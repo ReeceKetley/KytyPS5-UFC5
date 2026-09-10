@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1353,7 +1354,12 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 		    .data_address     = data_address,
 		    .metadata_address = metadata_address,
 		});
-		(void)group.ImageInfo(registrations.back());
+		const auto surface_info = group.ImageInfo(registrations.back());
+		// Make the game's registered pixel format authoritative for this flip address,
+		// so a later CS storage write can't create the cache image with a different
+		// (compatible) packed format first.
+		DriverState().Renderer().GetTextureCache().RegisterVideoOutSurface(
+		    surface_info.data.address, surface_info.data.size, surface_info.pixel_format);
 	}
 
 	Common::LockGuard lock(ctx->mutex);
@@ -1415,7 +1421,9 @@ KYTY_SYSV_ABI int VideoOutSubmitChangeBufferAttribute2(int handle, int set_index
 	};
 	for (const auto& buffer: ctx->buffers) {
 		if (buffer.group_index == set_index) {
-			(void)replacement.ImageInfo(buffer);
+			const auto surface_info = replacement.ImageInfo(buffer);
+			DriverState().Renderer().GetTextureCache().RegisterVideoOutSurface(
+			    surface_info.data.address, surface_info.data.size, surface_info.pixel_format);
 		}
 	}
 	ctx->groups[set_index] = replacement;

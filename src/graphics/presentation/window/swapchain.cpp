@@ -1258,12 +1258,10 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
 
+	// The scanout image is pinned to the game's registered VideoOut pixel_format at
+	// creation (TextureCache::RegisterVideoOutSurface), so image.backing.format is
+	// already the authoritative display layout - no per-present format override.
 	auto frame_format = image.backing.format;
-	if (source == &scanout && IsPacked10Unorm(frame_format) && IsPacked10Unorm(info.pixel_format)) {
-		// Alternating buffers can have different cache backing formats. Decode both
-		// using the registered display layout, rather than their allocation history.
-		frame_format = info.pixel_format;
-	}
 	switch (frame_format) {
 		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
 		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;

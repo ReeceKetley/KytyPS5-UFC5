@@ -61,6 +61,12 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+
+	// The game's VideoOut buffer registration is the authoritative interpretation of
+	// the bits at a flip address. Record it here so that whichever binding first
+	// creates the cache image for that memory (a CS storage write can beat the
+	// VideoOut resolve) stamps the registered packed format, not its own guess.
+	void RegisterVideoOutSurface(uint64_t address, uint64_t size, vk::Format format);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
@@ -106,6 +112,9 @@ private:
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
+	// If [info.data] sits inside a registered VideoOut surface, force info.pixel_format
+	// to the registered packed format. Caller holds m_lock.
+	void                      PinVideoOutFormat(ImageInfo& info) const;
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
@@ -172,6 +181,12 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	struct VideoOutSurface {
+		uint64_t   address = 0;
+		uint64_t   size    = 0;
+		vk::Format format  = vk::Format::eUndefined;
+	};
+	std::vector<VideoOutSurface>                      m_video_out_surfaces;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

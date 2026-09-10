@@ -293,9 +293,48 @@ bool TextureCache::SafeToDownload(const Image& image) {
 	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
 }
 
+void TextureCache::RegisterVideoOutSurface(uint64_t address, uint64_t size, vk::Format format) {
+	if (address == 0 || size == 0 || format == vk::Format::eUndefined) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	for (auto& surface: m_video_out_surfaces) {
+		if (surface.address == address) {
+			surface.size   = size;
+			surface.format = format;
+			return;
+		}
+	}
+	m_video_out_surfaces.push_back({address, size, format});
+}
+
+void TextureCache::PinVideoOutFormat(ImageInfo& info) const {
+	if (info.data.address == 0 || info.pixel_format == vk::Format::eUndefined) {
+		return;
+	}
+	for (const auto& surface: m_video_out_surfaces) {
+		if (info.data.address >= surface.address &&
+		    info.data.address < surface.address + surface.size &&
+		    info.pixel_format != surface.format &&
+		    ImageViewOps::FormatsCompatible(info.pixel_format, surface.format)) {
+			static std::atomic<uint32_t> pin_logs = 0;
+			if (pin_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("TextureCache: pinning VideoOut surface 0x%016" PRIx64 " to registered "
+				     "format %d (was %d)\n",
+				     info.data.address, static_cast<int>(surface.format),
+				     static_cast<int>(info.pixel_format));
+			}
+			info.pixel_format = surface.format;
+			return;
+		}
+	}
+}
+
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
-	if (!info.data.Empty()) {
+	ImageInfo pinned = info;
+	PinVideoOutFormat(pinned);
+	const auto id = m_slot_images.insert(m_graphics, m_scheduler, pinned);
+	if (!pinned.data.Empty()) {
 		RegisterImage(id);
 	}
 	return id;
