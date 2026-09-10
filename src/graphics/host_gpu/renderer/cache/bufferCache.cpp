@@ -907,7 +907,17 @@ void BufferCache::RunGarbageCollector() {
 		}
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 		Unregister(id);
-		m_slot_buffers.erase(id);
+		// DownloadBufferMemory() above recorded GPU->staging copies against these very
+		// buffers into the command buffer that is still recording, and the deferred
+		// readback path does not Finish() before returning. Destroying the VkBuffer here
+		// invalidates that command buffer ("VkBuffer ... was destroyed" /
+		// VUID-vkCmdPipelineBarrier-commandBuffer-recording) and loses the device. Retire
+		// on tick completion instead, exactly as DeleteBuffer() does.
+		if (m_scheduler.Active()) {
+			m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
+		} else {
+			m_slot_buffers.erase(id);
+		}
 	}
 }
 
