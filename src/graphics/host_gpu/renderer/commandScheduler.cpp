@@ -180,6 +180,7 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 }
 
 void CommandScheduler::FlushAndWait() {
+	FrameWorkScope frame_work(FrameWorkKind::Finish);
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();

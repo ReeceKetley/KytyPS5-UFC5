@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -911,6 +912,7 @@ void BufferCache::RunGarbageCollector() {
 }
 
 void BufferCache::ProcessFaultBuffer() {
+	FrameWorkScope faultbuf_scope(FrameWorkKind::FaultBuf);
 	m_fault_manager.ProcessFaultBuffer();
 }
 

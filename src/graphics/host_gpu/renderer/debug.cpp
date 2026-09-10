@@ -1102,7 +1102,7 @@ void hw_print(const CommandBuffer& buffer) {
 
 namespace {
 
-constexpr size_t kFrameWorkKindCount = 5;
+constexpr size_t kFrameWorkKindCount = 11;
 
 std::atomic<uint32_t> g_frame_work_count[kFrameWorkKindCount] {};
 std::atomic<uint64_t> g_frame_work_us[kFrameWorkKindCount] {};
@@ -1135,6 +1135,12 @@ FrameWorkPulse ConsumeFrameWorkPulse() {
 	take(FrameWorkKind::Submit, pulse.submits, pulse.submit_ms);
 	take(FrameWorkKind::Finish, pulse.finishes, pulse.finish_ms);
 	take(FrameWorkKind::Present, pulse.presents, pulse.present_ms);
+	take(FrameWorkKind::Process, pulse.processes, pulse.process_ms);
+	take(FrameWorkKind::Gc, pulse.gcs, pulse.gc_ms);
+	take(FrameWorkKind::Flush, pulse.flushes, pulse.flush_ms);
+	take(FrameWorkKind::SendCmd, pulse.sendcmds, pulse.sendcmd_ms);
+	take(FrameWorkKind::DrawPrep, pulse.drawpreps, pulse.drawprep_ms);
+	take(FrameWorkKind::FaultBuf, pulse.faultbufs, pulse.faultbuf_ms);
 	return pulse;
 }
 

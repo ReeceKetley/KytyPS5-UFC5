@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -39,6 +40,12 @@ private:
 	std::vector<BufferCursor> m_buffer_stack;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
+	// Set once we have flushed-and-waited for the current unsatisfied WAIT_REG_MEM;
+	// cleared on any forward progress. Stops a suspended wait from re-issuing a full
+	// GPU idle stall on every ThreadRun re-entry (nothing this submission does while
+	// suspended can change the wait outcome - only other queues can, and the value
+	// re-test catches that).
+	bool                      m_flushed_for_wait = false;
 };
 
 class CommandProcessor {
@@ -146,6 +153,13 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
 	void SuspendPm4();
+	// EOP/RELEASE_MEM label writes recorded (but not yet flushed) in the current
+	// command buffer. A WAIT_REG_MEM on one of these is an intra-buffer GPU->GPU
+	// dependency the Vulkan command order already satisfies - no CPU flush-and-wait.
+	void NoteGpuLabelWrite(uint64_t address, uint64_t value);
+	[[nodiscard]] bool GpuLabelSatisfies(uint64_t address, uint64_t ref, uint64_t mask,
+	                                     uint32_t func) const;
+	void ClearGpuLabels() { m_pending_gpu_labels.clear(); }
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 	void                CheckBuffer() const { GetScheduler().CheckActive(); }
@@ -175,6 +189,7 @@ private:
 	FlipInfo  m_flip;
 	const int m_interrupt_event_id;
 	uint64_t  m_submit_id                   = 0;
+	std::unordered_map<uint64_t, uint64_t> m_pending_gpu_labels;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
 };

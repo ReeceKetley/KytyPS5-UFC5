@@ -1030,6 +1030,15 @@ void WindowContext::UpdateTitle() {
 	static double   submit_ms        = 0.0;
 	static double   finish_ms        = 0.0;
 	static double   present_ms       = 0.0;
+	static double   process_ms       = 0.0;
+	static double   gc_ms            = 0.0;
+	static double   flush_ms         = 0.0;
+	static double   sendcmd_ms       = 0.0;
+	static double   drawprep_ms      = 0.0;
+	static double   faultbuf_ms      = 0.0;
+	static uint32_t processes        = 0;
+	static uint32_t gcs              = 0;
+	static uint32_t faultbufs        = 0;
 	const auto      pulse            = ConsumeShaderCompilePulse();
 	const auto      gpu              = ConsumeFrameWorkPulse();
 	shader_compiles += pulse.shader_count;
@@ -1045,15 +1054,36 @@ void WindowContext::UpdateTitle() {
 	submit_ms += gpu.submit_ms;
 	finish_ms += gpu.finish_ms;
 	present_ms += gpu.present_ms;
+	process_ms += gpu.process_ms;
+	gc_ms += gpu.gc_ms;
+	flush_ms += gpu.flush_ms;
+	sendcmd_ms += gpu.sendcmd_ms;
+	drawprep_ms += gpu.drawprep_ms;
+	faultbuf_ms += gpu.faultbuf_ms;
+	processes += gpu.processes;
+	gcs += gpu.gcs;
+	faultbufs += gpu.faultbufs;
 	if (now - fps_start >= frequency) {
 		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
 		              static_cast<double>(now - fps_start);
+		// process_ms is the whole GPU-worker-thread cost of guest submissions; the
+		// named buckets below (draw/dispatch/submit/finish nest inside it, gc/flush/
+		// sendcmd are siblings). "cp_other" = process_ms minus all of them = raw PM4
+		// decode + register/state handlers + descriptor & cache lookups.
+		// gc_ms already contains finish_ms spent inside GC, and drawprep_ms contains
+		// draw_ms; cp_rest is process time not in any of: draw-prep, dispatch, submit,
+		// gc, flush, sendcmd  => raw PM4 decode + register/state packet handlers.
+		const double cp_rest = process_ms - drawprep_ms - dispatch_ms - submit_ms - gc_ms -
+		                       flush_ms - sendcmd_ms;
 		LOGF("FrameProfile: fps=%.3f frames=%" PRIu64 " shader_compiles=%u shader_ms=%.1f "
 		     "pso_creates=%u pso_ms=%.1f draws=%u draw_ms=%.1f dispatch=%u dispatch_ms=%.1f "
-		     "submit=%u submit_ms=%.1f finish=%u finish_ms=%.1f present_ms=%.1f\n",
+		     "submit=%u submit_ms=%.1f finish=%u finish_ms=%.1f present_ms=%.1f "
+		     "process=%u process_ms=%.1f drawprep_ms=%.1f gc=%u gc_ms=%.1f faultbuf=%u "
+		     "faultbuf_ms=%.1f flush_ms=%.1f sendcmd_ms=%.1f cp_rest=%.1f\n",
 		     current_fps, fps_frames, shader_compiles, shader_ms, pipeline_creates, pipeline_ms,
 		     draws, draw_ms, dispatches, dispatch_ms, submits, submit_ms, finishes, finish_ms,
-		     present_ms);
+		     present_ms, processes, process_ms, drawprep_ms, gcs, gc_ms, faultbufs, faultbuf_ms,
+		     flush_ms, sendcmd_ms, cp_rest);
 		fps_start        = now;
 		fps_frames       = 0;
 		shader_compiles  = 0;
@@ -1069,6 +1099,15 @@ void WindowContext::UpdateTitle() {
 		submit_ms        = 0.0;
 		finish_ms        = 0.0;
 		present_ms       = 0.0;
+		process_ms       = 0.0;
+		gc_ms            = 0.0;
+		flush_ms         = 0.0;
+		sendcmd_ms       = 0.0;
+		drawprep_ms      = 0.0;
+		faultbuf_ms      = 0.0;
+		processes        = 0;
+		gcs              = 0;
+		faultbufs        = 0;
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();

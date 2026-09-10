@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/debug.h"
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
@@ -89,6 +90,7 @@ void GpuResourceManager::PrepareBda() {
 }
 
 void GpuResourceManager::RunGarbageCollector() {
+	FrameWorkScope gc_scope(FrameWorkKind::Gc);
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();

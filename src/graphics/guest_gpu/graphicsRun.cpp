@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -128,6 +129,10 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
+	if (m_pending_commands.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	FrameWorkScope sendcmd_scope(FrameWorkKind::SendCmd);
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
 		{
@@ -232,6 +237,7 @@ void CommandProcessor::Reset() {
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
+	m_pending_gpu_labels.clear();
 
 	std::memset(m_const_ram, 0, sizeof(m_const_ram));
 }
@@ -265,10 +271,15 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
+	FrameWorkScope flush_scope(FrameWorkKind::Flush);
+	// The current command buffer is being submitted; its EOP label writes are now the
+	// scheduler's problem (deferred commits fire on completion).
+	m_pending_gpu_labels.clear();
 	GetScheduler().Flush();
 }
 
 void CommandProcessor::BufferFlushAndWait() {
+	m_pending_gpu_labels.clear();
 	GetScheduler().FlushAndWait();
 }
 
@@ -348,7 +359,21 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	// wait is in the same command list as that label, flush-and-wait so the
 	// deferred write is visible; otherwise suspend until a later submit.
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
-		BufferFlushAndWait();
+		// An EOP earlier in THIS command buffer is going to write this label. Anything
+		// the guest records after the wait lands in the same command buffer after that
+		// EOP's work, so the GPU already serialises it - skip the CPU flush-and-wait.
+		// The deferred label commit still writes guest memory when the submit retires.
+		if (GpuLabelSatisfies(reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(ref),
+		                      static_cast<uint64_t>(mask), func)) {
+			return;
+		}
+		auto* exec = g_current_execution;
+		if (exec == nullptr || !exec->m_flushed_for_wait) {
+			BufferFlushAndWait();
+			if (exec != nullptr) {
+				exec->m_flushed_for_wait = true;
+			}
+		}
 		if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 			SuspendPm4();
 		}
@@ -565,6 +590,7 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
+	FrameWorkScope process_scope(FrameWorkKind::Process);
 	const bool first_slice = !submission.started;
 	auto& cp = GetProcessor(submission.queue_id);
 
@@ -694,6 +720,24 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands)
 	ProcessPm4(execution, stop_depth);
 }
 
+void CommandProcessor::NoteGpuLabelWrite(uint64_t address, uint64_t value) {
+	if (address == 0) {
+		return;
+	}
+	// A real frame records ~150 EOP labels; cap defensively against a pathological
+	// stream that never flushes.
+	if (m_pending_gpu_labels.size() >= 4096) {
+		m_pending_gpu_labels.clear();
+	}
+	m_pending_gpu_labels[address] = value;
+}
+
+bool CommandProcessor::GpuLabelSatisfies(uint64_t address, uint64_t ref, uint64_t mask,
+                                         uint32_t func) const {
+	const auto it = m_pending_gpu_labels.find(address);
+	return it != m_pending_gpu_labels.end() && TestWaitRegMemValue(it->second, ref, mask, func);
+}
+
 void CommandProcessor::SuspendPm4() {
 	EXIT_IF(g_current_execution == nullptr);
 	g_current_execution->m_suspended = true;
@@ -712,6 +756,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			cursor.offset_dw += cursor.deferred_advance_dw;
 			cursor.deferred_advance_dw = 0;
 			execution.m_made_progress  = true;
+			execution.m_flushed_for_wait = false;
 			continue;
 		}
 		if (cursor.offset_dw == cursor.commands.size()) {
@@ -729,6 +774,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		if (packet_header == 0x80000000u) {
 			cursor.offset_dw++;
 			execution.m_made_progress = true;
+			execution.m_flushed_for_wait = false;
 			continue;
 		}
 
@@ -764,6 +810,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			}
 			cursor.offset_dw += packet_dw;
 			execution.m_made_progress = true;
+			execution.m_flushed_for_wait = false;
 			continue;
 		}
 
@@ -797,6 +844,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		EXIT_IF(execution.m_buffer_stack.size() != buffer_index + 1);
 		execution.m_buffer_stack[buffer_index].offset_dw += packet_dw;
 		execution.m_made_progress = true;
+		execution.m_flushed_for_wait = false;
 	}
 }
 
@@ -1243,6 +1291,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
 
+		if (!with_interrupt) {
+			NoteGpuLabelWrite(reinterpret_cast<uint64_t>(dst), data);
+		}
 		if (with_interrupt) {
 			if (with_writeback) {
 				Sync::WriteAtEndOfPipeWithInterruptWriteBack32(m_submit_id, CurrentBuffer(), dst,
@@ -1292,6 +1343,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 
+					if (!with_interrupt) {
+						NoteGpuLabelWrite(reinterpret_cast<uint64_t>(dst), value);
+					}
 					if (with_interrupt) {
 						if (with_writeback) {
 							Sync::WriteAtEndOfPipeWithInterruptWriteBack64(

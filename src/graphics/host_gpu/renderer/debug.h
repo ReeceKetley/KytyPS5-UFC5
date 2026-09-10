@@ -54,7 +54,20 @@ void                     LogDrawPhase(const char* draw_name, const char* phase);
 ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc,
                                vk::Extent2D extent, uint32_t viewport_index);
 
-enum class FrameWorkKind : uint8_t { Draw, Dispatch, Submit, Finish, Present };
+enum class FrameWorkKind : uint8_t {
+	Draw,
+	Dispatch,
+	Submit,
+	Finish,
+	Present,
+	Process,  // whole GuestGpu::Process(submission) on the GPU worker thread
+	Gc,       // RunGarbageCollector
+	Flush,    // CommandProcessor::BufferFlush
+	SendCmd,  // draining cross-thread SendCommand callbacks (readbacks etc.)
+	DrawPrep, // whole RenderExecutor::DrawIndex/Auto (nests Draw): pipeline lookup,
+	          // descriptor resolve, FindImage/FindBuffer, hw_check
+	FaultBuf, // BufferCache::ProcessFaultBuffer (readback-via-page-fault, nests inside Gc)
+};
 
 struct FrameWorkPulse {
 	uint32_t draws       = 0;
@@ -62,11 +75,23 @@ struct FrameWorkPulse {
 	uint32_t submits     = 0;
 	uint32_t finishes    = 0;
 	uint32_t presents    = 0;
+	uint32_t processes   = 0;
+	uint32_t gcs         = 0;
+	uint32_t flushes     = 0;
+	uint32_t sendcmds    = 0;
+	uint32_t drawpreps   = 0;
+	uint32_t faultbufs   = 0;
 	double   draw_ms     = 0.0;
 	double   dispatch_ms = 0.0;
 	double   submit_ms   = 0.0;
 	double   finish_ms   = 0.0;
 	double   present_ms  = 0.0;
+	double   process_ms  = 0.0;
+	double   gc_ms       = 0.0;
+	double   flush_ms    = 0.0;
+	double   sendcmd_ms  = 0.0;
+	double   drawprep_ms = 0.0;
+	double   faultbuf_ms = 0.0;
 };
 
 [[nodiscard]] FrameWorkPulse ConsumeFrameWorkPulse();
