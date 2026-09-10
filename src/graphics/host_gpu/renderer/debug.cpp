@@ -141,8 +141,10 @@ uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
 }
 
 bool graphics_debug_dump_enabled() {
-	return Config::GraphicsDebugDumpEnabled() &&
-	       Config::GetPrintfDirection() != Config::OutputDirection::Silent;
+	// Config is fixed after startup; this is polled multiple times per draw.
+	static const bool enabled = Config::GraphicsDebugDumpEnabled() &&
+	                            Config::GetPrintfDirection() != Config::OutputDirection::Silent;
+	return enabled;
 }
 
 void uc_print(const char* func, const HW::UserConfig& uc) {

@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <unordered_set>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -69,35 +70,52 @@ bool ParseHexU64(const char* text, uint64_t* out) {
 }
 
 bool EnvListContainsHash(const char* env_name, uint64_t hash) {
-	const char* env = std::getenv(env_name);
-	if (env == nullptr || env[0] == '\0') {
-		return false;
+	// getenv + parse once per env var; this is polled once per dispatch / shader compile.
+	struct ParsedList {
+		bool                          wildcard = false;
+		std::unordered_set<uint64_t>  hashes;
+	};
+	static std::mutex                                    cache_mutex;
+	static std::unordered_map<std::string, ParsedList>   cache;
+
+	const ParsedList* list = nullptr;
+	{
+		std::scoped_lock lock {cache_mutex};
+		auto it = cache.find(env_name);
+		if (it == cache.end()) {
+			ParsedList parsed;
+			if (const char* env = std::getenv(env_name); env != nullptr && env[0] != '\0') {
+				if ((env[0] == '*' && env[1] == '\0') || (env[0] == '1' && env[1] == '\0')) {
+					parsed.wildcard = true;
+				} else {
+					const char* cursor = env;
+					while (*cursor != '\0') {
+						while (*cursor == ' ' || *cursor == '\t' || *cursor == ',') {
+							++cursor;
+						}
+						if (*cursor == '\0') {
+							break;
+						}
+						const char* start = cursor;
+						while (*cursor != '\0' && *cursor != ',') {
+							++cursor;
+						}
+						std::string token(start, static_cast<size_t>(cursor - start));
+						while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) {
+							token.pop_back();
+						}
+						uint64_t value = 0;
+						if (ParseHexU64(token.c_str(), &value)) {
+							parsed.hashes.insert(value);
+						}
+					}
+				}
+			}
+			it = cache.emplace(env_name, std::move(parsed)).first;
+		}
+		list = &it->second;
 	}
-	if ((env[0] == '*' && env[1] == '\0') || (env[0] == '1' && env[1] == '\0')) {
-		return hash == kUfcHangCsHash;
-	}
-	const char* cursor = env;
-	while (*cursor != '\0') {
-		while (*cursor == ' ' || *cursor == '\t' || *cursor == ',') {
-			++cursor;
-		}
-		if (*cursor == '\0') {
-			break;
-		}
-		const char* start = cursor;
-		while (*cursor != '\0' && *cursor != ',') {
-			++cursor;
-		}
-		std::string token(start, static_cast<size_t>(cursor - start));
-		while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) {
-			token.pop_back();
-		}
-		uint64_t parsed = 0;
-		if (ParseHexU64(token.c_str(), &parsed) && parsed == hash) {
-			return true;
-		}
-	}
-	return false;
+	return list->wildcard ? hash == kUfcHangCsHash : list->hashes.contains(hash);
 }
 
 bool ShouldSkipComputeHash(uint64_t hash) {

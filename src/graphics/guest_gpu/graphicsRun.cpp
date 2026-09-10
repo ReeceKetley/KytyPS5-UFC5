@@ -88,8 +88,10 @@ private:
 };
 
 static bool GraphicsRunDebugDumpEnabled() {
-	return Config::GraphicsDebugDumpEnabled() &&
-	       Config::GetPrintfDirection() != Config::OutputDirection::Silent;
+	// Config is fixed after startup; this is polled once per PM4 packet.
+	static const bool enabled = Config::GraphicsDebugDumpEnabled() &&
+	                            Config::GetPrintfDirection() != Config::OutputDirection::Silent;
+	return enabled;
 }
 
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
