@@ -724,7 +724,15 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	    source.backing.format == destination.backing.format ||
 	    (!source_depth && !dest_depth &&
 	     SameTexelBlockSize(source.backing.format, destination.backing.format));
-	if (direct_copy) {
+	const bool crosses_1d = source.backing.image_type != destination.backing.image_type &&
+	    (source.backing.image_type == vk::ImageType::e1D ||
+	     destination.backing.image_type == vk::ImageType::e1D);
+	if (direct_copy && crosses_1d) {
+		// UFC reuses a 1D R32 image as a 2D row. Without maintenance5 a direct
+		// vkCmdCopyImage across these types is invalid; preserve the bits via a buffer.
+		auto& copy_buffer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
+		destination.CopyImageWithBuffer(source, copy_buffer);
+	} else if (direct_copy) {
 		destination.CopyImage(source);
 	} else if (!CopyD16(destination, source)) {
 		if (source.backing.samples != 1 || destination.backing.samples != 1) {
@@ -1072,6 +1080,12 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 	                                       info.resources.levels, layers, info.tile_mode,
 	                                       info.data.size, allow_depth_tile, volume, owner);
 	plan.regions = TextureBuildImageCopies(plan.layout);
+	// Keep guest layout/array strides intact, but never issue host copies for the
+	// extra tail levels omitted when the Vulkan backing was clamped.
+	const auto transfer_levels = std::min(info.resources.levels, image.backing.mip_levels);
+	std::erase_if(plan.regions, [transfer_levels](const auto& region) {
+		return region.imageSubresource.mipLevel >= transfer_levels;
+	});
 	if (info.IsDepth()) {
 		for (auto& region: plan.regions) {
 			region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eDepth;
@@ -1079,7 +1093,7 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 	}
 	if (plan.layout.surface.description.tile_mode != Prospero::TileMode::kLinear) {
 		if (!TextureBuildGpuTileInfos(info.data.size, plan.regions, plan.layout,
-		                              info.resources.levels, plan.tiles)) {
+		                              transfer_levels, plan.tiles)) {
 			return plan;
 		}
 	}

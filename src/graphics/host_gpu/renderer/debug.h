@@ -10,6 +10,8 @@
 namespace Libs::Graphics {
 
 class CommandBuffer;
+class RenderContext;
+class Image;
 
 namespace HW {
 class Context;
@@ -30,6 +32,17 @@ struct ScissorRect {
 uint32_t                 render_target_mask_slot(uint32_t mask, uint32_t slot);
 uint32_t                 render_target_first_bound_slot(const CommandBuffer& buffer);
 bool                     graphics_debug_dump_enabled();
+// Opt-in resource provenance. KYTY_TRACE_RESOURCES is a comma-separated list of
+// guest addresses; log the first occurrence of each distinct binding only.
+bool                     TraceResourceAddress(uint64_t address, uint64_t size);
+void                     TraceResourceBinding(uint64_t frame, const std::string& binding);
+// Capture the first binding of each selected hash at/after KYTY_CAPTURE_INPUTS_FRAME.
+bool                     CaptureShaderInputs(uint64_t hash, uint64_t frame);
+void                     DumpShaderInput(CommandBuffer& command, RenderContext& renderer,
+                                         Image& image, const std::string& tag);
+void                     DumpShaderBufferInput(CommandBuffer& command, RenderContext& renderer,
+                                               vk::Buffer buffer, uint64_t offset, uint64_t size,
+                                               const std::string& tag);
 void                     uc_print(const char* func, const HW::UserConfig& uc);
 void                     uc_check(const HW::UserConfig& uc);
 void                     sh_print(const char* func, const HW::Shader& uc);

@@ -298,6 +298,11 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	}
 
 	TextureCache::ImageDesc desc {};
+	if (rt.cmask.addr != 0 && TraceResourceAddress(rt.cmask.addr, 1)) {
+		TraceResourceBinding(0, fmt::format("color_metadata color=0x{:x} cmask=0x{:x} "
+		    "dcc=0x{:x} vrs_hint={} extent={}x{}", rt.base.addr, rt.cmask.addr,
+		    rt.dcc_addr.addr, rt.attrib3.write_vrs_rate_hint_to_cmask, width, height));
+	}
 	desc.type              = TextureCache::BindingType::RenderTarget;
 	desc.info.data         = {rt.base.addr, backing_size};
 	desc.info.pixel_format = target_format.format;

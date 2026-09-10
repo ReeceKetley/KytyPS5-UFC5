@@ -602,8 +602,17 @@ void AddOutputAnnotationsAndNames(EmitterState& state) {
 		if (binding.kind == IR::StageOutputKind::Parameter ||
 		    binding.kind == IR::StageOutputKind::Mrt) {
 			state.builder.AddName(binding.variable_id, binding.debug_name.c_str());
+			const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
+			    state.stage == ShaderType::Pixel && state.input_info.pixel != nullptr &&
+			    state.input_info.pixel->ps_dual_source_blend;
 			state.builder.AddAnnotation(
-			    {OpDecorate, binding.variable_id, DecorationLocation, binding.location});
+			    {OpDecorate, binding.variable_id, DecorationLocation,
+			     dual_source ? 0u : binding.location});
+			if (dual_source) {
+				EXIT_IF(binding.location > 1u);
+				state.builder.AddAnnotation(
+				    {OpDecorate, binding.variable_id, DecorationIndex, binding.location});
+			}
 		}
 	}
 }

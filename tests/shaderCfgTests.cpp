@@ -11440,6 +11440,35 @@ void TestNewShaderRecompilerExpPixelOutputs() {
   CheckSpirvBinaryValidates(unorm16_ba_result.spirv);
 }
 
+void TestDualSourcePixelExports() {
+  const uint32_t shader[] = {
+      EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(0x01, 0xf, true), EncodeExp1(4, 5, 6, 7),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo pixel{};
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  const auto normal_key = MakeStageStaticKey(pixel);
+  const auto normal = RecompileForTest(shader, options);
+  Check(SpirvDecorationValueCount(normal.spirv, 30u, 0u) == 1u &&
+            SpirvDecorationValueCount(normal.spirv, 30u, 1u) == 1u &&
+            !SpirvHasDecorationValue(normal.spirv, 32u, 1u),
+        "ordinary MRT exports must keep separate locations");
+  CheckSpirvBinaryValidates(normal.spirv);
+
+  pixel.ps_dual_source_blend = true;
+  Check(MakeStageStaticKey(pixel) != normal_key,
+        "dual-source blend mode must specialize the pixel shader cache key");
+  const auto dual = RecompileForTest(shader, options);
+  Check(SpirvDecorationValueCount(dual.spirv, 30u, 0u) == 2u &&
+            !SpirvHasDecorationValue(dual.spirv, 30u, 1u) &&
+            SpirvDecorationValueCount(dual.spirv, 32u, 0u) == 1u &&
+            SpirvDecorationValueCount(dual.spirv, 32u, 1u) == 1u,
+        "dual-source exports must use Location 0 and distinct Index 0/1");
+  CheckSpirvBinaryValidates(dual.spirv);
+}
+
 void TestRenderTargetReverseExportMapping() {
   const auto format = TextureGetRenderTargetFormat(
       Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
@@ -13124,10 +13153,15 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int main(int argc, char** argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--dual-source-only") == 0) {
+    TestDualSourcePixelExports();
+    std::puts("ShaderCfgTests: dual-source pixel exports passed");
+    return 0;
+  }
   TestResourceDescriptorClassification();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
@@ -13240,6 +13274,7 @@ int main() {
   TestNewShaderRecompilerPerInvocationMasksWithoutMirrors();
   TestNewShaderRecompilerPerInvocationU64Complement();
   TestNewShaderRecompilerExpPixelOutputs();
+  TestDualSourcePixelExports();
   TestRenderTargetReverseExportMapping();
   TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
   TestTypedDescriptorRealWideMoveTranslation();

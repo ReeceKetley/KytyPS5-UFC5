@@ -177,7 +177,11 @@ bool EnvListContainsHash(const char* env_name, uint64_t hash) {
 }
 
 bool ShouldDumpShader(const CompileOptions& options) {
-	return options.shader_hash == kUfcHangCsHash ||
+	static const bool dump_all = [] {
+		const char* value = std::getenv("KYTY_DUMP_ALL_SHADERS");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return dump_all || options.shader_hash == kUfcHangCsHash ||
 	       EnvListContainsHash("KYTY_DUMP_SHADER_HASH", options.shader_hash);
 }
 

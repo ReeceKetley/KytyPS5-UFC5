@@ -501,6 +501,16 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			BindRenderTarget(target.image_id);
 		}
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
+		if (TraceResourceAddress(target.desc.info.data.address, target.desc.info.data.size)) {
+			TraceResourceBinding(m_context.GetGpu().GetFrameNum(),
+			    fmt::format("color_target={} ps_hash=0x{:016x} addr=0x{:x} bytes={} "
+			                "format={} mip={} layer={}+{}",
+			                i, pixel ? pixel->program->shader_hash : uint64_t {0},
+			                target.desc.info.data.address, target.desc.info.data.size,
+			                static_cast<int>(target.desc.view_info.format),
+			                target.desc.view_info.base_level, target.desc.view_info.base_layer,
+			                target.desc.view_info.layer_count));
+		}
 		auto&      image      = cache.GetImage(target.image_id);
 		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
 		                     "Kyty.MRT{}.Image[guest=0x{:016x} size=0x{:x} format={}]",

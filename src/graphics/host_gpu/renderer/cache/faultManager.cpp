@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <atomic>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
@@ -138,9 +139,12 @@ void FaultManager::ProcessFaultBuffer() {
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
 		const auto  count  = static_cast<uint32_t>(faults[0]);
+		static std::atomic<uint32_t> non_cached_logs = 0;
 		for (uint32_t index = 1; index <= count; ++index) {
 			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
-			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
+			if (non_cached_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+				LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
+			}
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());

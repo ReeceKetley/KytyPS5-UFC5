@@ -14,9 +14,93 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
 #include <fmt/format.h>
+#include <mutex>
+#include <unordered_set>
 
 namespace Libs::Graphics {
+
+bool CaptureShaderInputs(uint64_t hash, uint64_t frame) {
+	static const uint64_t after_hash = [] {
+		const char* value = std::getenv("KYTY_CAPTURE_AFTER_HASH");
+		return value == nullptr ? 0ull : std::strtoull(value, nullptr, 16);
+	}();
+	static const auto hashes = [] {
+		std::unordered_set<uint64_t> result;
+		const char* cursor = std::getenv("KYTY_CAPTURE_INPUTS_HASH");
+		while (cursor != nullptr && *cursor != '\0') {
+			while (*cursor == ',' || *cursor == ' ') ++cursor;
+			if (*cursor == '\0') break;
+			char* end = nullptr;
+			const auto value = std::strtoull(cursor, &end, 16);
+			if (end == cursor || (*end != '\0' && *end != ',' && *end != ' ')) break;
+			result.insert(value);
+			cursor = end;
+		}
+		return result;
+	}();
+	if (after_hash == 0 && !hashes.contains(hash)) return false;
+	static const auto first_frame = [] {
+		const char* value = std::getenv("KYTY_CAPTURE_INPUTS_FRAME");
+		return value == nullptr ? 0ull : std::strtoull(value, nullptr, 10);
+	}();
+	if (frame < first_frame) return false;
+	static std::mutex lock;
+	static std::unordered_set<uint64_t> captured;
+	static uint64_t checked_frame = UINT64_MAX;
+	static uint64_t capture_frame = UINT64_MAX;
+	static bool armed = false;
+	std::scoped_lock guard {lock};
+	if (checked_frame != frame) {
+		checked_frame = frame;
+		std::error_code error;
+		if (std::filesystem::remove("D:/PS5/dumps/DUMP_INPUTS", error)) {
+			captured.clear();
+			armed = true;
+		}
+	}
+	if (after_hash != 0) {
+		if (armed && hash == after_hash) {
+			capture_frame = frame;
+			armed = false;
+			LOGF("InputCapture: begin frame=%" PRIu64 " after_hash=0x%016" PRIx64 "\n", frame, hash);
+		}
+		if (frame != capture_frame) return false;
+	}
+	return captured.insert(hash).second;
+}
+
+bool TraceResourceAddress(uint64_t address, uint64_t size) {
+	static const auto watched = [] {
+		std::vector<uint64_t> addresses;
+		const char* cursor = std::getenv("KYTY_TRACE_RESOURCES");
+		while (cursor != nullptr && *cursor != '\0') {
+			while (*cursor == ',' || *cursor == ' ') ++cursor;
+			if (*cursor == '\0') break;
+			char* end = nullptr;
+			const auto value = std::strtoull(cursor, &end, 16);
+			if (end == cursor || (*end != '\0' && *end != ',' && *end != ' ')) break;
+			addresses.push_back(value);
+			cursor = end;
+		}
+		return addresses;
+	}();
+	return std::any_of(watched.begin(), watched.end(), [=](uint64_t point) {
+		return point >= address && point - address < size;
+	});
+}
+
+void TraceResourceBinding(uint64_t frame, const std::string& binding) {
+	static std::mutex lock;
+	static std::unordered_set<std::string> seen;
+	std::scoped_lock guard {lock};
+	// Bound diagnostic memory and output even when a watched range is frequently reused.
+	if (seen.size() < 4096 && seen.insert(binding).second) {
+		LOGF("ResourceTrace: frame=%" PRIu64 " %s\n", frame, binding.c_str());
+	}
+}
 
 uint32_t render_target_mask_slot(uint32_t mask, uint32_t slot) {
 	return (mask >> (slot * 4u)) & 0x0fu;

@@ -29,6 +29,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
@@ -47,6 +48,11 @@ void RequestGpuImageDump() {
 }
 
 namespace {
+
+bool IsPacked10Unorm(vk::Format format) {
+	return format == vk::Format::eA2R10G10B10UnormPack32 ||
+	       format == vk::Format::eA2B10G10R10UnormPack32;
+}
 
 [[nodiscard]] uint8_t Unorm10To8(uint32_t value) {
 	return static_cast<uint8_t>((value * 255u + 511u) / 1023u);
@@ -229,6 +235,14 @@ void ConvertPackedToBgra(vk::Format format, uint32_t width, uint32_t height,
 			}
 			return;
 		}
+		case vk::Format::eR32Sfloat: {
+			const auto* values = reinterpret_cast<const float*>(packed);
+			for (uint32_t i = 0; i < count; i++) {
+				const auto gray = std::isfinite(values[i]) ? Saturate8(values[i]) : 0;
+				put(i, gray, gray, gray, 255);
+			}
+			return;
+		}
 		case vk::Format::eR32G32B32A32Sfloat: {
 			const auto* floats = reinterpret_cast<const float*>(packed);
 			for (uint32_t i = 0; i < count; i++) {
@@ -268,6 +282,7 @@ void ConvertPackedToBgra(vk::Format format, uint32_t width, uint32_t height,
 		case vk::Format::eB10G11R11UfloatPack32:
 		case vk::Format::eR16G16B16A16Sfloat:
 		case vk::Format::eR16G16B16A16Unorm:
+		case vk::Format::eR32Sfloat:
 		case vk::Format::eR32G32B32A32Sfloat: return true;
 		default: return false;
 	}
@@ -296,7 +311,7 @@ void ConvertPackedToBgra(vk::Format format, uint32_t width, uint32_t height,
 }
 
 void DumpGpuImage(CommandBuffer& command, RenderContext& renderer, Image& image, const char* tag,
-                  uint64_t address, bool dump) {
+                  uint64_t address, bool dump, bool raw = false) {
 	if (!dump || command.IsInvalid() || image.backing.image == nullptr || !image.IsGpuModified()) {
 		return;
 	}
@@ -358,7 +373,7 @@ void DumpGpuImage(CommandBuffer& command, RenderContext& renderer, Image& image,
 	const std::string tag_copy = tag;
 	scheduler.DeferPriorityOperation(
 	    [&download, mapped, offset, byte_size, width, height, format, frame_num, tag_copy,
-	     address] {
+	     address, raw] {
 		    download.Invalidate(offset, byte_size);
 		    std::vector<uint8_t> packed(mapped, mapped + byte_size);
 		    std::vector<uint8_t> bgra;
@@ -370,6 +385,13 @@ void DumpGpuImage(CommandBuffer& command, RenderContext& renderer, Image& image,
 		    const auto path = std::filesystem::path("D:/PS5/dumps") /
 		                      (tag_copy + "-f" + std::to_string(frame_num) + ".bmp");
 		    WriteBmpBgra(path, width, height, bgra);
+		    if (raw) {
+			    auto raw_path = path;
+			    raw_path.replace_extension(".bin");
+			    std::ofstream output(raw_path, std::ios::binary);
+			    output.write(reinterpret_cast<const char*>(packed.data()),
+			                 static_cast<std::streamsize>(packed.size()));
+		    }
 		    LOGF("VideoOut dump: %s frame=%d fmt=%d addr=0x%016" PRIx64
 		         " extent=%ux%u nonzero=%" PRIu64 "/%u max8=%u file=%s\n",
 		         tag_copy.c_str(), frame_num, static_cast<int>(format), address, width, height,
@@ -402,6 +424,79 @@ void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCac
 }
 
 } // namespace
+
+void DumpShaderInput(CommandBuffer& command, RenderContext& renderer, Image& image,
+                     const std::string& tag) {
+	// Capture the backing's base mip/layer before the consuming draw/dispatch. Normal
+	// descriptor commit still transitions the image to the consumer's required layout.
+	const auto saved = image.backing.state;
+	if (saved.layout == vk::ImageLayout::eUndefined || image.backing.samples != 1) return;
+	if (!image.IsGpuModified() || !DumpFormatSupported(image.backing.format) ||
+	    image.backing.extent.depth != 1) return;
+	static uint64_t budget_frame = UINT64_MAX;
+	static uint64_t budget_bytes = 0;
+	static std::mutex capture_lock;
+	std::scoped_lock guard {capture_lock};
+	const auto frame = renderer.GetGpu().GetFrameNum();
+	if (budget_frame != frame) {
+		budget_frame = frame;
+		budget_bytes = 0;
+	}
+	const uint64_t bytes = uint64_t(image.backing.extent.width) * image.backing.extent.height *
+	    DumpBytesPerPixel(image.backing.format);
+	if (bytes > (512ull << 20) - budget_bytes) {
+		LOGF("InputCapture: image budget exhausted at %s\n", tag.c_str());
+		return;
+	}
+	budget_bytes += bytes;
+	DumpGpuImage(command, renderer, image, tag.c_str(), image.info.data.address, true, true);
+	image.Transit(saved.layout, saved.access_mask, {}, command.Handle());
+}
+
+void DumpShaderBufferInput(CommandBuffer& command, RenderContext& renderer, vk::Buffer buffer,
+                           uint64_t source_offset, uint64_t byte_size, const std::string& tag) {
+	// Read the bound GPU bytes before the consumer, including its guest-offset adjustment
+	// supplied by the caller. A later CPU-memory snapshot can miss GPU-produced masks.
+	if (command.IsInvalid() || buffer == nullptr || byte_size == 0 || byte_size > (1ull << 20)) {
+		return;
+	}
+	auto& download = renderer.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
+	auto [mapped, offset] = download.Map(byte_size, 256);
+	if (mapped == nullptr) return;
+	command.EndRendering();
+	auto vk_command = command.Handle();
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask = vk::PipelineStageFlagBits2::eCopy;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers = &barrier;
+	vk_command.pipelineBarrier2(dependency);
+	const vk::BufferCopy copy {source_offset, offset, byte_size};
+	vk_command.copyBuffer(buffer, download.Handle(), 1, &copy);
+	barrier.srcStageMask = vk::PipelineStageFlagBits2::eCopy;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eHost;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
+	                        vk::AccessFlagBits2::eHostRead;
+	vk_command.pipelineBarrier2(dependency);
+	download.Commit();
+	const auto frame = renderer.GetGpu().GetFrameNum();
+	renderer.GetCommandScheduler().DeferPriorityOperation(
+	    [&download, mapped, offset, byte_size, tag, frame] {
+		    download.Invalidate(offset, byte_size);
+		    std::error_code ec;
+		    std::filesystem::create_directories("D:/PS5/dumps", ec);
+		    const auto path = std::filesystem::path("D:/PS5/dumps") /
+		                      (tag + "-f" + std::to_string(frame) + ".bin");
+		    std::ofstream output(path, std::ios::binary);
+		    output.write(reinterpret_cast<const char*>(mapped), static_cast<std::streamsize>(byte_size));
+		    LOGF("InputCapture: buffer bytes=%" PRIu64 " file=%s success=%d\n",
+		         byte_size, path.string().c_str(), static_cast<int>(output.good()));
+	    });
+}
 
 struct Presenter::Frame {
 	VulkanImage image;
@@ -642,10 +737,11 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	const auto height = std::min(source.backing.extent.height, image.extent.height);
 	const auto layers = std::min(source.backing.layers, image.layers);
 	EXIT_IF(layers == 0);
-	// copyImage requires identical formats. VideoOut 10:10:10:2 and shader storage images can
-	// disagree on A2R vs A2B packing while still sharing one texture-cache backing, so blit
-	// when the present image was allocated with a different host format.
-	if (source.backing.format == image.format) {
+	// Packed 10-bit VideoOut is an interpretation of the guest bits, regardless of
+	// which compatible storage view/backing wrote them. A blit converts colours and
+	// would undo that interpretation. Vulkan permits a bit copy between this pair.
+	if (source.backing.format == image.format ||
+	    (IsPacked10Unorm(source.backing.format) && IsPacked10Unorm(image.format))) {
 		vk::ImageCopy copy {};
 		copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, layers};
 		copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, layers};
@@ -1144,23 +1240,30 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 			     candidate.backing.extent.height, candidate.info.data.address, info.data.address);
 		}
 	};
-	// The game composites its final frame into a B10G11R11 storage image aliased at the
-	// flip address, but registers the VideoOut buffer with a different (color) format,
-	// so ResolveSurface() hands back a distinct image the compositor never writes.
-	// Present the GPU-written alias at the flip address first - that is the real frame.
-	consider(cache.FindImageFromRange(info.data.address, 0x0000000000870000ull, false),
-	         "flip alias", true);
-	// Fall back to the last large GPU-written color / the title compositor only when the
-	// flip alias had nothing (early boot, menu paths that render straight to 0x1162c00000).
-	consider(cache.FindLastPresentableColor(), "last color", false);
-	consider(cache.FindImageFromRange(0x0000001162c00000ull, 0x0000000000870000ull, false),
-	         "compositor color", false);
+	// A current GPU-written VideoOut image is authoritative. In UFC matches the last
+	// large colour target can be the UI-only layer, while the final compute composite
+	// writes the actual scanout. Do not replace that completed frame with the UI layer.
+	// Retain the early-menu fallbacks only when scanout has no current GPU contents.
+	const bool native_scanout = scanout.SafeToDownload() &&
+	    (scanout.usage.storage || scanout.usage.render_target);
+	if (!native_scanout) {
+		consider(cache.FindImageFromRange(info.data.address, 0x0000000000870000ull, false),
+		         "flip alias", true);
+		consider(cache.FindLastPresentableColor(), "last color", false);
+		consider(cache.FindImageFromRange(0x0000001162c00000ull, 0x0000000000870000ull, false),
+		         "compositor color", false);
+	}
 	auto& image = *source;
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
 
 	auto frame_format = image.backing.format;
+	if (source == &scanout && IsPacked10Unorm(frame_format) && IsPacked10Unorm(info.pixel_format)) {
+		// Alternating buffers can have different cache backing formats. Decode both
+		// using the registered display layout, rather than their allocation history.
+		frame_format = info.pixel_format;
+	}
 	switch (frame_format) {
 		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
 		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;

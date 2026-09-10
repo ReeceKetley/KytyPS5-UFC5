@@ -79,6 +79,7 @@ enum : uint32_t {
 	DecorationFlat          = 14,
 	DecorationAliased       = 20,
 	DecorationLocation      = 30,
+	DecorationIndex         = 32,
 	DecorationArrayStride   = 6,
 	DecorationBinding       = 33,
 	DecorationDescriptorSet = 34,

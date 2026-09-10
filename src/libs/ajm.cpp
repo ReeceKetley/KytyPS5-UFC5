@@ -26,6 +26,18 @@ namespace Libs::Audio::Ajm {
 
 LIB_NAME("Ajm", "Ajm");
 
+// Per-call parameter dumps that pair with PRINT_NAME(). UFC 5 drives the AJM
+// decoder every audio frame, so leaving these as raw LOGF produced millions of
+// log lines per session. Gate them behind the same flag PRINT_NAME() uses.
+namespace {
+template <typename... Args>
+void AjmTrace(const char* format, const Args&... args) {
+	if (PRINT_NAME_ENABLED) {
+		LOGF(format, args...);
+	}
+}
+} // namespace
+
 struct AjmBatchInfo {
 	void*       buffer;
 	size_t      offset;
@@ -227,7 +239,7 @@ public:
 		m_is_initialized        = true;
 		m_frames_per_packet     = 1;
 
-		LOGF("AJM Opus initialized: %" PRIu32 " Hz, %" PRIu32 " ch, mapping=%" PRIu32 "\n",
+		AjmTrace("AJM Opus initialized: %" PRIu32 " Hz, %" PRIu32 " ch, mapping=%" PRIu32 "\n",
 		     params->sample_rate, params->channel_num, params->mapping_family);
 
 		return MakeResult();
@@ -411,7 +423,7 @@ static uint8_t* AjmReserveJob(AjmBatchInfo* info, size_t job_size) {
 static int AjmAppendJob(AjmBatchInfo* info, size_t job_size, const char* name) {
 	auto* job = AjmReserveJob(info, job_size);
 	if (job == nullptr) {
-		LOGF("\t %s: not enough batch space, offset=0x%016" PRIx64 ", size=0x%016" PRIx64
+		AjmTrace("\t %s: not enough batch space, offset=0x%016" PRIx64 ", size=0x%016" PRIx64
 		     ", job=0x%016" PRIx64 "\n",
 		     name, static_cast<uint64_t>(info->offset), static_cast<uint64_t>(info->size),
 		     static_cast<uint64_t>(job_size));
@@ -731,7 +743,7 @@ int KYTY_SYSV_ABI AjmInitialize(int64_t reserved, uint32_t* context) {
 
 	EXIT_NOT_IMPLEMENTED(context == nullptr);
 	if (reserved != 0) {
-		LOGF("\t ignoring reserved = 0x%016" PRIx64 "\n", static_cast<uint64_t>(reserved));
+		AjmTrace("\t ignoring reserved = 0x%016" PRIx64 "\n", static_cast<uint64_t>(reserved));
 	}
 
 	*context = 1;
@@ -741,7 +753,7 @@ int KYTY_SYSV_ABI AjmInitialize(int64_t reserved, uint32_t* context) {
 
 int KYTY_SYSV_ABI AjmFinalize(uint32_t context) {
 	PRINT_NAME();
-	LOGF("\t context = %" PRIu32 "\n", context);
+	AjmTrace("\t context = %" PRIu32 "\n", context);
 	return OK;
 }
 
@@ -749,11 +761,11 @@ int KYTY_SYSV_ABI AjmModuleRegister(uint32_t context, uint32_t codec, int64_t re
 	PRINT_NAME();
 
 	if (reserved != 0) {
-		LOGF("\t ignoring reserved = 0x%016" PRIx64 "\n", static_cast<uint64_t>(reserved));
+		AjmTrace("\t ignoring reserved = 0x%016" PRIx64 "\n", static_cast<uint64_t>(reserved));
 	}
 
-	LOGF("\t codec = %u\n", codec);
-	LOGF("\t %s\n", AjmCodecName(codec));
+	AjmTrace("\t codec = %u\n", codec);
+	AjmTrace("\t %s\n", AjmCodecName(codec));
 
 	const auto valid     = AjmCodecIsValid(codec);
 	const auto supported = valid && AjmLogCodecSupport(codec);
@@ -767,7 +779,7 @@ int KYTY_SYSV_ABI AjmModuleRegister(uint32_t context, uint32_t codec, int64_t re
 	}
 
 	if (!supported) {
-		LOGF("\t codec is not implemented\n");
+		AjmTrace("\t codec is not implemented\n");
 	}
 
 	return result;
@@ -775,7 +787,7 @@ int KYTY_SYSV_ABI AjmModuleRegister(uint32_t context, uint32_t codec, int64_t re
 
 int KYTY_SYSV_ABI AjmModuleUnregister(uint32_t context, uint32_t codec) {
 	PRINT_NAME();
-	LOGF("\t context = %" PRIu32 ", codec = %" PRIu32 "\n", context, codec);
+	AjmTrace("\t context = %" PRIu32 ", codec = %" PRIu32 "\n", context, codec);
 	return OK;
 }
 
@@ -800,13 +812,13 @@ int KYTY_SYSV_ABI AjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t f
 		g_ajm_instances[*instance] = std::move(state);
 	}
 
-	LOGF("\t context  = %" PRIu32 "\n"
+	AjmTrace("\t context  = %" PRIu32 "\n"
 	     "\t codec    = %" PRIu32 "\n"
 	     "\t flags    = 0x%016" PRIx64 "\n"
 	     "\t instance = 0x%08" PRIx32 "\n",
 	     context, codec, flags, *instance);
 	if (!supported) {
-		LOGF("\t unsupported codec instance created without decoder\n");
+		AjmTrace("\t unsupported codec instance created without decoder\n");
 	}
 
 	return OK;
@@ -814,7 +826,7 @@ int KYTY_SYSV_ABI AjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t f
 
 int KYTY_SYSV_ABI AjmInstanceDestroy(uint32_t context, uint32_t instance) {
 	PRINT_NAME();
-	LOGF("\t context = %" PRIu32 ", instance = 0x%08" PRIx32 "\n", context, instance);
+	AjmTrace("\t context = %" PRIu32 ", instance = 0x%08" PRIx32 "\n", context, instance);
 
 	std::scoped_lock lock(g_ajm_instances_mutex);
 	g_ajm_instances.erase(instance);
@@ -824,14 +836,14 @@ int KYTY_SYSV_ABI AjmInstanceDestroy(uint32_t context, uint32_t instance) {
 
 int KYTY_SYSV_ABI AjmMemoryRegister(uint32_t context, void* ptr, size_t pages) {
 	PRINT_NAME();
-	LOGF("\t context = %" PRIu32 ", ptr = 0x%016" PRIx64 ", pages = 0x%016" PRIx64 "\n", context,
+	AjmTrace("\t context = %" PRIu32 ", ptr = 0x%016" PRIx64 ", pages = 0x%016" PRIx64 "\n", context,
 	     reinterpret_cast<uint64_t>(ptr), static_cast<uint64_t>(pages));
 	return OK;
 }
 
 int KYTY_SYSV_ABI AjmMemoryUnregister(uint32_t context, void* ptr) {
 	PRINT_NAME();
-	LOGF("\t context = %" PRIu32 ", ptr = 0x%016" PRIx64 "\n", context,
+	AjmTrace("\t context = %" PRIu32 ", ptr = 0x%016" PRIx64 "\n", context,
 	     reinterpret_cast<uint64_t>(ptr));
 	return OK;
 }
@@ -885,7 +897,7 @@ int KYTY_SYSV_ABI AjmBatchWait(uint32_t context, uint32_t batch, uint32_t timeou
 
 int KYTY_SYSV_ABI AjmBatchCancel(uint32_t context, uint32_t batch) {
 	PRINT_NAME();
-	LOGF("\t context = %" PRIu32 ", batch = %" PRIu32 "\n", context, batch);
+	AjmTrace("\t context = %" PRIu32 ", batch = %" PRIu32 "\n", context, batch);
 	return OK;
 }
 
@@ -894,7 +906,7 @@ int KYTY_SYSV_ABI AjmBatchErrorDump(const AjmBatchInfo* info, AjmBatchError* err
 	if (error != nullptr) {
 		std::memset(error, 0, sizeof(AjmBatchError));
 	}
-	LOGF("\t info = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(info));
+	AjmTrace("\t info = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(info));
 	return OK;
 }
 
@@ -908,7 +920,7 @@ int KYTY_SYSV_ABI AjmBatchJobInitialize(AjmBatchInfo* info, uint32_t instance,
 	    AjmInitializeInstance(instance, codec_parameters, codec_parameters_size);
 	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decode_result);
 
-	LOGF("\t instance = 0x%08" PRIx32 ", codec_parameters = 0x%016" PRIx64 ", size = 0x%016" PRIx64
+	AjmTrace("\t instance = 0x%08" PRIx32 ", codec_parameters = 0x%016" PRIx64 ", size = 0x%016" PRIx64
 	     "\n",
 	     instance, reinterpret_cast<uint64_t>(codec_parameters),
 	     static_cast<uint64_t>(codec_parameters_size));
@@ -933,7 +945,7 @@ int KYTY_SYSV_ABI AjmBatchJobClearContext(AjmBatchInfo* info, uint32_t instance,
 	}
 
 	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decode_result);
-	LOGF("\t instance = 0x%08" PRIx32 "\n", instance);
+	AjmTrace("\t instance = 0x%08" PRIx32 "\n", instance);
 	return AjmAppendJob(info, AJM_JOB_CONTROL_SIZE, "clear-context");
 }
 
@@ -949,7 +961,7 @@ int KYTY_SYSV_ABI AjmBatchJobDecode(AjmBatchInfo* info, uint32_t instance,
 	    result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_STREAM_SIZE + AJM_SIDEBAND_MFRAME_SIZE,
 	    decode_result, true);
 
-	LOGF("\t instance = 0x%08" PRIx32 ", input = 0x%016" PRIx64 ", input_size = 0x%016" PRIx64
+	AjmTrace("\t instance = 0x%08" PRIx32 ", input = 0x%016" PRIx64 ", input_size = 0x%016" PRIx64
 	     ", output = 0x%016" PRIx64 ", output_size = 0x%016" PRIx64 "\n",
 	     instance, reinterpret_cast<uint64_t>(bitstream_input),
 	     static_cast<uint64_t>(bitstream_input_size), reinterpret_cast<uint64_t>(pcm_output),
@@ -968,7 +980,7 @@ int KYTY_SYSV_ABI AjmBatchJobDecodeSingle(AjmBatchInfo* info, uint32_t instance,
 	AjmWriteStreamResult(result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_STREAM_SIZE, decode_result,
 	                     false);
 
-	LOGF("\t instance = 0x%08" PRIx32 "\n", instance);
+	AjmTrace("\t instance = 0x%08" PRIx32 "\n", instance);
 	return AjmAppendJob(info, AJM_JOB_RUN_SIZE, "decode-single");
 }
 
@@ -985,7 +997,7 @@ int KYTY_SYSV_ABI AjmBatchJobDecodeSplit(AjmBatchInfo* info, uint32_t instance,
 	    result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_STREAM_SIZE + AJM_SIDEBAND_MFRAME_SIZE,
 	    decode_result, true);
 
-	LOGF("\t instance = 0x%08" PRIx32 ", input_buffers = 0x%016" PRIx64
+	AjmTrace("\t instance = 0x%08" PRIx32 ", input_buffers = 0x%016" PRIx64
 	     ", input_num = 0x%016" PRIx64 ", output_buffers = 0x%016" PRIx64
 	     ", output_num = 0x%016" PRIx64 "\n",
 	     instance, reinterpret_cast<uint64_t>(input_buffers),
@@ -1012,7 +1024,7 @@ int KYTY_SYSV_ABI AjmBatchJobEncode(AjmBatchInfo* info, uint32_t instance, const
 	AjmWriteStreamResult(
 	    result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_STREAM_SIZE + AJM_SIDEBAND_MFRAME_SIZE,
 	    encode_result, true);
-	LOGF("\t instance = 0x%08" PRIx32 ", input = 0x%016" PRIx64 ", output = 0x%016" PRIx64 "\n",
+	AjmTrace("\t instance = 0x%08" PRIx32 ", input = 0x%016" PRIx64 ", output = 0x%016" PRIx64 "\n",
 	     instance, reinterpret_cast<uint64_t>(pcm_input),
 	     reinterpret_cast<uint64_t>(bitstream_output));
 	return AjmAppendJob(info, AJM_JOB_RUN_SIZE, "encode");
@@ -1027,7 +1039,7 @@ int KYTY_SYSV_ABI AjmBatchJobGetInfo(AjmBatchInfo* info, uint32_t instance, void
 	AjmWriteFormat(result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_FORMAT_SIZE, format,
 	               decode_result);
 
-	LOGF("\t instance = 0x%08" PRIx32 "\n", instance);
+	AjmTrace("\t instance = 0x%08" PRIx32 "\n", instance);
 	return AjmAppendJob(info, AJM_JOB_RUN_SIZE, "get-info");
 }
 
@@ -1042,7 +1054,7 @@ int KYTY_SYSV_ABI AjmBatchJobGetCodecInfo(AjmBatchInfo* info, uint32_t instance,
 	AjmWriteResult(result, result_size, decode_result);
 	AjmWriteCodecInfo(decoder, result, result_size, decode_result);
 
-	LOGF("\t instance = 0x%08" PRIx32 ", result_size = 0x%016" PRIx64 "\n", instance,
+	AjmTrace("\t instance = 0x%08" PRIx32 ", result_size = 0x%016" PRIx64 "\n", instance,
 	     static_cast<uint64_t>(result_size));
 	return AjmAppendJob(info, AJM_JOB_RUN_SIZE, "get-codec-info");
 }
@@ -1053,7 +1065,7 @@ int KYTY_SYSV_ABI AjmBatchJobSetGaplessDecode(AjmBatchInfo* info, uint32_t insta
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 	const auto decode_result = AjmSetGaplessDecode(instance, gapless_decode, reset);
 	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decode_result);
-	LOGF("\t instance = 0x%08" PRIx32 ", gapless_decode = 0x%016" PRIx64 ", reset = %d\n", instance,
+	AjmTrace("\t instance = 0x%08" PRIx32 ", gapless_decode = 0x%016" PRIx64 ", reset = %d\n", instance,
 	     reinterpret_cast<uint64_t>(gapless_decode), reset);
 	return AjmAppendJob(info, AJM_JOB_CONTROL_SIZE, "set-gapless");
 }
@@ -1072,7 +1084,7 @@ int KYTY_SYSV_ABI AjmBatchJobGetGaplessDecode(AjmBatchInfo* info, uint32_t insta
 		*gapless      = gapless_decode;
 	}
 
-	LOGF("\t instance = 0x%08" PRIx32 "\n", instance);
+	AjmTrace("\t instance = 0x%08" PRIx32 "\n", instance);
 	return AjmAppendJob(info, AJM_JOB_RUN_SIZE, "get-gapless");
 }
 
@@ -1081,7 +1093,7 @@ int KYTY_SYSV_ABI AjmBatchJobSetResampleParameters(AjmBatchInfo* info, uint32_t 
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE);
-	LOGF("\t instance = 0x%08" PRIx32 ", ratio = %f, flags = 0x%08" PRIx32 "\n", instance,
+	AjmTrace("\t instance = 0x%08" PRIx32 ", ratio = %f, flags = 0x%08" PRIx32 "\n", instance,
 	     static_cast<double>(ratio), flags);
 	return AjmAppendJob(info, AJM_JOB_SET_RESAMPLE_PARAMETERS_SIZE, "set-resample");
 }
@@ -1093,7 +1105,7 @@ int KYTY_SYSV_ABI AjmBatchJobSetResampleParametersEx(AjmBatchInfo* info, uint32_
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE);
-	LOGF("\t instance = 0x%08" PRIx32 ", ratio_start = %f, ratio_change = %f, flags = 0x%08" PRIx32
+	AjmTrace("\t instance = 0x%08" PRIx32 ", ratio_start = %f, ratio_change = %f, flags = 0x%08" PRIx32
 	     "\n",
 	     instance, static_cast<double>(ratio_start), static_cast<double>(ratio_change_per_sample),
 	     flags);
@@ -1113,7 +1125,7 @@ int KYTY_SYSV_ABI AjmBatchJobGetResampleInfo(AjmBatchInfo* info, uint32_t instan
 		                                                             AJM_SIDEBAND_RESULT_SIZE);
 		resample->ratio = 1.0f;
 	}
-	LOGF("\t instance = 0x%08" PRIx32 "\n", instance);
+	AjmTrace("\t instance = 0x%08" PRIx32 "\n", instance);
 	return AjmAppendJob(info, AJM_JOB_RUN_SIZE, "get-resample-info");
 }
 
@@ -1137,7 +1149,7 @@ int KYTY_SYSV_ABI AjmBatchJobControl(AjmBatchInfo* info, uint32_t instance, uint
 	                                                    sideband_input_size, &decoder, &gapless);
 	AjmWriteSideband(flags, sideband_output, sideband_output_size, decoder, gapless, decode_result);
 
-	LOGF("\t instance = 0x%08" PRIx32 ", flags = 0x%016" PRIx64 ", input = 0x%016" PRIx64
+	AjmTrace("\t instance = 0x%08" PRIx32 ", flags = 0x%016" PRIx64 ", input = 0x%016" PRIx64
 	     ", input_size = 0x%016" PRIx64 ", output = 0x%016" PRIx64 ", output_size = 0x%016" PRIx64
 	     "\n",
 	     instance, flags, reinterpret_cast<uint64_t>(sideband_input),
@@ -1161,7 +1173,7 @@ int KYTY_SYSV_ABI AjmBatchJobRun(AjmBatchInfo* info, uint32_t instance, uint64_t
 	(void)AjmGetInstanceFormat(instance, nullptr, &decoder, &gapless);
 	AjmWriteSideband(flags, sideband_output, sideband_output_size, decoder, gapless, decode_result);
 
-	LOGF("\t instance = 0x%08" PRIx32 ", flags = 0x%016" PRIx64 ", input = 0x%016" PRIx64
+	AjmTrace("\t instance = 0x%08" PRIx32 ", flags = 0x%016" PRIx64 ", input = 0x%016" PRIx64
 	     ", input_size = 0x%016" PRIx64 ", output = 0x%016" PRIx64 ", output_size = 0x%016" PRIx64
 	     "\n",
 	     instance, flags, reinterpret_cast<uint64_t>(data_input),
@@ -1185,7 +1197,7 @@ int KYTY_SYSV_ABI AjmBatchJobRunSplit(AjmBatchInfo* info, uint32_t instance, uin
 	(void)AjmGetInstanceFormat(instance, nullptr, &decoder, &gapless);
 	AjmWriteSideband(flags, sideband_output, sideband_output_size, decoder, gapless, decode_result);
 
-	LOGF("\t instance = 0x%08" PRIx32 ", flags = 0x%016" PRIx64 ", input_buffers = 0x%016" PRIx64
+	AjmTrace("\t instance = 0x%08" PRIx32 ", flags = 0x%016" PRIx64 ", input_buffers = 0x%016" PRIx64
 	     ", input_num = 0x%016" PRIx64 ", output_buffers = 0x%016" PRIx64
 	     ", output_num = 0x%016" PRIx64 "\n",
 	     instance, flags, reinterpret_cast<uint64_t>(input_buffers),
@@ -1196,7 +1208,7 @@ int KYTY_SYSV_ABI AjmBatchJobRunSplit(AjmBatchInfo* info, uint32_t instance, uin
 
 const char* KYTY_SYSV_ABI AjmStrError(int error) {
 	PRINT_NAME();
-	LOGF("\t error = %d\n", error);
+	AjmTrace("\t error = %d\n", error);
 	return "AJM";
 }
 

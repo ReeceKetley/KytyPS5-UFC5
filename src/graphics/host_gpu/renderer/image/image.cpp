@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -10,6 +11,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
+#include <cinttypes>
 #include <cstdint>
 #include <xxhash.h>
 
@@ -114,9 +118,21 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		range->base_layer  = 0;
 		range->layer_count = 1;
 	}
+	// The backing may have fewer levels than the guest declared (over-declared mip
+	// chain clamped at creation, see the Image ctor). Keep every transition inside the
+	// real range so we never emit a barrier for a level that does not exist.
+	if (range && backing.mip_levels != 0) {
+		if (range->base_level >= backing.mip_levels) {
+			range->base_level = backing.mip_levels - 1;
+		}
+		if (range->base_level + range->level_count > backing.mip_levels) {
+			range->level_count = backing.mip_levels - range->base_level;
+		}
+	}
+	const uint32_t full_levels = std::min<uint32_t>(info.resources.levels, backing.mip_levels);
 
 	const bool partial =
-	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||
+	    range && (range->base_level != 0 || range->level_count != full_levels ||
 	              range->base_layer != 0 || range->layer_count != info.resources.layers);
 	const bool has_subresource_states = !subresource_states.empty();
 
@@ -127,7 +143,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		}
 
 		const uint32_t base_level  = partial ? range->base_level : 0;
-		const uint32_t level_count = partial ? range->level_count : info.resources.levels;
+		const uint32_t level_count = partial ? range->level_count : full_levels;
 		const uint32_t base_layer  = partial ? range->base_layer : 0;
 		const uint32_t layer_count = partial ? range->layer_count : info.resources.layers;
 		for (uint32_t level = base_level; level < base_level + level_count; level++) {
@@ -736,6 +752,26 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	backing.samples     = info.samples;
 	backing.flags       = ImageCreateFlags(graphics, info);
 	backing.usage       = ImageUsageFlags(graphics, info);
+	// Vulkan requires mipLevels <= floor(log2(max_dim)) + 1. UFC 5 over-declares some
+	// storage mip chains by one level (e.g. 0x123c370000: 512x512 asking for 11). The
+	// extra level has undefined contents and shows as RGB speckle when sampled, so
+	// clamp to the complete chain; FindView() folds any descriptor that still points
+	// at the dropped level back into the real range.
+	const auto complete_levels = std::bit_width(
+	    std::max({backing.extent.width, backing.extent.height, backing.extent.depth}));
+	if (backing.mip_levels > complete_levels) {
+		static std::atomic<uint32_t> invalid_mip_logs = 0;
+		if (invalid_mip_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("ImageMipTrace: addr=0x%016" PRIx64 " size=0x%" PRIx64
+			     " extent=%ux%ux%u levels=%u complete=%u layers=%u type=%u"
+			     " guest_format=%u host_format=%d tile=%u (clamped)\n",
+			     info.data.address, info.data.size, backing.extent.width, backing.extent.height,
+			     backing.extent.depth, backing.mip_levels, complete_levels, backing.layers,
+			     static_cast<uint32_t>(info.type), static_cast<uint32_t>(info.guest_format),
+			     static_cast<int>(backing.format), static_cast<uint32_t>(info.tile_mode));
+		}
+		backing.mip_levels = complete_levels;
+	}
 
 	vk::ImageCreateInfo create {};
 	create.flags         = backing.flags;

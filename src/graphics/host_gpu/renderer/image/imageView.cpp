@@ -593,6 +593,17 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	// A guest descriptor may reference a mip level that was clamped away when the image
+	// was created with an over-declared chain (see image.cpp). Fold the request back
+	// into the real range instead of failing the view - the dropped level is the
+	// 1x1 tail and reads of it degenerate to the smallest real mip.
+	if (image.mip_levels != 0 && normalized.base_level >= image.mip_levels) {
+		normalized.base_level = image.mip_levels - 1;
+	}
+	if (image.mip_levels != 0 &&
+	    normalized.level_count > image.mip_levels - normalized.base_level) {
+		normalized.level_count = image.mip_levels - normalized.base_level;
+	}
 	const bool format_compatible = normalized.format != vk::Format::eUndefined &&
 	                               ImageViewOps::FormatsCompatible(image.format, normalized.format);
 	const bool slice_view =

@@ -35,6 +35,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -382,6 +383,41 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
+	// UFC 5 builds its UI-presence mask from tiled colour-buffer metadata. Vulkan
+	// colour draws currently leave that guest metadata empty. For this exact 1080p
+	// mask kernel, conservatively visit every UI pixel in the later compositor;
+	// its original premultiplied-alpha blend still determines the resulting colour.
+	// This is a title-specific compatibility path, not CMask emulation.
+	static const bool ufc_ui_mask_fallback = [] {
+		const char* value = std::getenv("KYTY_UFC_UI_MASK_FALLBACK");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	if (ufc_ui_mask_fallback && program.shader_hash == 0x5942a92ebef7b363ull &&
+	    !use_thread_dimensions && thread_group_x == 15 && thread_group_y == 135 &&
+	    thread_group_z == 1 && input_info.threads_num[0] == 32 &&
+	    input_info.threads_num[1] == 2 && input_info.threads_num[2] == 1 &&
+	    resources.buffers.size() == 3 && program.info.buffers.size() == 3 &&
+	    program.info.images.empty() && program.info.buffers[2].written &&
+	    !program.info.buffers[2].read) {
+		const auto destination = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[2]);
+		if (destination.Base48() != 0 && (destination.Base48() & 3u) == 0 &&
+		    destination.Stride() == 4 && destination.NumRecords() == 4050 &&
+		    static_cast<uint32_t>(destination.Format()) == 5) {
+			constexpr uint64_t byte_size = 4050 * sizeof(uint32_t);
+			buffer.EndRendering();
+			m_context.GetTextureCache().InvalidateMemoryFromGPU(destination.Base48(), byte_size);
+			auto [mask, offset] = m_context.GetBufferCache().ObtainBuffer(
+			    destination.Base48(), byte_size, true, true);
+			mask->Fill(offset, byte_size, UINT32_MAX);
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+				LOGF("UfcUiMask: conservative 1080p coverage addr=0x%016" PRIx64 "\n",
+				     destination.Base48());
+			}
+			ResetBindings();
+			return;
+		}
+	}
 	if (TryConsumeComputeMetaClear(input_info, buffer)) {
 		ResetBindings();
 		return;
@@ -534,12 +570,20 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	if (skip_cs) {
-		// Rather than dropping the dispatch outright (which leaves the occlusion-cull
-		// shader's Hi-Z / software-depth outputs holding stale data, so every GPU-driven
-		// draw is culled and the scene renders black), stub it to "nothing occludes":
-		// clear its read-write images to zero. Zero is what the real shader stores into a
-		// tile with no occluder (IMAGE_STORE v=0 at tile setup), and with Frostbite's
-		// reverse-Z that is the far plane, so downstream visibility tests pass everything.
+		// Experimental replacement: clear written images and leave buffers untouched.
+		// The watched UFC shader clears these images at tile setup, but later accumulates
+		// color and reads/writes packed data and linked entries in its buffers. This
+		// is not a proven "all visible" replacement for the complete shader.
+		for (uint32_t i = 0; i < program.info.buffers.size() && i < resources.buffers.size(); i++) {
+			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+			const auto size = BufferDescriptorSize(descriptor);
+			if (TraceResourceAddress(descriptor.Base48(), size)) {
+				const auto& resource = program.info.buffers[i];
+				TraceResourceBinding(frame_num,
+				    fmt::format("skipped_hash=0x{:016x} buffer={} addr=0x{:x} bytes={} read={} write={}",
+				                shader_hash, i, descriptor.Base48(), size, resource.read, resource.written));
+			}
+		}
 		auto&    cache        = buffer.GetContext().GetTextureCache();
 		uint32_t cleared      = 0;
 		for (uint32_t i = 0; i < program.info.images.size() && i < resources.images.size(); i++) {

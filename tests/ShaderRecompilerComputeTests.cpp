@@ -25275,6 +25275,42 @@ void CheckImageTransitionState(RenderContext &renderer) {
   Buffer copy_scratch(context, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                       16);
   buffered_destination.CopyImageWithBuffer(buffered_source, copy_scratch);
+  // UFC retypes a one-dimensional R32 surface as a two-dimensional row. The
+  // buffer route must preserve all bits (including NaN payloads) in both directions.
+  auto row_info = buffered_info;
+  row_info.type = Prospero::ImageType::kColor1D;
+  row_info.pixel_format = vk::Format::eR32Sfloat;
+  row_info.guest_format = Prospero::BufferFormat::k32Float;
+  row_info.extent = {4, 1, 1};
+  row_info.pitch = 4;
+  row_info.bytes_per_block = 4;
+  row_info.mip_layout[0] = {0, 16, 4, 1};
+  Image row_source(context, scheduler, row_info);
+  Image row_return(context, scheduler, row_info);
+  row_info.type = Prospero::ImageType::kColor2D;
+  Image row_target(context, scheduler, row_info);
+  constexpr std::array<uint32_t, 4> row_expected{
+      0x3f800000u, 0x7fc01234u, 0x80000000u, 0xdeadbeefu};
+  const auto [row_upload, row_upload_offset] = upload.Map(sizeof(row_expected), 4);
+  Require(name, "row-copy upload map", row_upload != nullptr,
+          "row-copy source allocation failed");
+  std::memcpy(row_upload, row_expected.data(), sizeof(row_expected));
+  upload.Commit();
+  vk::BufferImageCopy row_region{};
+  row_region.bufferOffset = row_upload_offset;
+  row_region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+  row_region.imageExtent = row_info.extent;
+  row_source.Upload(std::span{&row_region, 1}, upload.Handle(), row_upload_offset,
+                    sizeof(row_expected));
+  row_target.CopyImageWithBuffer(row_source, copy_scratch);
+  row_return.CopyImageWithBuffer(row_target, copy_scratch);
+  const auto [row_download, row_download_offset] = download.Map(sizeof(row_expected), 4);
+  Require(name, "row-copy download map", row_download != nullptr,
+          "row-copy destination allocation failed");
+  download.Commit();
+  row_region.bufferOffset = row_download_offset;
+  row_return.Download(std::span{&row_region, 1}, download.Handle(), row_download_offset,
+                      sizeof(row_expected));
   const auto [buffered_download_data, buffered_download_offset] =
       download.Map(buffered_expected.size(), 4);
   Require(name, "buffered-copy download map", buffered_download_data != nullptr,
@@ -25287,6 +25323,10 @@ void CheckImageTransitionState(RenderContext &renderer) {
   scheduler.Finish();
   download.Invalidate(download_offset, 128);
   download.Invalidate(buffered_download_offset, buffered_expected.size());
+  download.Invalidate(row_download_offset, sizeof(row_expected));
+  Require(name, "1D/2D row copy contents",
+          std::memcmp(row_download, row_expected.data(), sizeof(row_expected)) == 0,
+          "buffered 1D/2D roundtrip did not preserve raw R32 bits");
   Require(name, "depth/stencil mip contents",
           std::memcmp(download_data, expected_depth.data(),
                       sizeof(expected_depth)) == 0 &&

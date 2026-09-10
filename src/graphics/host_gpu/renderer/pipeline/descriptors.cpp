@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -622,6 +623,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 
 	const bool    volume       = type == Prospero::ImageType::kColor3D;
+	if (!multisampled && levels > std::bit_width(std::max({width, height, volume ? depth : 1u}))) {
+		static std::atomic<uint32_t> invalid_mip_logs = 0;
+		if (invalid_mip_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("TextureMipTrace: addr=0x%016" PRIx64 " base=%u last=%u max=%u r128=%d"
+			     " storage=%d dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			     address, base_level, last_level, descriptor.MaxMip(), resource.r128, storage,
+			     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+			     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+		}
+	}
 	const bool    layered      = type == Prospero::ImageType::kColor1DArray ||
 	                             type == Prospero::ImageType::kColor2DArray ||
 	                             type == Prospero::ImageType::kColor2DMsaaArray;
@@ -831,6 +842,15 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			continue;
 		}
 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+		if (TraceResourceAddress(address, size)) {
+			const auto& resource = program.info.buffers[i];
+			TraceResourceBinding(m_context.GetGpu().GetFrameNum(),
+			    fmt::format("stage={} hash=0x{:016x} buffer={} addr=0x{:x} bytes={} "
+			                "read={} write={} atomic={} stride={} records={} guest_format={}",
+			                static_cast<uint32_t>(program.stage), program.shader_hash, i,
+			                address, size, resource.read, resource.written, resource.atomic,
+			                stride, records, static_cast<uint32_t>(descriptor.Format())));
+		}
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}
 }
@@ -878,6 +898,25 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	const bool capture_inputs = CaptureShaderInputs(program.shader_hash, m_context.GetGpu().GetFrameNum());
+	static const bool capture_buffers = std::getenv("KYTY_CAPTURE_INPUT_BUFFERS") != nullptr;
+	if (capture_inputs && capture_buffers) {
+		for (uint32_t i = 0; i < prepared.buffers.size(); ++i) {
+			const auto& source = prepared.buffer_sources[i];
+			if (!program.info.buffers[i].read || source.address == 0 || source.size == 0 ||
+			    source.size > (1ull << 20)) continue;
+			const auto& buffer = prepared.buffers[i];
+			const auto dword = program.bindings.memory_offset_dword + i / 4u;
+			const auto adjustment = (prepared.shader_data[dword] >> ((i % 4u) * 8u)) & 0xffu;
+			DumpShaderBufferInput(m_context.GetCommandScheduler().Current(), m_context,
+			    buffer.buffer, buffer.offset + adjustment, source.size,
+			    fmt::format("input-{:016x}-b{}-{:x}", program.shader_hash, i, source.address));
+			LOGF("CaptureBuffer: frame=%" PRIu64 " hash=0x%016" PRIx64
+			     " buffer=%u addr=0x%" PRIx64 " bytes=%" PRIu64 " adjustment=%u\n",
+			     static_cast<uint64_t>(m_context.GetGpu().GetFrameNum()), program.shader_hash,
+			     i, source.address, source.size, adjustment);
+		}
+	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
@@ -914,6 +953,36 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+		if (capture_inputs && resource.read && binding.desc.view_info.base_level == 0 &&
+		    binding.desc.view_info.base_layer == 0 && image.backing.layers == 1) {
+			DumpShaderInput(m_context.GetCommandScheduler().Current(), m_context, image,
+			    fmt::format("input-{:016x}-i{}-{:x}", program.shader_hash, i, image.info.data.address));
+		}
+		if (capture_inputs || TraceResourceAddress(binding.desc.info.data.address, binding.desc.info.data.size)) {
+			// Report the view actually returned by the cache, not just the guest request.
+			const auto actual = std::find_if(image.views.begin(), image.views.end(),
+			    [&](const auto& view) { return view.view == binding.image_view; });
+			const auto message = fmt::format("stage={} hash=0x{:016x} image={} addr=0x{:x} bytes={} "
+			                "read={} write={} numeric={} guest_format={} requested_vk={} "
+			                "backing_vk={} actual_vk={} extent={}x{} mip={}+{} layer={}+{} "
+			                "backing_addr=0x{:x} backing_levels={} backing_layers={}",
+			                static_cast<uint32_t>(program.stage), program.shader_hash, i,
+			                binding.desc.info.data.address, binding.desc.info.data.size,
+			                resource.read, resource.written, static_cast<uint32_t>(resource.numeric_class),
+			                static_cast<uint32_t>(binding.desc.info.guest_format),
+			                static_cast<int>(binding.desc.view_info.format), static_cast<int>(image.backing.format),
+			                actual == image.views.end() ? -1 : static_cast<int>(actual->info.format),
+			                binding.desc.info.extent.width, binding.desc.info.extent.height,
+			                binding.desc.view_info.base_level, binding.desc.view_info.level_count,
+			                binding.desc.view_info.base_layer, binding.desc.view_info.layer_count,
+			                image.info.data.address, image.backing.mip_levels, image.backing.layers);
+			if (capture_inputs) {
+				LOGF("CaptureBinding: frame=%" PRIu64 " %s\n",
+				     static_cast<uint64_t>(m_context.GetGpu().GetFrameNum()), message.c_str());
+			} else {
+				TraceResourceBinding(m_context.GetGpu().GetFrameNum(), message);
+			}
+		}
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
 	}

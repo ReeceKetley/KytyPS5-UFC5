@@ -644,6 +644,20 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	ShaderParams pixel_params;
 	if (pixel_active) {
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		const auto& blend = context.GetBlendControl(0);
+		const auto secondary = [](uint8_t factor) {
+			return factor >= static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color) &&
+			       factor <= static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
+		};
+		pixel_info.ps_dual_source_blend = blend.enable &&
+		    !context.GetRenderTarget(0).info.blend_bypass && (context.GetRenderTargetMask() & 0xfu) &&
+		    (secondary(blend.color_srcblend) || secondary(blend.color_destblend) ||
+		     (blend.separate_alpha_blend &&
+		      (secondary(blend.alpha_srcblend) || secondary(blend.alpha_destblend))));
+		if (pixel_info.ps_dual_source_blend) {
+			// Export 1 is the secondary blend input for target 0, not a second attachment.
+			pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
+		}
 	}
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
