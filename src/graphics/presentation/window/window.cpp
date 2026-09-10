@@ -1036,6 +1036,9 @@ void WindowContext::UpdateTitle() {
 	static double   sendcmd_ms       = 0.0;
 	static double   drawprep_ms      = 0.0;
 	static double   faultbuf_ms      = 0.0;
+	static double   hwcheck_ms       = 0.0;
+	static double   getprog_ms       = 0.0;
+	static double   rtresolve_ms     = 0.0;
 	static uint32_t processes        = 0;
 	static uint32_t gcs              = 0;
 	static uint32_t faultbufs        = 0;
@@ -1060,6 +1063,9 @@ void WindowContext::UpdateTitle() {
 	sendcmd_ms += gpu.sendcmd_ms;
 	drawprep_ms += gpu.drawprep_ms;
 	faultbuf_ms += gpu.faultbuf_ms;
+	hwcheck_ms += gpu.hwcheck_ms;
+	getprog_ms += gpu.pipeline_ms;
+	rtresolve_ms += gpu.rtresolve_ms;
 	processes += gpu.processes;
 	gcs += gpu.gcs;
 	faultbufs += gpu.faultbufs;
@@ -1078,12 +1084,13 @@ void WindowContext::UpdateTitle() {
 		LOGF("FrameProfile: fps=%.3f frames=%" PRIu64 " shader_compiles=%u shader_ms=%.1f "
 		     "pso_creates=%u pso_ms=%.1f draws=%u draw_ms=%.1f dispatch=%u dispatch_ms=%.1f "
 		     "submit=%u submit_ms=%.1f finish=%u finish_ms=%.1f present_ms=%.1f "
-		     "process=%u process_ms=%.1f drawprep_ms=%.1f gc=%u gc_ms=%.1f faultbuf=%u "
+		     "process=%u process_ms=%.1f drawprep_ms=%.1f hwcheck_ms=%.1f getprog_ms=%.1f "
+		     "rtresolve_ms=%.1f gc=%u gc_ms=%.1f faultbuf=%u "
 		     "faultbuf_ms=%.1f flush_ms=%.1f sendcmd_ms=%.1f cp_rest=%.1f\n",
 		     current_fps, fps_frames, shader_compiles, shader_ms, pipeline_creates, pipeline_ms,
 		     draws, draw_ms, dispatches, dispatch_ms, submits, submit_ms, finishes, finish_ms,
-		     present_ms, processes, process_ms, drawprep_ms, gcs, gc_ms, faultbufs, faultbuf_ms,
-		     flush_ms, sendcmd_ms, cp_rest);
+		     present_ms, processes, process_ms, drawprep_ms, hwcheck_ms, getprog_ms, rtresolve_ms,
+		     gcs, gc_ms, faultbufs, faultbuf_ms, flush_ms, sendcmd_ms, cp_rest);
 		fps_start        = now;
 		fps_frames       = 0;
 		shader_compiles  = 0;
@@ -1105,6 +1112,9 @@ void WindowContext::UpdateTitle() {
 		sendcmd_ms       = 0.0;
 		drawprep_ms      = 0.0;
 		faultbuf_ms      = 0.0;
+		hwcheck_ms       = 0.0;
+		getprog_ms       = 0.0;
+		rtresolve_ms     = 0.0;
 		processes        = 0;
 		gcs              = 0;
 		faultbufs        = 0;

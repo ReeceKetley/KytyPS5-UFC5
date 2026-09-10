@@ -157,9 +157,11 @@ private:
 	// command buffer. A WAIT_REG_MEM on one of these is an intra-buffer GPU->GPU
 	// dependency the Vulkan command order already satisfies - no CPU flush-and-wait.
 	void NoteGpuLabelWrite(uint64_t address, uint64_t value);
-	[[nodiscard]] bool GpuLabelSatisfies(uint64_t address, uint64_t ref, uint64_t mask,
-	                                     uint32_t func) const;
-	void ClearGpuLabels() { m_pending_gpu_labels.clear(); }
+	// 0 = miss, 1 = intra-buffer hit (this CP), 2 = cross-queue hit (another CP).
+	[[nodiscard]] int GpuLabelSatisfies(uint64_t address, uint64_t ref, uint64_t mask,
+	                                    uint32_t func) const;
+	// Drop entries whose target now holds a satisfying value (their write has landed).
+	static void PruneSatisfiedGpuLabels();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 	void                CheckBuffer() const { GetScheduler().CheckActive(); }
@@ -189,7 +191,6 @@ private:
 	FlipInfo  m_flip;
 	const int m_interrupt_event_id;
 	uint64_t  m_submit_id                   = 0;
-	std::unordered_map<uint64_t, uint64_t> m_pending_gpu_labels;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
 };

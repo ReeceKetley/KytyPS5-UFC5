@@ -987,6 +987,7 @@ ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeC
 }
 
 void hw_check(const CommandBuffer& buffer) {
+	FrameWorkScope hwcheck_scope(FrameWorkKind::HwCheck);
 	const auto& hw      = buffer.GetRegisters();
 	const auto  rt_slot = render_target_first_bound_slot(buffer);
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
@@ -1102,7 +1103,7 @@ void hw_print(const CommandBuffer& buffer) {
 
 namespace {
 
-constexpr size_t kFrameWorkKindCount = 11;
+constexpr size_t kFrameWorkKindCount = 14;
 
 std::atomic<uint32_t> g_frame_work_count[kFrameWorkKindCount] {};
 std::atomic<uint64_t> g_frame_work_us[kFrameWorkKindCount] {};
@@ -1141,6 +1142,10 @@ FrameWorkPulse ConsumeFrameWorkPulse() {
 	take(FrameWorkKind::SendCmd, pulse.sendcmds, pulse.sendcmd_ms);
 	take(FrameWorkKind::DrawPrep, pulse.drawpreps, pulse.drawprep_ms);
 	take(FrameWorkKind::FaultBuf, pulse.faultbufs, pulse.faultbuf_ms);
+	take(FrameWorkKind::HwCheck, pulse.hwchecks, pulse.hwcheck_ms);
+	uint32_t ignore = 0;
+	take(FrameWorkKind::Pipeline, ignore, pulse.pipeline_ms);
+	take(FrameWorkKind::RtResolve, ignore, pulse.rtresolve_ms);
 	return pulse;
 }
 

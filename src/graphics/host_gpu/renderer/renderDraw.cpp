@@ -917,6 +917,7 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& b
                                             bool log_setup_phases, DrawRenderState& state) {
 	auto& ctx = buffer.GetRegisters();
 
+	FrameWorkScope rtresolve_scope(FrameWorkKind::RtResolve);
 	if (ResolveColorTargets(submit_id, buffer, render_target_slice_offset)) {
 		return false;
 	}
@@ -968,9 +969,12 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 	if (log_phases) {
 		LogDrawPhase(draw.name, "GetGraphicsPrograms");
 	}
-	state.programs = pipeline_cache.GetGraphicsPrograms(
-	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vs_input_info, state.ps_input_info);
+	{
+		FrameWorkScope pipeline_scope(FrameWorkKind::Pipeline);
+		state.programs = pipeline_cache.GetGraphicsPrograms(
+		    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
+		    target_export_mapping, state.ps_active, state.vs_input_info, state.ps_input_info);
+	}
 }
 
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,

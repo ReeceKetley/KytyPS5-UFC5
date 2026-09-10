@@ -67,6 +67,9 @@ enum class FrameWorkKind : uint8_t {
 	DrawPrep, // whole RenderExecutor::DrawIndex/Auto (nests Draw): pipeline lookup,
 	          // descriptor resolve, FindImage/FindBuffer, hw_check
 	FaultBuf, // BufferCache::ProcessFaultBuffer (readback-via-page-fault, nests inside Gc)
+	HwCheck,  // hw_check + uc_check per-draw state validation (nests in DrawPrep)
+	Pipeline, // PipelineCache::GetGraphicsPrograms per draw (nests in DrawPrep)
+	RtResolve,// Resolve{Color,Depth}Target per draw (nests in DrawPrep)
 };
 
 struct FrameWorkPulse {
@@ -81,6 +84,7 @@ struct FrameWorkPulse {
 	uint32_t sendcmds    = 0;
 	uint32_t drawpreps   = 0;
 	uint32_t faultbufs   = 0;
+	uint32_t hwchecks    = 0;
 	double   draw_ms     = 0.0;
 	double   dispatch_ms = 0.0;
 	double   submit_ms   = 0.0;
@@ -92,6 +96,9 @@ struct FrameWorkPulse {
 	double   sendcmd_ms  = 0.0;
 	double   drawprep_ms = 0.0;
 	double   faultbuf_ms = 0.0;
+	double   hwcheck_ms  = 0.0;
+	double   pipeline_ms = 0.0;
+	double   rtresolve_ms = 0.0;
 };
 
 [[nodiscard]] FrameWorkPulse ConsumeFrameWorkPulse();

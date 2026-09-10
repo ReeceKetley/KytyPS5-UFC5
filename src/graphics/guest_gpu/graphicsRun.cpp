@@ -40,6 +40,17 @@ static thread_local bool              g_gpu_mutex_owned   = false;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
 
+// EOP/RELEASE_MEM label writes recorded but not yet observed in guest memory.
+// Shared across every CommandProcessor (graphics + async-compute queues) - all run
+// on the single GPU worker thread - so a graphics WAIT_REG_MEM can see a label an
+// async-compute EOP is going to write. value.second is the recording CP, used to
+// tell an intra-buffer wait (safe to skip outright) from a cross-queue one.
+struct PendingGpuLabel {
+	uint64_t                value    = 0;
+	const CommandProcessor* recorder = nullptr;
+};
+static std::unordered_map<uint64_t, PendingGpuLabel> g_pending_gpu_labels;
+
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
 	uint32_t instance_count;
@@ -237,7 +248,6 @@ void CommandProcessor::Reset() {
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
-	m_pending_gpu_labels.clear();
 
 	std::memset(m_const_ram, 0, sizeof(m_const_ram));
 }
@@ -270,16 +280,28 @@ void CommandProcessor::BufferInit() {
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
 }
 
+void CommandProcessor::PruneSatisfiedGpuLabels() {
+	// Keep entries whose write has not landed yet (a later cross-queue wait may still
+	// need them); drop the rest so the map stays small.
+	for (auto it = g_pending_gpu_labels.begin(); it != g_pending_gpu_labels.end();) {
+		const auto observed =
+		    *reinterpret_cast<const volatile uint32_t*>(static_cast<uintptr_t>(it->first));
+		if (observed == static_cast<uint32_t>(it->second.value)) {
+			it = g_pending_gpu_labels.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
 void CommandProcessor::BufferFlush() {
 	FrameWorkScope flush_scope(FrameWorkKind::Flush);
-	// The current command buffer is being submitted; its EOP label writes are now the
-	// scheduler's problem (deferred commits fire on completion).
-	m_pending_gpu_labels.clear();
+	PruneSatisfiedGpuLabels();
 	GetScheduler().Flush();
 }
 
 void CommandProcessor::BufferFlushAndWait() {
-	m_pending_gpu_labels.clear();
+	PruneSatisfiedGpuLabels();
 	GetScheduler().FlushAndWait();
 }
 
@@ -359,13 +381,24 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	// wait is in the same command list as that label, flush-and-wait so the
 	// deferred write is visible; otherwise suspend until a later submit.
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
-		// An EOP earlier in THIS command buffer is going to write this label. Anything
-		// the guest records after the wait lands in the same command buffer after that
-		// EOP's work, so the GPU already serialises it - skip the CPU flush-and-wait.
-		// The deferred label commit still writes guest memory when the submit retires.
-		if (GpuLabelSatisfies(reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(ref),
-		                      static_cast<uint64_t>(mask), func)) {
+		const int label = GpuLabelSatisfies(reinterpret_cast<uint64_t>(addr),
+		                                    static_cast<uint64_t>(ref),
+		                                    static_cast<uint64_t>(mask), func);
+		if (label == 1) {
+			// An EOP earlier in THIS command buffer is going to write this label.
+			// Anything recorded after the wait lands in the same command buffer after
+			// that EOP's work, so GPU command order already serialises it - no stall.
 			return;
+		}
+		if (label == 2) {
+			// Another queue's EOP is going to write this label. Drain any retired
+			// submissions first; if that queue already finished, the value is now real
+			// in guest memory and we can skip the stall with no ordering risk.
+			GetScheduler().PopPendingOperations();
+			if (TestWaitRegMemValue(*addr, ref, mask, func)) {
+				g_pending_gpu_labels.erase(reinterpret_cast<uint64_t>(addr));
+				return;
+			}
 		}
 		auto* exec = g_current_execution;
 		if (exec == nullptr || !exec->m_flushed_for_wait) {
@@ -725,17 +758,23 @@ void CommandProcessor::NoteGpuLabelWrite(uint64_t address, uint64_t value) {
 		return;
 	}
 	// A real frame records ~150 EOP labels; cap defensively against a pathological
-	// stream that never flushes.
-	if (m_pending_gpu_labels.size() >= 4096) {
-		m_pending_gpu_labels.clear();
+	// stream that never prunes.
+	if (g_pending_gpu_labels.size() >= 4096) {
+		g_pending_gpu_labels.clear();
 	}
-	m_pending_gpu_labels[address] = value;
+	g_pending_gpu_labels[address] = {value, this};
 }
 
-bool CommandProcessor::GpuLabelSatisfies(uint64_t address, uint64_t ref, uint64_t mask,
-                                         uint32_t func) const {
-	const auto it = m_pending_gpu_labels.find(address);
-	return it != m_pending_gpu_labels.end() && TestWaitRegMemValue(it->second, ref, mask, func);
+// 0 = not pending, 1 = pending and this CP recorded it (intra-buffer: skip stall
+// outright), 2 = pending but another queue recorded it (cross-queue: only safe to
+// skip once the value is actually observed in guest memory).
+int CommandProcessor::GpuLabelSatisfies(uint64_t address, uint64_t ref, uint64_t mask,
+                                        uint32_t func) const {
+	const auto it = g_pending_gpu_labels.find(address);
+	if (it == g_pending_gpu_labels.end() || !TestWaitRegMemValue(it->second.value, ref, mask, func)) {
+		return 0;
+	}
+	return it->second.recorder == this ? 1 : 2;
 }
 
 void CommandProcessor::SuspendPm4() {
