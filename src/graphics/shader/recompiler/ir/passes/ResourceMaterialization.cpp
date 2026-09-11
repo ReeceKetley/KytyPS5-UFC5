@@ -1,12 +1,14 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <cstring>
@@ -993,11 +995,40 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	const auto           t0 = Common::Timer::QueryPerformanceCounter();
 	MaterializedSnapshot materialized;
-	if (!MaterializeSnapshot(program, runtime, materialized)) {
+	const auto           ok = MaterializeSnapshot(program, runtime, materialized);
+	const auto           t1 = Common::Timer::QueryPerformanceCounter();
+	if (!ok) {
 		return false;
 	}
-	return BuildResourceSpecialization(program, std::move(materialized), snapshot, specialization);
+	const auto result =
+	    BuildResourceSpecialization(program, std::move(materialized), snapshot, specialization);
+	const auto t2 = Common::Timer::QueryPerformanceCounter();
+	{
+		static std::atomic<uint32_t> count {0};
+		static std::atomic<uint64_t> snap_ns {0}, spec_ns {0};
+		static std::atomic<uint32_t> bufs {0}, imgs {0}, smps {0};
+		const auto                   freq = Common::Timer::QueryPerformanceFrequency();
+		const auto ns = [freq](uint64_t a, uint64_t b) {
+			return freq == 0 ? 0ull : (b - a) * 1000000000ull / freq;
+		};
+		snap_ns.fetch_add(ns(t0, t1), std::memory_order_relaxed);
+		spec_ns.fetch_add(ns(t1, t2), std::memory_order_relaxed);
+		bufs.fetch_add(static_cast<uint32_t>(program.info.buffers.size()),
+		               std::memory_order_relaxed);
+		imgs.fetch_add(static_cast<uint32_t>(program.info.images.size()),
+		               std::memory_order_relaxed);
+		smps.fetch_add(static_cast<uint32_t>(program.info.samplers.size()),
+		               std::memory_order_relaxed);
+		if ((count.fetch_add(1, std::memory_order_relaxed) % 8192) == 8191) {
+			LOGF("Materialize/8192: snapshot=%.1fus/call specialize=%.1fus/call "
+			     "avgbuf=%.1f avgimg=%.1f avgsmp=%.1f\n",
+			     snap_ns.exchange(0) / 8192.0 / 1000.0, spec_ns.exchange(0) / 8192.0 / 1000.0,
+			     bufs.exchange(0) / 8192.0, imgs.exchange(0) / 8192.0, smps.exchange(0) / 8192.0);
+		}
+	}
+	return result;
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

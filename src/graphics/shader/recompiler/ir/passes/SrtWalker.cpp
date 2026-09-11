@@ -1,9 +1,11 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/timer.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -1034,6 +1036,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	    runtime.read_specialization_memory == nullptr) {
 		return false;
 	}
+	const auto prof_t0        = Common::Timer::QueryPerformanceCounter();
 	SrtRuntime clean_runtime  = runtime;
 	clean_runtime.read_memory = runtime.read_specialization_memory;
 	Evaluator            clean_evaluator(program, clean_runtime);
@@ -1042,6 +1045,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	if (evaluate_flat) {
 		active.assign(program.descriptor_sources.size(), 1u);
 	}
+	const auto prof_t1 = Common::Timer::QueryPerformanceCounter();
 	if (evaluate_flat && !program.control_flow.empty()) {
 		for (const auto& block: program.control_flow) {
 			for (const auto source: block.sources) {
@@ -1071,6 +1075,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			}
 		}
 	}
+	const auto                   prof_t2 = Common::Timer::QueryPerformanceCounter();
 	std::vector<DescriptorValue> evaluated;
 	evaluated.reserve(sources.size());
 	for (const auto source_index: sources) {
@@ -1089,6 +1094,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		}
 		evaluated.push_back(value);
 	}
+	const auto            prof_t3 = Common::Timer::QueryPerformanceCounter();
 	std::vector<uint32_t> flattened;
 	if (evaluate_flat) {
 		flattened.resize(program.srt_reads.size());
@@ -1100,6 +1106,36 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
 				return false;
 			}
+		}
+	}
+	const auto prof_t4 = Common::Timer::QueryPerformanceCounter();
+	if (evaluate_flat) {
+		// Per-call cost split. None of these scale with the handful of bound resources:
+		// setup builds two Evaluators, cfg walks the whole control-flow graph, and srt
+		// re-evaluates the entire flattened SRT table from guest memory every draw.
+		static std::atomic<uint32_t> count {0}, cfg_n {0}, srt_n {0}, src_n {0};
+		static std::atomic<uint64_t> setup_ns {0}, cfgw_ns {0}, srcs_ns {0}, srtw_ns {0};
+		const auto                   freq = Common::Timer::QueryPerformanceFrequency();
+		const auto ns = [freq](uint64_t a, uint64_t b) {
+			return freq == 0 ? 0ull : (b - a) * 1000000000ull / freq;
+		};
+		setup_ns.fetch_add(ns(prof_t0, prof_t1), std::memory_order_relaxed);
+		cfgw_ns.fetch_add(ns(prof_t1, prof_t2), std::memory_order_relaxed);
+		srcs_ns.fetch_add(ns(prof_t2, prof_t3), std::memory_order_relaxed);
+		srtw_ns.fetch_add(ns(prof_t3, prof_t4), std::memory_order_relaxed);
+		cfg_n.fetch_add(static_cast<uint32_t>(program.control_flow.size()),
+		                std::memory_order_relaxed);
+		srt_n.fetch_add(static_cast<uint32_t>(program.srt_reads.size()),
+		                std::memory_order_relaxed);
+		src_n.fetch_add(static_cast<uint32_t>(program.descriptor_sources.size()),
+		                std::memory_order_relaxed);
+		if ((count.fetch_add(1, std::memory_order_relaxed) % 8192) == 8191) {
+			LOGF("SrtEval/8192: setup=%.2fus cfg=%.2fus sources=%.2fus srtreads=%.2fus | "
+			     "avg_cfg=%.1f avg_srtreads=%.1f avg_srcs=%.1f\n",
+			     setup_ns.exchange(0) / 8192.0 / 1000.0, cfgw_ns.exchange(0) / 8192.0 / 1000.0,
+			     srcs_ns.exchange(0) / 8192.0 / 1000.0, srtw_ns.exchange(0) / 8192.0 / 1000.0,
+			     cfg_n.exchange(0) / 8192.0, srt_n.exchange(0) / 8192.0,
+			     src_n.exchange(0) / 8192.0);
 		}
 	}
 	results = std::move(evaluated);

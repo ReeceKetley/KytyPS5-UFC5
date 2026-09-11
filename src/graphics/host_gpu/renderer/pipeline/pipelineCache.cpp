@@ -264,6 +264,28 @@ struct PipelineCache::ProgramCache {
 
 	static constexpr std::size_t MaxStaticKeyWords = 13 + ShaderVertexInputInfo::RES_MAX * 13;
 
+	// Per-draw cost split for the cache-hit path: building/looking up the static key,
+	// re-materializing SRT resources from guest memory, and scanning permutations.
+	static void NoteProgramLookup(uint64_t t0, uint64_t t1, uint64_t t2, uint64_t t3,
+	                              std::size_t permutations) {
+		static std::atomic<uint32_t> count {0}, perms {0};
+		static std::atomic<uint64_t> key_us {0}, mat_us {0}, perm_us {0};
+		const auto                   freq = Common::Timer::QueryPerformanceFrequency();
+		const auto us = [freq](uint64_t a, uint64_t b) {
+			return freq == 0 ? 0ull : (b - a) * 1000000ull / freq;
+		};
+		key_us.fetch_add(us(t0, t1), std::memory_order_relaxed);
+		mat_us.fetch_add(us(t1, t2), std::memory_order_relaxed);
+		perm_us.fetch_add(us(t2, t3), std::memory_order_relaxed);
+		perms.fetch_add(static_cast<uint32_t>(permutations), std::memory_order_relaxed);
+		const auto n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((n % 8192) == 0) {
+			LOGF("ProgLookup/8192: key=%.1fms materialize=%.1fms permscan=%.1fms avgperms=%.1f\n",
+			     key_us.exchange(0) / 1000.0, mat_us.exchange(0) / 1000.0,
+			     perm_us.exchange(0) / 1000.0, perms.exchange(0) / 8192.0);
+		}
+	}
+
 	Permutation CompilePermutation(const ShaderParams&                          params,
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
@@ -325,12 +347,14 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
+		const auto prof_t0         = Common::Timer::QueryPerformanceCounter();
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
+		const auto                                   prof_t1 = Common::Timer::QueryPerformanceCounter();
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
@@ -342,15 +366,19 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end()) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, resources, specialization));
-			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
-				        const auto& layout = candidate.program.bindings;
-				        return layout.push_data_start_dword ==
-				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == specialization;
-			        });
-			    permutation != entry->second.permutations.end()) {
+			const auto prof_t2 = Common::Timer::QueryPerformanceCounter();
+			const auto permutation = std::ranges::find_if(
+			    entry->second.permutations, [&](const Permutation& candidate) {
+				    const auto& layout = candidate.program.bindings;
+				    return layout.push_data_start_dword ==
+				               ShaderRecompiler::IR::PushData::StartFor(
+				                   push_data_cursor, layout.ShaderDataDwords()) &&
+				           candidate.specialization == specialization;
+			    });
+			const auto prof_t3 = Common::Timer::QueryPerformanceCounter();
+			NoteProgramLookup(prof_t0, prof_t1, prof_t2, prof_t3,
+			                  entry->second.permutations.size());
+			if (permutation != entry->second.permutations.end()) {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = std::move(resources)};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);

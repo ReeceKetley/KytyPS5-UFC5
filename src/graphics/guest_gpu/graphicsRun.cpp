@@ -6,6 +6,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -873,8 +874,41 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		// cp_rest (process_ms minus the named buckets) is the largest single item in an
+		// in-match frame once readback is deferred, and it is all in here. Attribute it
+		// per PM4 opcode so the expensive handlers are named rather than guessed at.
+		const auto pm4_t0 = Common::Timer::QueryPerformanceCounter();
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		{
+			static std::atomic<uint64_t> op_ns[256];
+			static std::atomic<uint32_t> op_n[256];
+			static std::atomic<uint32_t> total {0};
+			const auto                   freq = Common::Timer::QueryPerformanceFrequency();
+			if (freq != 0) {
+				op_ns[opcode].fetch_add(
+				    (Common::Timer::QueryPerformanceCounter() - pm4_t0) * 1000000000ull / freq,
+				    std::memory_order_relaxed);
+			}
+			op_n[opcode].fetch_add(1, std::memory_order_relaxed);
+			if ((total.fetch_add(1, std::memory_order_relaxed) % 262144) == 262143) {
+				std::array<std::pair<uint64_t, uint32_t>, 256> rank {};
+				for (uint32_t i = 0; i < 256; i++) {
+					rank[i] = {op_ns[i].exchange(0, std::memory_order_relaxed), i};
+				}
+				std::ranges::sort(rank, std::ranges::greater {});
+				std::string line;
+				for (uint32_t i = 0; i < 8 && rank[i].first != 0; i++) {
+					const auto op = rank[i].second;
+					const auto n  = op_n[op].exchange(0, std::memory_order_relaxed);
+					line += fmt::format(" op0x{:02x}={:.0f}ms/{}", op, rank[i].first / 1e6, n);
+				}
+				for (uint32_t i = 8; i < 256; i++) {
+					op_n[rank[i].second].exchange(0, std::memory_order_relaxed);
+				}
+				LOGF("Pm4Ops/262144:%s\n", line.c_str());
+			}
+		}
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			if (execution.m_buffer_stack.size() > buffer_index + 1) {

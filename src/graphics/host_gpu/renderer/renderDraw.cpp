@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/assert.h"
+#include "common/timer.h"
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -1125,9 +1126,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);
 	}
+	// Draw recording measured ~53us/draw in a fight, the largest single item left in the
+	// frame. Split it: descriptor-set build, vertex/index acquire, render-target acquire,
+	// pipeline-cache lookup.
+	const auto dp_t0 = Common::Timer::QueryPerformanceCounter();
 	LogDrawPhase(draw.name, "PrepareBindings");
 	auto bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
 	                                        state.ps_active);
+	const auto            dp_t1 = Common::Timer::QueryPerformanceCounter();
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1135,9 +1141,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vs_input_info);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	const auto dp_t2 = Common::Timer::QueryPerformanceCounter();
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         bindings.pixel);
+	const auto dp_t3 = Common::Timer::QueryPerformanceCounter();
 
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
@@ -1146,6 +1154,25 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs.vertex, state.programs.pixel);
+	{
+		const auto dp_t4 = Common::Timer::QueryPerformanceCounter();
+		static std::atomic<uint32_t> n {0};
+		static std::atomic<uint64_t> bind_ns {0}, vbuf_ns {0}, rt_ns {0}, pipe_ns {0};
+		const auto                   freq = Common::Timer::QueryPerformanceFrequency();
+		const auto ns = [freq](uint64_t a, uint64_t b) {
+			return freq == 0 ? 0ull : (b - a) * 1000000000ull / freq;
+		};
+		bind_ns.fetch_add(ns(dp_t0, dp_t1), std::memory_order_relaxed);
+		vbuf_ns.fetch_add(ns(dp_t1, dp_t2), std::memory_order_relaxed);
+		rt_ns.fetch_add(ns(dp_t2, dp_t3), std::memory_order_relaxed);
+		pipe_ns.fetch_add(ns(dp_t3, dp_t4), std::memory_order_relaxed);
+		if ((n.fetch_add(1, std::memory_order_relaxed) % 8192) == 8191) {
+			LOGF("DrawPhase/8192: bindings=%.1fus vbuf=%.1fus rendertargets=%.1fus "
+			     "pipeline=%.1fus\n",
+			     bind_ns.exchange(0) / 8192.0 / 1000.0, vbuf_ns.exchange(0) / 8192.0 / 1000.0,
+			     rt_ns.exchange(0) / 8192.0 / 1000.0, pipe_ns.exchange(0) / 8192.0 / 1000.0);
+		}
+	}
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
