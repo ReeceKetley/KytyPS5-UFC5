@@ -4,6 +4,7 @@
 #include "common/timer.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
@@ -990,6 +991,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->heap_source),
 		                   plan.clean_flat_slots);
 	}
+	// Compile the flat SRT evaluator for THIS plan. Everything above rebuilds the value DAG into
+	// plan.value_storage, so the source Program's compiled program does not apply here - and this
+	// is the object every draw evaluates. Must run after clean_flat_slots, which gates it.
+	BuildSrtLinearProgram(plan);
 	return plan;
 }
 

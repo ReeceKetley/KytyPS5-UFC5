@@ -504,6 +504,83 @@ private:
 	EvaluatorScratch* m_slot = nullptr;
 };
 
+// Accumulates time spent inside the guest-memory read callback, reported alongside the
+// per-call SrtEval split so the walk can be divided into interpreter dispatch vs the reads
+// themselves. See EvaluateRawRead for why that division decides the JIT's shape.
+std::atomic<uint64_t> g_guest_read_ticks {0};
+std::atomic<uint64_t> g_guest_read_count {0};
+
+void NoteGuestRead(uint64_t ticks) {
+	g_guest_read_ticks.fetch_add(ticks, std::memory_order_relaxed);
+	g_guest_read_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Opcode census for the SRT JIT scoping decision (see EvaluateInst). `hot` counts the
+// pointer-chase / integer-address subset that a shadPS4-shaped code generator covers; the
+// rest would have to fall back to this interpreter, and a high `cold` share means a JIT has
+// to grow into a general expression backend before it pays.
+void NoteEvaluatedOpcode(ValueOpcode opcode) {
+	const bool hot = [opcode] {
+		switch (opcode) {
+			case ValueOpcode::GetUserData:
+			case ValueOpcode::ReadConst:
+			case ValueOpcode::GetShaderBase:
+			case ValueOpcode::IAdd32:
+			case ValueOpcode::IAdd64:
+			case ValueOpcode::ISub32:
+			case ValueOpcode::IMul32:
+			case ValueOpcode::ShiftLeftLogical32:
+			case ValueOpcode::ShiftLeftLogical64:
+			case ValueOpcode::ShiftRightLogical32:
+			case ValueOpcode::ShiftRightLogical64:
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseAnd64:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::CompositeConstructU64:
+			case ValueOpcode::CompositeExtractU64:
+			case ValueOpcode::CompositeConstructU32x2:
+			case ValueOpcode::CompositeExtractU32x2: return true;
+			default: return false;
+		}
+	}();
+
+	static std::atomic<uint64_t> total {0};
+	static std::atomic<uint64_t> hot_count {0};
+	static std::atomic<uint32_t> cold_histogram[256] {};
+	const auto                   raw = static_cast<uint32_t>(opcode);
+	if (hot) {
+		hot_count.fetch_add(1, std::memory_order_relaxed);
+	} else if (raw < 256) {
+		cold_histogram[raw].fetch_add(1, std::memory_order_relaxed);
+	}
+	const auto n = total.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((n % 1048576) != 0) {
+		return;
+	}
+	const auto hot_total = hot_count.exchange(0);
+	std::string worst;
+	for (int rank = 0; rank < 5; rank++) {
+		uint32_t best_index = 0;
+		uint32_t best_value = 0;
+		for (uint32_t i = 0; i < 256; i++) {
+			const auto value = cold_histogram[i].load(std::memory_order_relaxed);
+			if (value > best_value) {
+				best_value = value;
+				best_index = i;
+			}
+		}
+		if (best_value == 0) {
+			break;
+		}
+		cold_histogram[best_index].store(0, std::memory_order_relaxed);
+		worst += fmt::format(" op{}={}", best_index, best_value);
+	}
+	for (auto& slot: cold_histogram) {
+		slot.store(0, std::memory_order_relaxed);
+	}
+	LOGF("SrtOps/1M: hot=%.1f%% cold_top5:%s\n", hot_total * 100.0 / 1048576.0, worst.c_str());
+}
+
 class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
@@ -664,18 +741,34 @@ private:
 			}
 		}
 		uint32_t word = 0;
+		// Splits the walk into "interpreter dispatch" and "the guest read itself". Every load
+		// goes through an indirect call into read_memory (~120 per draw across both stages),
+		// which a flat/bytecode rewrite would keep and only an Xbyak walker reading raw
+		// pointers could remove - at the cost of a vectored exception handler for faults. If
+		// this is most of the cost, the cheap rewrite is not worth building.
+		const auto rd_t0 = Common::Timer::QueryPerformanceCounter();
+		bool       ok    = true;
 		if (m_runtime.read_memory != nullptr) {
-			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
-				return false;
-			}
+			ok = m_runtime.read_memory(m_runtime.userdata, address, &word);
 		} else {
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		}
+		NoteGuestRead(Common::Timer::QueryPerformanceCounter() - rd_t0);
+		if (!ok) {
+			return false;
 		}
 		result = word;
 		return true;
 	}
 
 	bool EvaluateInst(const Inst& inst, uint64_t& result) {
+		// Scope check for the SRT JIT. shadPS4's walker compiles because their SRT walk is a
+		// pure ReadConst pointer chase - a chain of loads. Kyty's evaluator is a general
+		// expression interpreter over ~45 opcodes including f32 and 64-bit arithmetic, so a
+		// code generator must either cover all of them or bail to the interpreter. Which of
+		// those it is depends entirely on which opcodes UFC5 actually evaluates, so count
+		// them: `hot` is the pointer-chase subset a shadPS4-shaped JIT would handle.
+		NoteEvaluatedOpcode(inst.GetOpcode());
 		uint64_t   a       = 0;
 		uint64_t   b       = 0;
 		uint64_t   c       = 0;
@@ -1017,6 +1110,351 @@ private:
 	uint32_t                  m_generation = m_scratch.Get().generation;
 };
 
+// ---------------------------------------------------------------------------------------
+// SRT linear program: compile the value DAG once, evaluate it as a flat array per draw.
+//
+// Measured motivation (in-fight, this build): SrtEval sources=13.14us srtreads=6.93us per call
+// against SrtReads guest_read=1.52us - the guest memory access is 7% of the walk and the
+// tree-walking interpreter is the other 93%, at ~195ns per evaluated node. SrtOps says the
+// opcode mix is narrow: LoadAddressU32 alone is 57% of all evaluated nodes, the declared "hot"
+// pointer-chase set is 41%, and everything else is ~1.7%. So a flat evaluator over a small
+// opcode set covers essentially all traffic, and anything it does not cover marks the program
+// unusable and falls back to the interpreter with no behaviour change.
+// ---------------------------------------------------------------------------------------
+constexpr uint32_t kNoSlot = UINT32_MAX;
+// DescriptorSource::dwords is std::array<Value, 8> - an image or sampler descriptor is 8 dwords.
+// Hardcoding 4 here truncated every one of them and zeroed the upper half, which surfaced as
+// "unsupported storage texture ... dwords=...,00000000,00000000,00000000,00000000".
+constexpr uint32_t kMaxDescriptorDwords = 8;
+
+class LinearCompiler final {
+public:
+	explicit LinearCompiler(ResourcePlan& program): m_program(program) {}
+
+	void Run() {
+		auto& out = m_program.srt_linear;
+		out = {};
+		// The conditional-source CFG and the clean/specialization evaluator both change which
+		// nodes are evaluated per draw; the flat program evaluates a fixed set, so it only
+		// applies when neither is in play. SrtShape measures that at ~78% of in-fight calls.
+		if (!m_program.control_flow.empty() ||
+		    std::ranges::any_of(m_program.clean_flat_slots, [](uint8_t c) { return c != 0u; })) {
+			return;
+		}
+
+		out.read_slots.assign(m_program.srt_reads.size(), kNoSlot);
+		out.source_slots.assign(m_program.descriptor_sources.size() * kMaxDescriptorDwords, kNoSlot);
+
+		for (uint32_t i = 0; i < m_program.srt_reads.size(); i++) {
+			const auto slot = Compile(m_program.srt_reads[i].value);
+			if (slot == kNoSlot) {
+				out = {};
+				return;
+			}
+			out.read_slots[i] = slot;
+		}
+		for (uint32_t i = 0; i < m_program.descriptor_sources.size(); i++) {
+			const auto& source = m_program.descriptor_sources[i];
+			for (uint32_t d = 0; d < source.dword_count && d < kMaxDescriptorDwords; d++) {
+				const auto slot = Compile(source.dwords[d]);
+				if (slot == kNoSlot) {
+					out = {};
+					return;
+				}
+				out.source_slots[i * kMaxDescriptorDwords + d] = slot;
+			}
+		}
+		out.usable = true;
+	}
+
+private:
+	uint32_t Emit(ValueOpcode opcode, std::span<const uint32_t> operands, uint64_t immediate) {
+		auto&        out = m_program.srt_linear;
+		SrtLinearOp  op;
+		op.opcode        = opcode;
+		op.immediate     = immediate;
+		op.operand_begin = static_cast<uint32_t>(out.operands.size());
+		op.operand_count = static_cast<uint32_t>(operands.size());
+		out.operands.insert(out.operands.end(), operands.begin(), operands.end());
+		out.ops.push_back(op);
+		return static_cast<uint32_t>(out.ops.size() - 1u);
+	}
+
+	uint32_t EmitConstant(uint64_t value) { return Emit(ValueOpcode::Void, {}, value); }
+
+	// Returns the slot holding `value`, or kNoSlot if anything in its subtree is unsupported.
+	uint32_t Compile(Value value) {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			switch (value.GetType()) {
+				case Type::U1: return EmitConstant(value.U1());
+				case Type::U8: return EmitConstant(value.U8());
+				case Type::U16: return EmitConstant(value.U16());
+				case Type::U32: return EmitConstant(value.U32());
+				case Type::U64: return EmitConstant(value.U64());
+				case Type::F32: return EmitConstant(std::bit_cast<uint32_t>(value.F32Value()));
+				default: return kNoSlot;
+			}
+		}
+		auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return kNoSlot;
+		}
+		if (const auto found = m_slots.find(inst); found != m_slots.end()) {
+			return found->second;
+		}
+		// Depth guard: a cycle would otherwise recurse forever. The interpreter uses a visiting
+		// stack for this; here an in-progress marker is enough because we never revisit.
+		if (!m_active.insert(inst).second) {
+			return kNoSlot;
+		}
+		const auto slot = CompileInst(*inst);
+		m_active.erase(inst);
+		if (slot != kNoSlot) {
+			m_slots.emplace(inst, slot);
+		}
+		return slot;
+	}
+
+	uint32_t CompileArgs(const Inst& inst, size_t count, ValueOpcode opcode, uint64_t immediate) {
+		std::array<uint32_t, 5> slots {};
+		if (inst.NumArgs() < count || count > slots.size()) {
+			return kNoSlot;
+		}
+		for (size_t i = 0; i < count; i++) {
+			slots[i] = Compile(inst.Arg(i));
+			if (slots[i] == kNoSlot) {
+				return kNoSlot;
+			}
+		}
+		return Emit(opcode, std::span {slots.data(), count}, immediate);
+	}
+
+	uint32_t CompileInst(const Inst& inst) {
+		const auto opcode = inst.GetOpcode();
+		switch (opcode) {
+			case ValueOpcode::GetUserData: {
+				const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
+				if (reg < m_program.user_data_base) {
+					return kNoSlot;
+				}
+				// The bound check against runtime.user_data.size() stays at evaluation time.
+				return Emit(ValueOpcode::GetUserData, {}, reg - m_program.user_data_base);
+			}
+			case ValueOpcode::GetShaderBase: return Emit(opcode, {}, 0);
+			case ValueOpcode::Phi: {
+				const auto resolved = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
+				return resolved.IsEmpty() ? kNoSlot : Compile(resolved);
+			}
+			case ValueOpcode::ReadConst: {
+				// Resolves at compile time to another node in this same DAG.
+				const auto slot = inst.Arg(1).Resolve();
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+				    slot.U32() >= m_program.srt_reads.size()) {
+					return kNoSlot;
+				}
+				return Compile(m_program.srt_reads[slot.U32()].value);
+			}
+			case ValueOpcode::LoadAddressU32: {
+				// 57% of all evaluated nodes. EvaluateRawRead reaches THROUGH the handle to its
+				// low/high args rather than evaluating the handle itself, so mirror that here.
+				if (!IsRawRead(m_program, inst)) {
+					return kNoSlot;
+				}
+				const auto flags = inst.Flags<MemoryFlags>();
+				if (flags.index >= m_program.memory_info.size()) {
+					return kNoSlot;
+				}
+				const auto* handle = inst.Arg(0).ResolveInstruction();
+				if (handle == nullptr || handle->NumArgs() < 2u || inst.NumArgs() < 2u) {
+					return kNoSlot;
+				}
+				const std::array<uint32_t, 3> slots {Compile(handle->Arg(0)), Compile(handle->Arg(1)),
+				                                     Compile(inst.Arg(1))};
+				if (std::ranges::find(slots, kNoSlot) != slots.end()) {
+					return kNoSlot;
+				}
+				return Emit(opcode, slots, flags.index);
+			}
+			case ValueOpcode::BitCastU32F32:
+			case ValueOpcode::BitCastF32U32: return CompileArgs(inst, 1, ValueOpcode::Identity, 0);
+			case ValueOpcode::CompositeExtractU64:
+			case ValueOpcode::CompositeExtractU32x2: {
+				const auto index = inst.Arg(1).Resolve();
+				if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) {
+					return kNoSlot;
+				}
+				const auto component = index.U32();
+				if (opcode == ValueOpcode::CompositeExtractU64) {
+					const auto packed = Compile(inst.Arg(0));
+					return packed == kNoSlot
+					           ? kNoSlot
+					           : Emit(ValueOpcode::CompositeExtractU64, {&packed, 1}, component);
+				}
+				// CompositeExtractU32x2 of a CompositeConstructU32x2 picks the component's
+				// source directly; the interpreter never evaluates the construct node.
+				const auto* source = inst.Arg(0).ResolveInstruction();
+				if (source == nullptr ||
+				    source->GetOpcode() != ValueOpcode::CompositeConstructU32x2 ||
+				    source->NumArgs() <= component) {
+					return kNoSlot;
+				}
+				return Compile(source->Arg(component));
+			}
+			case ValueOpcode::CompositeConstructU64:
+			case ValueOpcode::IAdd32:
+			case ValueOpcode::IAdd64:
+			case ValueOpcode::ISub32:
+			case ValueOpcode::ISub64:
+			case ValueOpcode::IMul32:
+			case ValueOpcode::IMul64:
+			case ValueOpcode::UMin32:
+			case ValueOpcode::ShiftLeftLogical32:
+			case ValueOpcode::ShiftLeftLogical64:
+			case ValueOpcode::ShiftRightLogical32:
+			case ValueOpcode::ShiftRightLogical64:
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseAnd64:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::ULessThan32:
+			case ValueOpcode::IEqual32:
+			case ValueOpcode::INotEqual32: return CompileArgs(inst, 2, opcode, 0);
+			case ValueOpcode::LogicalNot: return CompileArgs(inst, 1, opcode, 0);
+			default: return kNoSlot;
+		}
+	}
+
+	ResourcePlan&                             m_program;
+	std::unordered_map<const Inst*, uint32_t> m_slots;
+	std::unordered_set<const Inst*>           m_active;
+};
+
+// Evaluate the compiled program into `slots`. Returns false if any op fails, matching the
+// interpreter: in the no-CFG case every source is active and every srt_read is required, so a
+// failure anywhere fails the whole call either way.
+bool RunLinearProgram(const ResourcePlan& program, const SrtRuntime& runtime,
+                      std::vector<uint64_t>& slots) {
+	const auto& lin = program.srt_linear;
+	slots.assign(lin.ops.size(), 0);
+	const auto* operands = lin.operands.data();
+
+	for (size_t i = 0; i < lin.ops.size(); i++) {
+		const auto& op  = lin.ops[i];
+		const auto* arg = operands + op.operand_begin;
+		const auto  a   = op.operand_count > 0 ? slots[arg[0]] : uint64_t {0};
+		const auto  b   = op.operand_count > 1 ? slots[arg[1]] : uint64_t {0};
+		uint64_t    out = 0;
+		switch (op.opcode) {
+			case ValueOpcode::Void: out = op.immediate; break;
+			case ValueOpcode::Identity: out = a; break;
+			case ValueOpcode::GetUserData:
+				if (op.immediate >= runtime.user_data.size()) {
+					return false;
+				}
+				out = runtime.user_data[op.immediate];
+				break;
+			case ValueOpcode::GetShaderBase: out = runtime.shader_base; break;
+			case ValueOpcode::LoadAddressU32: {
+				const auto  base   = ((b << 32u) | static_cast<uint32_t>(a)) & AddressMask;
+				const auto& mem    = program.memory_info[op.immediate];
+				const auto  offset = slots[arg[2]];
+				// Must match EvaluateRawRead exactly: base, the memory_info immediate and the
+				// runtime offset are EACH aligned down to 4 bytes independently, not summed and
+				// then aligned. Getting this wrong was caught by TestSrtWalkerRealSmemTranslation.
+				const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
+				const auto relative  = (immediate & ~int64_t {3}) +
+				                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+				uint64_t address = 0;
+				if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
+					return false;
+				}
+				uint32_t   value = 0;
+				const auto t0    = Common::Timer::QueryPerformanceCounter();
+				bool       ok    = true;
+				if (runtime.read_memory != nullptr) {
+					ok = runtime.read_memory(runtime.userdata, address, &value);
+				} else {
+					std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+				}
+				NoteGuestRead(Common::Timer::QueryPerformanceCounter() - t0);
+				if (!ok) {
+					return false;
+				}
+				out = value;
+				break;
+			}
+			case ValueOpcode::CompositeExtractU64:
+				out = static_cast<uint32_t>(a >> (op.immediate * 32u));
+				break;
+			case ValueOpcode::CompositeConstructU64:
+				out = static_cast<uint32_t>(a) |
+				      (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
+				break;
+			case ValueOpcode::IAdd32: out = static_cast<uint32_t>(a + b); break;
+			case ValueOpcode::IAdd64: out = a + b; break;
+			case ValueOpcode::ISub32: out = static_cast<uint32_t>(a - b); break;
+			case ValueOpcode::ISub64: out = a - b; break;
+			case ValueOpcode::IMul32: out = static_cast<uint32_t>(a * b); break;
+			case ValueOpcode::IMul64: out = a * b; break;
+			case ValueOpcode::UMin32:
+				out = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+				break;
+			case ValueOpcode::ShiftLeftLogical32:
+				out = static_cast<uint32_t>(static_cast<uint32_t>(a) << (b & 31u));
+				break;
+			case ValueOpcode::ShiftLeftLogical64: out = a << (b & 63u); break;
+			case ValueOpcode::ShiftRightLogical32:
+				out = static_cast<uint32_t>(a) >> (b & 31u);
+				break;
+			case ValueOpcode::ShiftRightLogical64: out = a >> (b & 63u); break;
+			case ValueOpcode::BitwiseAnd32: out = static_cast<uint32_t>(a) & static_cast<uint32_t>(b); break;
+			case ValueOpcode::BitwiseAnd64: out = a & b; break;
+			case ValueOpcode::BitwiseOr32: out = static_cast<uint32_t>(a) | static_cast<uint32_t>(b); break;
+			case ValueOpcode::ULessThan32:
+				out = static_cast<uint32_t>(a) < static_cast<uint32_t>(b) ? 1u : 0u;
+				break;
+			case ValueOpcode::IEqual32:
+				out = static_cast<uint32_t>(a) == static_cast<uint32_t>(b) ? 1u : 0u;
+				break;
+			case ValueOpcode::INotEqual32:
+				out = static_cast<uint32_t>(a) != static_cast<uint32_t>(b) ? 1u : 0u;
+				break;
+			case ValueOpcode::LogicalNot: out = (a & 1u) != 0u ? 0u : 1u; break;
+			default: return false;
+		}
+		slots[i] = out;
+	}
+	return true;
+}
+
+// Per-call cost of the flat path, reported next to SrtEval so the two are directly comparable.
+std::atomic<uint64_t> g_linear_ticks {0};
+std::atomic<uint32_t> g_linear_calls {0};
+
+void NoteLinearCall(uint64_t ticks) {
+	g_linear_ticks.fetch_add(ticks, std::memory_order_relaxed);
+	g_linear_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool LinearPathEnabled() {
+	static const int mode = [] {
+		const char* env = std::getenv("KYTY_SRT_LINEAR");
+		if (env == nullptr || env[0] == '\0' || env[0] == '0') {
+			return 0;
+		}
+		return env[0] == 'v' ? 2 : 1; // "verify" runs both and compares
+	}();
+	return mode != 0;
+}
+
+bool LinearPathVerify() {
+	static const bool verify = [] {
+		const char* env = std::getenv("KYTY_SRT_LINEAR");
+		return env != nullptr && env[0] == 'v';
+	}();
+	return verify;
+}
+
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	if (source >= program.descriptor_sources.size()) {
 		return nullptr;
@@ -1036,6 +1474,101 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	    runtime.read_specialization_memory == nullptr) {
 		return false;
 	}
+	// Before porting shadPS4's Xbyak SRT walker, establish what fraction of draws it could
+	// actually compile. Their JIT handles a straight pointer chase; Kyty's evaluator also has
+	// (a) a CFG walk that activates sources conditionally and (b) a second "clean" evaluator
+	// reading specialization memory. A draw needing either is not a candidate, and a JIT that
+	// only covers a small minority is not worth the plumbing - the same mistake the previous
+	// four optimisation attempts made by assuming the expensive path was the common one.
+	{
+		const bool has_cfg = !program.control_flow.empty();
+		const bool has_clean =
+		    std::ranges::any_of(clean_flat_slots, [](uint8_t clean) { return clean != 0u; });
+		static std::atomic<uint32_t> calls {0};
+		static std::atomic<uint32_t> cfg_calls {0}, clean_calls {0}, simple_calls {0};
+		static std::atomic<uint64_t> srcs {0}, reads {0}, blocks {0};
+		if (has_cfg) {
+			cfg_calls.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (has_clean) {
+			clean_calls.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (!has_cfg && !has_clean) {
+			simple_calls.fetch_add(1, std::memory_order_relaxed);
+		}
+		srcs.fetch_add(sources.size(), std::memory_order_relaxed);
+		reads.fetch_add(program.srt_reads.size(), std::memory_order_relaxed);
+		blocks.fetch_add(program.control_flow.size(), std::memory_order_relaxed);
+		if ((calls.fetch_add(1, std::memory_order_relaxed) % 8192) == 8191) {
+			LOGF("SrtShape/8192: cfg=%u clean=%u jittable=%u | avg_srcs=%.1f avg_reads=%.1f "
+			     "avg_blocks=%.1f\n",
+			     cfg_calls.exchange(0), clean_calls.exchange(0), simple_calls.exchange(0),
+			     srcs.exchange(0) / 8192.0, reads.exchange(0) / 8192.0,
+			     blocks.exchange(0) / 8192.0);
+		}
+	}
+
+	// Flat path: compiled DAG, no recursion, no hash lookups, no cycle check. Only valid when
+	// the program compiled (no CFG-conditional sources, no clean slots) and we are doing the
+	// full flat evaluation. KYTY_SRT_LINEAR=1 enables it, =verify runs both and compares.
+	std::vector<DescriptorValue> verify_results;
+	std::vector<uint32_t>        verify_flat;
+	bool                         verify_active = false;
+	if (evaluate_flat && program.srt_linear.usable && LinearPathEnabled()) {
+		const auto  lin_t0 = Common::Timer::QueryPerformanceCounter();
+		const auto& lin    = program.srt_linear;
+		static thread_local std::vector<uint64_t> slots;
+		if (RunLinearProgram(program, runtime, slots)) {
+			std::vector<DescriptorValue> lin_results;
+			lin_results.reserve(sources.size());
+			bool ok = true;
+			for (const auto source_index: sources) {
+				const auto* source = Source(program, source_index);
+				if (source == nullptr ||
+				    source_index * kMaxDescriptorDwords >= lin.source_slots.size()) {
+					ok = false;
+					break;
+				}
+				DescriptorValue value;
+				value.dword_count = source->dword_count;
+				for (uint32_t d = 0; d < source->dword_count && d < kMaxDescriptorDwords; d++) {
+					const auto slot = lin.source_slots[source_index * kMaxDescriptorDwords + d];
+					if (slot == kNoSlot) {
+						ok = false;
+						break;
+					}
+					value.dwords[d] = static_cast<uint32_t>(slots[slot]);
+				}
+				lin_results.push_back(value);
+			}
+			std::vector<uint32_t> lin_flat;
+			if (ok) {
+				lin_flat.resize(program.srt_reads.size());
+				for (size_t i = 0; i < program.srt_reads.size(); i++) {
+					const auto slot = lin.read_slots[i];
+					const auto off  = program.srt_reads[i].flat_offset;
+					if (slot == kNoSlot || off >= lin_flat.size()) {
+						ok = false;
+						break;
+					}
+					lin_flat[off] = static_cast<uint32_t>(slots[slot]);
+				}
+			}
+			if (ok) {
+				NoteLinearCall(Common::Timer::QueryPerformanceCounter() - lin_t0);
+				if (!LinearPathVerify()) {
+					results = std::move(lin_results);
+					active_sources.assign(program.descriptor_sources.size(), 1u);
+					flat    = std::move(lin_flat);
+					return true;
+				}
+				verify_results = std::move(lin_results);
+				verify_flat    = std::move(lin_flat);
+				verify_active  = true;
+			}
+		}
+	}
+
 	const auto prof_t0        = Common::Timer::QueryPerformanceCounter();
 	SrtRuntime clean_runtime  = runtime;
 	clean_runtime.read_memory = runtime.read_specialization_memory;
@@ -1136,8 +1669,43 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			     srcs_ns.exchange(0) / 8192.0 / 1000.0, srtw_ns.exchange(0) / 8192.0 / 1000.0,
 			     cfg_n.exchange(0) / 8192.0, srt_n.exchange(0) / 8192.0,
 			     src_n.exchange(0) / 8192.0);
+			const auto read_ticks = g_guest_read_ticks.exchange(0);
+			const auto read_count = g_guest_read_count.exchange(0);
+			const auto lin_ticks = g_linear_ticks.exchange(0);
+			const auto lin_calls = g_linear_calls.exchange(0);
+			LOGF("SrtLinear/8192: calls=%u linear=%.2fus/call\n", lin_calls,
+			     (freq == 0 || lin_calls == 0)
+			         ? 0.0
+			         : lin_ticks * 1000000.0 / freq / static_cast<double>(lin_calls));
+			LOGF("SrtReads/8192: guest_read=%.2fus/call reads=%.1f/call ns_per_read=%.0f\n",
+			     freq == 0 ? 0.0 : read_ticks * 1000000.0 / freq / 8192.0, read_count / 8192.0,
+			     (freq == 0 || read_count == 0)
+			         ? 0.0
+			         : read_ticks * 1000000000.0 / freq / static_cast<double>(read_count));
 		}
 	}
+	// KYTY_SRT_LINEAR=verify: both paths ran; the interpreter's answer is authoritative and is
+	// what gets returned, so a mismatch is reported without changing behaviour.
+	if (verify_active) {
+		bool same = verify_results.size() == evaluated.size() && verify_flat == flattened;
+		for (size_t i = 0; same && i < evaluated.size(); i++) {
+			same = verify_results[i].dword_count == evaluated[i].dword_count;
+			for (uint32_t d = 0;
+			     same && d < evaluated[i].dword_count && d < kMaxDescriptorDwords; d++) {
+				same = verify_results[i].dwords[d] == evaluated[i].dwords[d];
+			}
+		}
+		static std::atomic<uint32_t> checked {0}, mismatched {0};
+		checked.fetch_add(1, std::memory_order_relaxed);
+		if (!same) {
+			mismatched.fetch_add(1, std::memory_order_relaxed);
+		}
+		if ((checked.load(std::memory_order_relaxed) % 8192) == 0) {
+			LOGF("SrtLinearVerify/8192: mismatched=%u (hash=0x%016" PRIx64 ")\n",
+			     mismatched.exchange(0), program.shader_hash);
+		}
+	}
+
 	results = std::move(evaluated);
 	active_sources = std::move(active);
 	if (evaluate_flat) {
@@ -1158,8 +1726,13 @@ void BuildSrtPlan(Program& program) {
 	}
 	program.srt_plan_complete = false;
 	PlanBuilder(program).Run();
+	// Compile the value DAG to a flat op array once, here, where it costs nothing per draw.
+	// ExtractResourcePlan() must do the same for its clone - see BuildSrtLinearProgram.
+	LinearCompiler(program).Run();
 	program.srt_plan_complete = true;
 }
+
+void BuildSrtLinearProgram(ResourcePlan& plan) { LinearCompiler(plan).Run(); }
 
 bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
                             const SrtRuntime& runtime, std::span<uint32_t> results) {

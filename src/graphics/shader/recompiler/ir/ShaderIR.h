@@ -505,6 +505,35 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
+// The SRT value DAG, linearised once per shader into a topologically ordered op array.
+//
+// The interpreter in SrtWalker.cpp costs ~195ns per evaluated node against a 24ns guest read -
+// 93% of the walk is tree-walking machinery (an unordered_map find, a linear scan of the
+// visiting stack, then an insert_out_assign, per node) and only 7% is memory access. Evaluating
+// a precomputed order into a flat slot array removes all of it: no lookups, no recursion, no
+// cycle check (topological order cannot revisit), and memoisation falls out for free because
+// each Inst appears exactly once.
+//
+// Operands are slot indices into the same array, always already computed. Immediates are
+// materialised as their own Constant ops so every operand is uniform. Variable-length operand
+// lists live in `operands` because a raw ReadConstBuffer needs five.
+struct SrtLinearOp {
+	ValueOpcode opcode        = ValueOpcode::Void;
+	uint32_t    operand_begin = 0;
+	uint32_t    operand_count = 0;
+	uint64_t    immediate     = 0; // Constant payload, user_data index, extract component, ...
+};
+
+struct SrtLinearProgram {
+	std::vector<SrtLinearOp> ops;
+	std::vector<uint32_t>    operands;
+	// Slot holding each descriptor_sources[i].dwords[j], flattened as i*4+j.
+	std::vector<uint32_t> source_slots;
+	// Slot holding each srt_reads[i].value.
+	std::vector<uint32_t> read_slots;
+	bool                  usable = false;
+};
+
 // Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
 // uniform condition and fill values without retaining translated blocks.
 struct ResourcePlan {
@@ -527,6 +556,7 @@ struct ResourcePlan {
 	std::vector<uint32_t>               materialization_sources;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;
+	SrtLinearProgram                    srt_linear;
 	bool                                requires_specialization_memory = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;

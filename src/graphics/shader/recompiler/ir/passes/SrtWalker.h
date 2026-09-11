@@ -27,6 +27,13 @@ enum class RuntimeValueType { Any, Integer };
 // Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
 // dynamic offsets remain explicit and are never assigned a fake slot.
 void BuildSrtPlan(Program& program);
+
+// Compile the plan's SRT value DAG into ResourcePlan::srt_linear. Must be called on the exact
+// object that will be evaluated per draw: ExtractResourcePlan() rebuilds every Inst into its
+// own value_storage, so a program compiled against the source Program's pointers is useless to
+// the extracted copy. Safe to call repeatedly; no-ops into an unusable program when the DAG
+// contains anything the flat evaluator does not cover.
+void BuildSrtLinearProgram(ResourcePlan& plan);
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
