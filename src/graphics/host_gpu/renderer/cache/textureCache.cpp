@@ -858,6 +858,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		case BindingType::Texture:
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
 			recreate |= raw_d16_texture;
+			// NOTE (2026-09-11): the reverse rule - recreating when a colour descriptor
+			// resolves to a depth image, as Storage/RenderTarget/VideoOut already do - was
+			// tried and REVERTED. It fixes "invalid image view: image_format=130
+			// view_format=43 aspect=0x1" but replaces images that are simultaneously bound
+			// as the draw's depth target, so the next draw dies on "depth target changed
+			// after render-state discovery" (renderDraw.cpp:553). Texture bindings legitimately
+			// alias the live depth target here; that is what the depth-feedback support is for.
 			break;
 		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
 		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
@@ -2298,6 +2305,17 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+// Why the texture GC deletes nothing. Measured: used=6245MB vs critical=5222MB (1GB over),
+// 4,471 registered images, deleted=0 across 128 runs. Candidates ARE being produced by the LRU
+// walk and then every one of them is skipped, so count the reasons rather than guess which
+// `continue` it is.
+std::atomic<uint32_t> g_texgc_candidates {0};
+std::atomic<uint32_t> g_texgc_skip_unregistered {0};
+std::atomic<uint32_t> g_texgc_skip_tiled {0};
+std::atomic<uint32_t> g_texgc_skip_unpressured {0};
+std::atomic<uint32_t> g_texgc_skip_download {0};
+std::atomic<uint32_t> g_texgc_unsafe_deleted {0};
+
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
@@ -2307,42 +2325,105 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
-	const auto collect = [&](bool allow_aggressive) {
+	uint32_t   deleted_this_run = 0;
+	const auto collect          = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
+		// `ForEachItemBelow(tick - age)` selects images UNUSED for at least `age` ticks, so a
+		// LARGER age is a NARROWER candidate pool. The original ordering (aggressive ? 160 :
+		// pressured ? 80 : 16) is inverted: it scanned the narrowest set under critical pressure
+		// and the widest with none. Worse, collect(false) runs first at 80 and collect(true) then
+		// re-scans at 160 - a strict subset of what pass one already had - so the aggressive pass
+		// is close to a no-op and texture memory never comes down. BufferCache already uses the
+		// correct direction (aggressive ? 80 : 160).
+		//
+		// Measured cause: the buffer cache holds a flat ~500MB while total device memory climbs
+		// to `critical` and stays pinned there, which keeps BufferCache::RunGarbageCollector
+		// permanently `aggressive=128/128` - downloading dirty buffers forever in response to
+		// texture pressure it cannot relieve. See BufferGc/128 in the ledger.
+		// SPLIT DELIBERATELY. Bundling these behind one flag measured a net regression
+		// (+14us/draw of texture re-upload in `draw`, against -7 finish / -3 gc) and could not
+		// say which half caused it. The budget fix and the age inversion are independent:
+		//   KYTY_TEXGC_BUDGET_FIX - scan past unevictable candidates, charge the deletion
+		//                           budget only for an image actually freed. Clearly correct.
+		//   KYTY_TEXGC_AGE_FIX    - invert the age ordering so critical pressure scans the
+		//                           WIDEST set. Suspected thrash source: `aggressive ? 16` evicts
+		//                           images last used ~0.1 frames ago, i.e. this frame. The
+		//                           original `160` may be deliberate anti-thrash.
+		static const bool fix_budget = [] {
+			const char* env = std::getenv("KYTY_TEXGC_BUDGET_FIX");
+			return env != nullptr && env[0] == '1';
+		}();
+		static const bool fix_age_order = [] {
+			const char* env = std::getenv("KYTY_TEXGC_AGE_FIX");
+			return env != nullptr && env[0] == '1';
+		}();
+		const uint64_t age =
+		    fix_age_order
+		        ? std::min<uint64_t>(aggressive ? 16 : pressured ? 80 : 160, tick)
+		        : std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		// THE LIVELOCK, measured: every LRU candidate is GPU-modified + tiled, and tiled images
+		// are correctly never evicted (downloading one would write detiled data into guest
+		// memory). But the loop below consumed a deletion-budget slot per *candidate examined*,
+		// not per image actually freed, and only `deletions` candidates were collected. So the
+		// GC spent its whole budget re-examining the same ~60 permanently-unevictable images
+		// every run and never reached anything it could free - out of 4,500 registered images.
+		// Counter that caught it: `TexGc/128 ... cand=7680 skip: tiled=7680 deleted=0`.
+		// Scan deeper, and only charge the budget for real deletions.
+		const size_t scan_limit = fix_budget ? deletions * 16 : deletions;
 		std::vector<ImageId> candidates;
-		candidates.reserve(deletions);
+		candidates.reserve(scan_limit);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
 		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
 			candidates.push_back(id);
-			return candidates.size() == deletions;
+			return candidates.size() == scan_limit;
 		});
+		g_texgc_candidates.fetch_add(static_cast<uint32_t>(candidates.size()),
+		                             std::memory_order_relaxed);
 		for (const auto id: candidates) {
 			if (deletions == 0) {
 				break;
 			}
-			--deletions;
+			if (!fix_budget) {
+				--deletions; // original behaviour: budget charged per candidate examined
+			}
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				g_texgc_skip_unregistered.fetch_add(1, std::memory_order_relaxed);
 				continue;
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = SafeToDownload(*owner);
 				if (safe && owner->info.IsTiled()) {
+					g_texgc_skip_tiled.fetch_add(1, std::memory_order_relaxed);
 					continue;
 				}
 				if (safe && !pressured) {
+					g_texgc_skip_unpressured.fetch_add(1, std::memory_order_relaxed);
 					continue;
 				}
 				if (safe && !TryDownloadImage(id)) {
+					g_texgc_skip_download.fetch_add(1, std::memory_order_relaxed);
 					continue;
+				}
+				if (!safe) {
+					g_texgc_unsafe_deleted.fetch_add(1, std::memory_order_relaxed);
 				}
 				owner->ClearGpuModified();
 			}
 			DeleteImage(id);
+			deleted_this_run++;
+			if (fix_budget && deletions > 0) {
+				--deletions; // charge the budget only for an image actually freed
+			}
+			// Re-read after freeing. m_total_used_memory was only sampled at the top of the
+			// function, so both de-escalation checks below could never fire - the value they
+			// test does not change during the loop.
+			if (fix_budget && m_graphics.CanReportMemoryUsage()) {
+				m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+			}
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
@@ -2356,6 +2437,33 @@ void TextureCache::RunGarbageCollector() {
 	collect(false);
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
+	}
+
+	// Attribute the VRAM growth: the buffer cache is measurably flat at ~500MB while total device
+	// memory climbs, so this cache is the suspect. Report what it holds and what it manages to
+	// evict per run.
+	{
+		static std::atomic<uint32_t> runs {0}, deleted {0};
+		deleted.fetch_add(deleted_this_run, std::memory_order_relaxed);
+		if ((runs.fetch_add(1, std::memory_order_relaxed) % 128) == 127) {
+			// VulkanImage carries no byte size (VMA owns the allocation), so count registered
+			// images instead - growth in count is the signal we need here.
+			uint32_t count = 0;
+			m_slot_images.ForEach([&](ImageId id, const Image& image) {
+				(void)id;
+				if (image.registered) {
+					count++;
+				}
+			});
+			LOGF("TexGc/128: used=%" PRIu64 "MB pressure=%" PRIu64 "MB critical=%" PRIu64
+			     "MB | images=%u deleted=%u | cand=%u skip: unreg=%u tiled=%u unpressured=%u "
+			     "dlfail=%u unsafe_del=%u\n",
+			     m_total_used_memory / (1024 * 1024), m_pressure_gc_memory / (1024 * 1024),
+			     m_critical_gc_memory / (1024 * 1024), count, deleted.exchange(0),
+			     g_texgc_candidates.exchange(0), g_texgc_skip_unregistered.exchange(0),
+			     g_texgc_skip_tiled.exchange(0), g_texgc_skip_unpressured.exchange(0),
+			     g_texgc_skip_download.exchange(0), g_texgc_unsafe_deleted.exchange(0));
+		}
 	}
 }
 

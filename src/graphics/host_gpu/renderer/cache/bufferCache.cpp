@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/timer.h"
@@ -20,6 +21,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -149,6 +153,14 @@ void BufferCache::Unregister(BufferId id) {
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	auto& buffer = m_slot_buffers[id];
+	// Running total of what THIS cache holds. The GC needs it every run (~175x/frame), so it
+	// cannot be recomputed by walking m_slot_buffers - the symmetric register/unregister hook is
+	// the cheap place to maintain it.
+	if constexpr (insert) {
+		m_registered_bytes += buffer.Size();
+	} else {
+		m_registered_bytes -= std::min(m_registered_bytes, buffer.Size());
+	}
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
@@ -249,6 +261,39 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 			     " size=%" PRIu64 "\n",
 			     n, copies.size(), total, copies.empty() ? 0 : copies.front().address,
 			     copies.empty() ? 0 : copies.front().size);
+		}
+	}
+	// Census of EVERY copy, not just the batch's first. The `first_addr` line above samples
+	// (64 calls then 1-in-64) and only ever names copies.front(), so it cannot answer "does the
+	// guest CPU ever read address X back?" - and that question decides whether GPU-side culling
+	// can change the host's draw count at all. Accumulates bytes+count per address and dumps the
+	// top talkers. Ungated like Pm4Ops/SchedFinish - Config::GraphicsDebugDumpEnabled() needs
+	// --graphics-debug-dump, which none of the other counters require, and gating on it made
+	// this print nothing at all on the first attempt.
+	{
+		struct Site {
+			uint64_t bytes = 0;
+			uint32_t count = 0;
+		};
+		static std::mutex                              census_mutex;
+		static std::unordered_map<uint64_t, Site>      census;
+		static uint32_t                                census_calls = 0;
+		std::scoped_lock                               lock {census_mutex};
+		for (const auto& c: copies) {
+			auto& site = census[c.address];
+			site.bytes += c.size;
+			site.count++;
+		}
+		if (++census_calls % 256 == 0) {
+			std::vector<std::pair<uint64_t, Site>> sorted(census.begin(), census.end());
+			std::sort(sorted.begin(), sorted.end(),
+			          [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
+			std::string top;
+			for (size_t i = 0; i < sorted.size() && i < 8; i++) {
+				top += fmt::format(" 0x{:016x}={}x/{}KB", sorted[i].first, sorted[i].second.count,
+				                   sorted[i].second.bytes / 1024);
+			}
+			LOGF("BufferDlCensus/256: sites=%zu%s\n", sorted.size(), top.c_str());
 		}
 	}
 	// Readback strategy. DEFAULT: synchronous (full GPU idle-stall per drain) - stable.
@@ -513,6 +558,27 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
 	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
 	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
+
+	// DIAGNOSTIC OVERRIDES, in MB. `critical` decides whether RunGarbageCollector DOWNLOADS a
+	// dirty buffer or skips it, and in-fight UFC5 sits ~1% over it permanently
+	// (used=5287MB vs critical=5222MB, aggressive=128/128), so every GC run pays the download.
+	// These make the threshold A/B-able without a rebuild.
+	const auto override_mb = [](const char* name, uint64_t& value) {
+		const char* env = std::getenv(name);
+		if (env == nullptr || env[0] == '\0') {
+			return;
+		}
+		char*      end    = nullptr;
+		const auto parsed = std::strtoull(env, &end, 10);
+		if (end != env && parsed != 0) {
+			value = parsed * 1024ull * 1024ull;
+		}
+	};
+	override_mb("KYTY_GC_TRIGGER_MB", m_trigger_gc_memory);
+	override_mb("KYTY_GC_CRITICAL_MB", m_critical_gc_memory);
+	LOGF("BufferGcThresholds: budget=%" PRIu64 "MB trigger=%" PRIu64 "MB critical=%" PRIu64 "MB\n",
+	     static_cast<uint64_t>(budget) / (1024 * 1024), m_trigger_gc_memory / (1024 * 1024),
+	     m_critical_gc_memory / (1024 * 1024));
 }
 
 BufferCache::~BufferCache() {
@@ -1028,7 +1094,29 @@ void BufferCache::RunGarbageCollector() {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	// `aggressive` decides whether a dirty buffer is DOWNLOADED (a GPU drain) or left alone.
+	// m_total_used_memory is TOTAL device memory, shared with the texture cache - and the texture
+	// cache cannot evict GPU-modified tiled images at all (measured: 100% of its LRU candidates
+	// are tiled, deleted=0 forever while 1GB over its own critical line). So total memory is
+	// pinned above critical permanently, by memory this cache does not own and cannot free, and
+	// the buffer GC was left `aggressive=128/128` downloading dirty buffers forever in response.
+	//
+	// This cache holds a flat ~500MB of a ~6.5GB budget. Going aggressive is only meaningful when
+	// evicting buffers could actually relieve the pressure, so require this cache to be holding a
+	// material share of the budget as well. `KYTY_BUFGC_OWN_SHARE=0` restores the old behaviour.
+	static const uint64_t own_share_pct = [] {
+		const char* env = std::getenv("KYTY_BUFGC_OWN_SHARE");
+		if (env == nullptr || env[0] == '\0') {
+			return uint64_t {25};
+		}
+		char*      end    = nullptr;
+		const auto parsed = std::strtoull(env, &end, 10);
+		return end == env ? uint64_t {25} : parsed;
+	}();
+	const bool own_pressure =
+	    own_share_pct == 0 ||
+	    m_registered_bytes >= m_critical_gc_memory * own_share_pct / 100;
+	const bool aggressive = m_total_used_memory >= m_critical_gc_memory && own_pressure;
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
@@ -1060,6 +1148,68 @@ void BufferCache::RunGarbageCollector() {
 		}
 		return ++retire_count == limit;
 	});
+	// Why this counter exists: BufferDlCensus showed one 10 MB buffer (0x113d000000) downloaded
+	// ~164x per census window, ~12x per frame, ~120 MB/frame. The demand-read path clips to a
+	// 512 KiB window and AppendSmallDirtyDownloads caps seeds at 64 KiB / 4 MiB, so neither can
+	// emit a 10 MB copy - only this path can, and only when `aggressive`. That means the cache
+	// is pinned at critical VRAM pressure and is evicting-and-redownloading the same live buffer
+	// every frame. Report the pressure and the volume so that is measured, not assumed.
+	{
+		static std::atomic<uint32_t> runs {0}, aggressive_runs {0};
+		static std::atomic<uint64_t> bytes {0};
+		uint64_t                     run_bytes = 0;
+		for (const auto& c: copies) {
+			run_bytes += c.size;
+		}
+		bytes.fetch_add(run_bytes, std::memory_order_relaxed);
+		if (aggressive) {
+			aggressive_runs.fetch_add(1, std::memory_order_relaxed);
+		}
+		if ((runs.fetch_add(1, std::memory_order_relaxed) % 128) == 127) {
+			// Is the VRAM growth even in buffers? GetDeviceMemoryUsage() is TOTAL device memory
+			// (VMA), shared with the texture cache, so `used` climbing does not by itself mean
+			// the buffer cache is the one growing. Census what this cache actually holds, split
+			// by dirty/clean, so the growth is attributed instead of assumed.
+			uint64_t held = 0, dirty_bytes = 0, clean_bytes = 0;
+			uint32_t count = 0, dirty_count = 0, old_clean = 0;
+			m_slot_buffers.ForEach([&](BufferId id, const Buffer& buffer) {
+				if (buffer.is_deleted) {
+					return;
+				}
+				count++;
+				held += buffer.Size();
+				if (m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
+					dirty_count++;
+					dirty_bytes += buffer.Size();
+				} else {
+					clean_bytes += buffer.Size();
+					old_clean++;
+				}
+				(void)id;
+			});
+			LOGF("BufferGc/128: aggressive=%u/128 used=%" PRIu64 "MB trigger=%" PRIu64
+			     "MB critical=%" PRIu64 "MB downloaded=%" PRIu64 "MB dirtylist=%zu | "
+			     "cache=%uk buffers %" PRIu64 "MB (dirty %u/%" PRIu64 "MB clean %u/%" PRIu64
+			     "MB)\n",
+			     aggressive_runs.exchange(0), m_total_used_memory / (1024 * 1024),
+			     m_trigger_gc_memory / (1024 * 1024), m_critical_gc_memory / (1024 * 1024),
+			     bytes.exchange(0) / (1024 * 1024), dirty_buffers.size(), count / 1000,
+			     held / (1024 * 1024), dirty_count, dirty_bytes / (1024 * 1024), old_clean,
+			     clean_bytes / (1024 * 1024));
+			// Sanity-check the running counter against the walk it replaces. Exact equality is
+			// the wrong test: the walk skips `is_deleted` buffers while the counter tracks
+			// register/unregister, so they legitimately differ by a few bytes in flight. Only a
+			// difference big enough to move the 25%-of-budget gate matters.
+			const auto drift = held > m_registered_bytes ? held - m_registered_bytes
+			                                             : m_registered_bytes - held;
+			if (drift > 16 * MiB) {
+				LOGF("BufferGc: registered_bytes drift: counter=%" PRIu64 "MB walk=%" PRIu64
+				     "MB\n",
+				     m_registered_bytes / (1024 * 1024), held / (1024 * 1024));
+			}
+		}
+	}
+
 	if (dirty_buffers.empty()) {
 		return;
 	}

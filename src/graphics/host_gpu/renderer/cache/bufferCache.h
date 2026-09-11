@@ -39,6 +39,11 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Unmap variant of InvalidateMemory: the guest can never observe these bytes
+	// again, so drop GPU ownership without the GPU->CPU write-back (and without
+	// InvalidateMemory's 512 KiB widening, which pulls unrelated dirty ranges into
+	// the same Finish). KYTY_UNMAP_DISCARD=0 restores the write-back.
+	void                   DiscardMemory(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	// Apply 1-frame-latency staging->guest writebacks whose GPU tick has retired
 	// (force = wait + apply all). Must be called before a guest range is unmapped.
@@ -124,6 +129,7 @@ private:
 	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
 	void AppendSmallDirtyDownloads(std::vector<DownloadCopy>& copies);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
+	void DiscardMemoryOnGpu(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -145,6 +151,8 @@ private:
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
+	// Bytes of registered buffers this cache actually owns, maintained in ChangeRegister().
+	uint64_t m_registered_bytes = 0;
 	uint64_t m_gc_tick            = 0;
 };
 

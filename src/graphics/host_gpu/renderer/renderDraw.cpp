@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -90,6 +91,48 @@ static std::atomic<uint32_t> g_draw_input_log_count   = 0;
 static std::atomic<uint32_t> g_mrt_state_log_count    = 0;
 
 static std::atomic<uint32_t> g_framebuffer_skip_log_count = 0;
+
+// DIAGNOSTIC, default off. `KYTY_SKIP_PS_HASH=<hex>[,<hex>...]` drops the draw call for draws
+// binding those pixel shaders - everything else about the draw (pipeline, descriptors, render
+// targets, all the host CPU work) still happens, only the vkCmdDraw* is not issued.
+//
+// Why it exists: the claim that 3 pixel ubershaders own ~79% of the frame rests on per-draw GPU
+// timestamp brackets, which is attribution, not causation - begin/end timestamps around a draw
+// on a pipelined GPU can still absorb work from other draws in flight, and this ledger has
+// already shipped one wrong figure from exactly that (the 96% wave64 number). Not issuing the
+// draws at all is the causal control, and it also gives the UPPER BOUND on what any fix to
+// those shaders can ever be worth. Keeping the CPU-side work means the delta is GPU time only.
+// The frame is not correct with this set - draws are missing. It is a measurement tool.
+static bool ShouldSkipPixelShaderHash(uint64_t hash) {
+	static const std::vector<uint64_t> skipped = [] {
+		std::vector<uint64_t> list;
+		const char*           env = std::getenv("KYTY_SKIP_PS_HASH");
+		if (env == nullptr) {
+			return list;
+		}
+		const char* cursor = env;
+		while (*cursor != '\0') {
+			while (*cursor == ',' || *cursor == ' ' || *cursor == '\t') {
+				++cursor;
+			}
+			if (*cursor == '\0') {
+				break;
+			}
+			if (cursor[0] == '0' && (cursor[1] == 'x' || cursor[1] == 'X')) {
+				cursor += 2;
+			}
+			char*      end   = nullptr;
+			const auto value = std::strtoull(cursor, &end, 16);
+			if (end == cursor) {
+				break;
+			}
+			list.push_back(static_cast<uint64_t>(value));
+			cursor = end;
+		}
+		return list;
+	}();
+	return !skipped.empty() && std::find(skipped.begin(), skipped.end(), hash) != skipped.end();
+}
 
 static float ConvertPolygonOffsetConstantFactor(float guest_factor, const HW::PolyOffset& offset,
                                                 vk::Format host_depth_format) {
@@ -1234,11 +1277,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
-	} else {
-		EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+	const uint64_t draw_vs_hash = state.vs_input_info.stage.program != nullptr
+	                                  ? state.vs_input_info.stage.program->shader_hash
+	                                  : uint64_t {0};
+	const uint64_t draw_ps_hash = state.ps_active &&
+	                                      state.ps_input_info.stage.program != nullptr
+	                                  ? state.ps_input_info.stage.program->shader_hash
+	                                  : uint64_t {0};
+	GpuTimestamps::Instance().BeginDraw(vk_buffer, draw_vs_hash, draw_ps_hash);
+	// Bracket the skipped draw too, so GpuDraws still reports it - at ~0us instead of ~21000us.
+	if (!ShouldSkipPixelShaderHash(draw_ps_hash)) {
+		if (mesh_active) {
+			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		} else {
+			EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+		}
 	}
+	GpuTimestamps::Instance().EndDraw(vk_buffer);
 
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
