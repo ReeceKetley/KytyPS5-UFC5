@@ -1296,10 +1296,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			for (uint32_t i = 0; i < state.color_count; i++) {
 				const auto& color = state.color_info[i];
 				const auto  ext   = color.Extent();
-				targets += fmt::format(" [{}]=0x{:016x} {}x{} fmt={} id={}", i,
+				// Log the actual ImageId, not a bool. rt68360000 dumps byte-identical across
+				// hundreds of frames while the game is live, so either these draws resolve a
+				// DIFFERENT cache image than the dump/compositor does for the same guest
+				// address (the FindImage alias family), or the draws stopped landing. The id
+				// is what separates those.
+				targets += fmt::format(" [{}]=0x{:016x} {}x{} fmt={} img={} mip={} layer={}", i,
 				                       color.desc.info.data.address, ext.width, ext.height,
 				                       static_cast<uint32_t>(color.desc.info.pixel_format),
-				                       color.image_id ? 1 : 0);
+				                       color.image_id.index, color.guest_mip_level,
+				                       color.guest_array_layer);
 			}
 			LOGF("WatchedDrawTarget: ps=0x%016" PRIx64 " colors=%u depth=%d%s\n", draw_ps_hash,
 			     state.color_count, state.depth_info.image_id ? 1 : 0, targets.c_str());

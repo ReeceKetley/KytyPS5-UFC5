@@ -454,6 +454,11 @@ void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCac
 		}
 		char tag[32];
 		std::snprintf(tag, sizeof(tag), "rt%08x", static_cast<uint32_t>(address));
+		// Report which cache image this address resolved to. Compare against the img= field in
+		// WatchedDrawTarget: if the draws write a different ImageId than the dump reads for the
+		// same guest address, the surface is aliased and the compositor is reading the wrong
+		// one - which is what a frozen dump alongside a live game would mean.
+		LOGF("DumpResolve: %s addr=0x%016" PRIx64 " img=%u\n", tag, address, id.index);
 		DumpGpuImage(command, renderer, cache.GetImage(id), tag, address, true);
 	}
 }

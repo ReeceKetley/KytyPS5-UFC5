@@ -1,10 +1,13 @@
 # UFC 5 / KytyPS5 ledger
 
-Last updated: 2026-09-11 session 3 — **THE BLACK ROUND IS A PRESENT BUG, NOT A CULLING BUG.** The fight
-scene renders fully into `0x1168360000` (1920x1080 HDR, 98.6% nonzero) every frame and never reaches the
-scanout (8.6%, HUD only). The "scene RT is empty" evidence that drove days of occlusion/wave64 work came
-from a surface dump with a **hardcoded address list that never contained the scene buffer**. Wave64
-Stage 2 is no longer justified by the black round. See "THE BLACK ROUND IS A COMPOSITE/PRESENT BUG".
+Last updated: 2026-09-11 session 4 — **THE FIGHT HDR TARGET IS FROZEN; IMAGE ALIASING IS RULED OUT.**
+In the actual fight round, the three pixel ubershaders bind `0x1168360000` as cache `ImageId 1356`, and
+the surface dump resolves that same address to the same `ImageId 1356`. Two dumps 224 frames apart are
+byte-identical (`SHA256 17A88E17...`) while `display`/`present` both change and the user can see the live
+blue/cyan edge and HUD. Therefore this is not a stale cache twin and not a frozen presentation path:
+the draws are issued against the right image but stop changing it after the walkout frame. Next split is
+depth rejection vs shader discard/no rasterized fragments vs ineffective colour output/blend. Wave64
+Stage 2 is still not justified by the black round until a dependency on the skipped occlusion CS is proven.
 
 Also this session: **IN-FIGHT 1.0 -> 5.0 FPS.** Two independent wins: the 3 pixel
 ubershaders now structurize on the Legacy path (1.0 -> 2.9), and `BufferCache` no longer garbage-collects
@@ -405,8 +408,8 @@ your shell cannot silently change the run), and prints what it set.
 
 | setting | why |
 |---|---|
-| `KYTY_SKIP_CS_HASH=0xea0aceac518ec52d` | **Required to reach a fight at all.** The occlusion CS is wave64 and TDRs on a wave32-only RTX 3070. This is why the round renders **BLACK** — expected, not a regression. |
-| `KYTY_GPU_TIMESTAMPS=1` | Real GPU timing. The 3 ubershader hashes are already the default watch list. |
+| `KYTY_SKIP_CS_HASH=0xea0aceac518ec52d` | **Required to reach a fight at all.** The occlusion CS is wave64 and TDRs on a wave32-only RTX 3070. The round is black with it skipped, but the causal path is not yet proven. |
+| `KYTY_GPU_TIMESTAMPS` unset | Off by default: validation found unreset timestamp queries (UB). `frame_stats.py` uses `FrameProfile` and does not need them. |
 | `KYTY_SRT_LINEAR=1` | Flat SRT evaluator. `getprog` -31%; verified equivalent (0 mismatches / 573k calls). |
 | *(no env var)* | The two big wins are **in the code, always on**: the ubershader structurizer fix, and BufferCache no longer GC'ing against memory it does not own. |
 
@@ -434,7 +437,29 @@ one frame.
 and `graphics_debug_dump_enabled()` keys off it, so without it every counter is silently
 discarded and the log looks fine but contains no measurements. The script always passes it.
 
-### THE BLACK ROUND IS A COMPOSITE/PRESENT BUG. THE SCENE RENDERS FINE. (2026-09-11)
+### THE FIGHT HDR TARGET IS FROZEN; ALIASING RULED OUT (2026-09-11 session 4)
+
+The actual fight-round A/B test resolves candidate **(B)**:
+
+```
+WatchedDrawTarget: ... addr=0x0000001168360000 ... img=1356 mip=0 layer=0
+DumpResolve: rt68360000 addr=0x0000001168360000 img=1356
+```
+
+The ubershader draws and the dump refer to the same cache image, mip, and layer. This rules out the
+`FindImage` stale-twin hypothesis. On-demand dumps at frames 2826 and 3050 were byte-identical for
+`rt68360000` (`SHA256 17A88E17E7EB95BF43A55FC9EE0B992E326EFA047ADF3AC4C29C478586DED5E6`),
+while `display` and `present` had different hashes across those frames and matched each other within
+each frame. The user's visible blue/cyan top/right edge changes too. Presentation is live; the HDR scene
+target is not.
+
+**Conclusion:** the old cage/walkout image is retained in `0x1168360000`, but fight-round draws stop
+changing it despite being issued against it. Next distinguish depth rejection, shader discard/no
+rasterized fragments, and ineffective colour output/blend. Do not call this a compositor/present bug.
+Do not infer that the skipped occlusion CS is or is not responsible until one of those mechanisms is
+measured.
+
+### WITHDRAWN: THE BLACK ROUND IS A COMPOSITE/PRESENT BUG. THE SCENE RENDERS FINE. (2026-09-11 session 3)
 
 **The fight scene is fully rendered every frame and never reaches the scanout.**
 
