@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -57,11 +58,51 @@
 namespace Libs::Graphics {
 namespace {
 
+// Thrown by Check() so a failing assertion aborts only the test that raised it.
+// The harness used to std::abort(), which meant the first failure hid every
+// later test - including the UFC ubershader oracle at the end of the list.
+struct CheckFailed {
+  std::string text;
+};
+
 void Check(bool value, const char *text) {
   if (!value) {
-    std::fprintf(stderr, "ShaderCfgTests: failed: %s\n", text);
-    std::abort();
+    throw CheckFailed{text != nullptr ? text : "<null>"};
   }
+}
+
+std::vector<std::string> g_failed_tests;
+
+template <typename Function> void RunTest(const char *name, Function function) {
+  try {
+    function();
+  } catch (const CheckFailed &failure) {
+    std::fprintf(stderr, "ShaderCfgTests: FAILED %s: %s\n", name,
+                 failure.text.c_str());
+    std::fflush(stderr);
+    g_failed_tests.emplace_back(std::string(name) + ": " + failure.text);
+  } catch (const std::exception &error) {
+    std::fprintf(stderr, "ShaderCfgTests: FAILED %s: exception: %s\n", name,
+                 error.what());
+    std::fflush(stderr);
+    g_failed_tests.emplace_back(std::string(name) +
+                                ": exception: " + error.what());
+  }
+}
+
+#define RUN(test) RunTest(#test, test)
+
+int ReportTestResults() {
+  if (g_failed_tests.empty()) {
+    std::puts("ShaderCfgTests: all tests passed");
+    return 0;
+  }
+  std::fprintf(stderr, "ShaderCfgTests: %zu test(s) failed:\n",
+               g_failed_tests.size());
+  for (const auto &failure : g_failed_tests) {
+    std::fprintf(stderr, "  - %s\n", failure.c_str());
+  }
+  return 1;
 }
 
 void SetShaderCfgStrategyEnv(const char *value) {
@@ -7757,10 +7798,22 @@ void TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check(Common::ContainsStr(result.ir_dump, "mode=dispatcher"),
-        "nested-loop nonlocal exit did not select dispatcher fallback");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 251) != 0,
-        "nested-loop nonlocal exit dispatcher SPIR-V lacks OpSwitch");
+  // A nonlocal exit out of a nested loop must produce VALID SPIR-V. Which strategy achieves
+  // that is an implementation detail: this test used to pin "mode=dispatcher" and went stale
+  // the moment the legacy structurizer learned to handle the pattern, leaving the whole suite
+  // red (the harness stops at the first failure, so everything after it went unverified).
+  // Assert the property that matters, plus internal consistency between the chosen mode and
+  // the emitted control flow.
+  const bool dispatcher = Common::ContainsStr(result.ir_dump, "mode=dispatcher");
+  const bool structured = Common::ContainsStr(result.ir_dump, "mode=structured");
+  Check(dispatcher != structured, "nested-loop nonlocal exit reported no single CFG mode");
+  // Only the dispatcher is *required* to emit a switch. The structured path may still contain
+  // one: StructurizeLegacy's second strategy (RouteSharedSelectionArm) introduces routing
+  // variables that lower to OpSwitch, so "structured" does not imply "switch-free".
+  if (dispatcher) {
+    Check(SpirvInstructionOpcodeCount(result.spirv, 251) != 0,
+          "nested-loop nonlocal exit dispatcher SPIR-V lacks OpSwitch");
+  }
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -7861,10 +7914,16 @@ void TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check(Common::ContainsStr(result.ir_dump, "mode=dispatcher"),
-        "mixed continue/nonmerge exit did not select dispatcher fallback");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 251) != 0,
-        "mixed continue/nonmerge exit dispatcher SPIR-V lacks OpSwitch");
+  // As with the nested-loop nonlocal exit above: the required property is valid SPIR-V, not a
+  // particular strategy. Pinning "mode=dispatcher" makes this test fail as an *improvement*
+  // whenever the legacy structurizer learns the pattern.
+  const bool dispatcher = Common::ContainsStr(result.ir_dump, "mode=dispatcher");
+  const bool structured = Common::ContainsStr(result.ir_dump, "mode=structured");
+  Check(dispatcher != structured, "mixed continue/nonmerge exit reported no single CFG mode");
+  if (dispatcher) {
+    Check(SpirvInstructionOpcodeCount(result.spirv, 251) != 0,
+          "mixed continue/nonmerge exit dispatcher SPIR-V lacks OpSwitch");
+  }
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -8792,6 +8851,59 @@ void TestUfc5PsDispatcherFullOracle() {
                legacy_stats.failure_reason.c_str(), dispatch_ok ? 1 : 0,
                dispatch_stats.final_blocks, dispatch_stats.dispatcher_cases,
                dispatch_stats.synthetic_blocks);
+
+  // These three shaders cost ~21ms of GPU time PER DRAW through the dispatcher (a 161-case
+  // switch inside a loop, executed per pixel), which is ~79% of an in-game frame. Fixing the
+  // legacy path needs the actual CFG shape around the failure, not the failure string - so
+  // print the neighbourhood of the blocks the reason names. KYTY_CFG_DUMP_BLOCKS overrides
+  // the id list.
+  if (!legacy_ok) {
+    // Dump the FAILED graph, not a fresh BuildGraph: the ids in the failure reason refer to
+    // the post-canonicalisation/split graph (193 blocks here), where 177 and 192 are synthetic
+    // blocks that do not exist in the 161-block original.
+    const auto &shape = legacy_graph;
+    std::vector<uint32_t> ids {13, 15, 16, 17, 18, 19, 177, 192};
+    if (const char *env = std::getenv("KYTY_CFG_DUMP_BLOCKS"); env != nullptr) {
+      ids.clear();
+      for (const char *c = env; *c != '\0';) {
+        char *end = nullptr;
+        const auto v = std::strtoul(c, &end, 10);
+        if (end == c) {
+          break;
+        }
+        ids.push_back(static_cast<uint32_t>(v));
+        c = (*end == ',') ? end + 1 : end;
+      }
+    }
+    std::fprintf(stderr, "UFC PS pre-structurize CFG (%u blocks):\n",
+                 static_cast<uint32_t>(shape.blocks.size()));
+    for (const auto id : ids) {
+      const auto *b = shape.FindBlock(id);
+      if (b == nullptr) {
+        std::fprintf(stderr, "  block_%u: ABSENT\n", id);
+        continue;
+      }
+      std::string preds;
+      for (const auto p : b->predecessors) {
+        preds += fmt::format("{},", p);
+      }
+      std::string succs;
+      for (const auto s : b->successors) {
+        succs += fmt::format("{},", s);
+      }
+      std::string doms;
+      for (const auto d : b->dominators) {
+        doms += fmt::format("{},", d);
+      }
+      std::fprintf(stderr,
+                   "  block_%u preds=[%s] succs=[%s] term=%u cond=%u true=%u false=%u "
+                   "doms=[%s]\n",
+                   id, preds.c_str(), succs.c_str(),
+                   static_cast<uint32_t>(b->terminator.kind),
+                   static_cast<uint32_t>(b->terminator.condition),
+                   b->terminator.true_block, b->terminator.false_block, doms.c_str());
+    }
+  }
   std::fflush(stderr);
 
   Check(dispatch_ok, dispatch_graph.unsupported_reason.c_str());
@@ -8844,6 +8956,101 @@ void TestUfc5PsDispatcherFullOracle() {
         "wide dispatch phis were not lowered to function variables");
   CheckSpirvBinaryValidates(compiled.spirv);
   (void)legacy_ok;
+}
+
+// The ubershader must come out of the LEGACY structurizer as valid SPIR-V, not just as a graph
+// ValidateStructuredExits accepts. That validator is necessary but not sufficient - an earlier
+// structurizer change passed it and still produced a module the driver turned into a device
+// loss - so gate the legacy path on spirv-val and on the phi-parent invariant here, where it
+// costs seconds instead of a navigate-into-a-fight cycle.
+void CheckUfc5PsLegacyStructurizedSpirv(const char *fixture, uint64_t hash) {
+  auto code = LoadShaderFixture(fixture);
+  if (code.empty()) {
+    std::fprintf(stderr, "ShaderCfgTests: skip UFC legacy spirv %s\n", fixture);
+    return;
+  }
+
+  // Structurize on its own first, so a failure names the CFG reason rather than surfacing as
+  // a silent dispatcher fallback further down.
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(code, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  ShaderRecompiler::CFG::StructurizeOptions options;
+  options.kind = ShaderRecompiler::CFG::StructurizerKind::LegacySplit;
+  ShaderRecompiler::CFG::StructurizeStats stats;
+  const auto structurize_started = std::chrono::steady_clock::now();
+  const bool legacy_ok =
+      ShaderRecompiler::CFG::StructurizeWithStrategy(graph, options, &stats);
+  const auto structurize_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - structurize_started)
+          .count();
+  std::fprintf(stderr,
+               "UFC PS %s legacy structurize=%d blocks=%u time=%.1fms reason=%s\n",
+               fixture, legacy_ok ? 1 : 0, stats.final_blocks, structurize_ms,
+               stats.failure_reason.c_str());
+  Check(legacy_ok, stats.failure_reason.c_str());
+
+  ShaderPixelInputInfo pixel;
+  pixel.input_num = 32;
+  SetIdentityInterpolatorSettings(&pixel);
+
+  auto compile = MakeCompileOptions(ShaderType::Pixel);
+  compile.shader_hash = hash;
+  compile.input_info.pixel = &pixel;
+  SetShaderCfgStrategyEnv("legacy");
+  auto translated = ShaderRecompiler::TranslateProgram(code, compile);
+  auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = compile.user_data,
+      .shader_base = reinterpret_cast<uint64_t>(code.data()),
+      .read_memory = ReadZeroTestMemory,
+      .userdata = nullptr,
+      .read_specialization_memory = ReadZeroTestMemory,
+  };
+  Check(ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources,
+                                                   specialization),
+        "UFC legacy resources did not materialize");
+  const auto compile_started = std::chrono::steady_clock::now();
+  auto compiled = ShaderRecompiler::CompileProgram(std::move(translated),
+                                                   compile, specialization);
+  const auto compile_ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - compile_started)
+                              .count();
+  std::fprintf(stderr,
+               "UFC PS %s legacy recompile spirv_words=%zu phis=%u switches=%u "
+               "fallback=%d emit=%.1fms\n",
+               fixture, compiled.spirv.size(),
+               SpirvInstructionOpcodeCount(compiled.spirv, 245u),
+               SpirvInstructionOpcodeCount(compiled.spirv, 251u),
+               compiled.program.dispatcher_fallback ? 1 : 0, compile_ms);
+  std::fflush(stderr);
+
+  CheckSpirvPhiParents(compiled.spirv);
+  CheckSpirvBinaryValidates(compiled.spirv);
+  Check(!compiled.program.dispatcher_fallback,
+        "UFC ubershader fell back to the dispatcher on the legacy strategy");
+  // The property that matters is the absence of the state machine, NOT module size: the
+  // dispatcher's cost is a 161-case OpSwitch inside a per-pixel loop where divergent lanes
+  // never reconverge, so each iteration the wave executes the union of every case any lane is
+  // in. Measured here, the structured module is the same ~165k words as the dispatcher one -
+  // the 30x GCN->SPIR-V expansion is wave64 lane-pair duplication, not control flow - so a
+  // size bound would assert nothing. OpSwitch is the real signal.
+  Check(SpirvInstructionOpcodeCount(compiled.spirv, 251u) == 0u,
+        "UFC legacy SPIR-V still contains a dispatch switch");
+}
+
+void TestUfc5PsLegacyStructurizedSpirv() {
+  // All three ubershaders share the same `if (a) return; if (b) return; <shared join>` shape
+  // and all three used to fall back to the dispatcher.
+  CheckUfc5PsLegacyStructurizedSpirv("PS_1bcc68ffb7b0469e.bin",
+                                     0x1bcc68ffb7b0469eull);
+  CheckUfc5PsLegacyStructurizedSpirv("PS_b808b3887f76ff0c.bin",
+                                     0xb808b3887f76ff0cull);
+  CheckUfc5PsLegacyStructurizedSpirv("PS_f7030726b9470dd8.bin",
+                                     0xf7030726b9470dd8ull);
 }
 
 void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
@@ -13162,141 +13369,142 @@ int main(int argc, char** argv) {
     std::puts("ShaderCfgTests: dual-source pixel exports passed");
     return 0;
   }
-  TestResourceDescriptorClassification();
-  TestNativeShaderResourceDependencies();
-  TestNormalizedImageContracts();
-  TestSpirvRequirementsAnalysis();
-  TestNewShaderRecompilerSpirvSizeBaselines();
-  TestDemandDrivenSpirvDeclarations();
-  TestNewShaderRecompilerSMovB32();
-  TestNewShaderRecompilerClipDisabledPosition();
-  TestNewShaderRecompilerAuxPositionExports();
-  TestNewShaderRecompilerNativeWideScalarMemoryIr();
-  TestNewShaderRecompilerNativeWideBufferIr();
-  TestNewShaderRecompilerScalarB64LaneTranslation();
-  TestNewShaderRecompilerMubufFormatTranslation();
-  TestNewShaderRecompilerTypedBufferTranslation();
-  TestNewShaderRecompilerDsReadWrite2Translation();
-  TestNewShaderRecompilerDsWideAndAtomicTranslation();
-  TestNewShaderRecompilerDsIncDecRsubTranslation();
-  TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
-  TestNewShaderRecompilerScalarMemoryBindingDomains();
+  RUN(TestResourceDescriptorClassification);
+  RUN(TestNativeShaderResourceDependencies);
+  RUN(TestNormalizedImageContracts);
+  RUN(TestSpirvRequirementsAnalysis);
+  RUN(TestNewShaderRecompilerSpirvSizeBaselines);
+  RUN(TestDemandDrivenSpirvDeclarations);
+  RUN(TestNewShaderRecompilerSMovB32);
+  RUN(TestNewShaderRecompilerClipDisabledPosition);
+  RUN(TestNewShaderRecompilerAuxPositionExports);
+  RUN(TestNewShaderRecompilerNativeWideScalarMemoryIr);
+  RUN(TestNewShaderRecompilerNativeWideBufferIr);
+  RUN(TestNewShaderRecompilerScalarB64LaneTranslation);
+  RUN(TestNewShaderRecompilerMubufFormatTranslation);
+  RUN(TestNewShaderRecompilerTypedBufferTranslation);
+  RUN(TestNewShaderRecompilerDsReadWrite2Translation);
+  RUN(TestNewShaderRecompilerDsWideAndAtomicTranslation);
+  RUN(TestNewShaderRecompilerDsIncDecRsubTranslation);
+  RUN(TestNewShaderRecompilerCapturedVop1SdwaByteConvert);
+  RUN(TestNewShaderRecompilerScalarMemoryBindingDomains);
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
-  TestNewShaderDecoderArchitecture();
-  TestImageAddressOperands();
-  TestSopkCompareImmediateExtension();
-  TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
-  TestNewShaderRecompilerIrLookupMissFailsExplicitly();
-  TestNewShaderRecompilerRejectsDppOn64BitCompares();
-  TestPsInputCountRegisterDecode();
-  TestPixelAncillaryLayerInput();
-  TestNewShaderRecompilerUnbasedFlatUsesBda();
-  TestNewShaderRecompilerFlatUserPointerUsesDma();
-  TestNewShaderRecompilerFlatAddressDomainsUseDma();
-  TestNewShaderRecompilerCfgStraightLine();
-  TestNewShaderRecompilerCfgIfElse();
-  TestNewShaderRecompilerCfgConsecutiveNativePhis();
-  TestNewShaderRecompilerStructuredU64Phi();
-  TestNewShaderRecompilerCfgTerminalExitMergePS();
-  TestNewShaderRecompilerCfgPostEndTargetMergePS();
-  TestNewShaderRecompilerCfgLoopBreakContinue();
+  RUN(TestNewShaderDecoderArchitecture);
+  RUN(TestImageAddressOperands);
+  RUN(TestSopkCompareImmediateExtension);
+  RUN(TestNewShaderRecompilerCapturedVopcSdwaCmpxClass);
+  RUN(TestNewShaderRecompilerIrLookupMissFailsExplicitly);
+  RUN(TestNewShaderRecompilerRejectsDppOn64BitCompares);
+  RUN(TestPsInputCountRegisterDecode);
+  RUN(TestPixelAncillaryLayerInput);
+  RUN(TestNewShaderRecompilerUnbasedFlatUsesBda);
+  RUN(TestNewShaderRecompilerFlatUserPointerUsesDma);
+  RUN(TestNewShaderRecompilerFlatAddressDomainsUseDma);
+  RUN(TestNewShaderRecompilerCfgStraightLine);
+  RUN(TestNewShaderRecompilerCfgIfElse);
+  RUN(TestNewShaderRecompilerCfgConsecutiveNativePhis);
+  RUN(TestNewShaderRecompilerStructuredU64Phi);
+  RUN(TestNewShaderRecompilerCfgTerminalExitMergePS);
+  RUN(TestNewShaderRecompilerCfgPostEndTargetMergePS);
+  RUN(TestNewShaderRecompilerCfgLoopBreakContinue);
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
-  TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
+  RUN(TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured);
+  RUN(TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher);
 #endif
-  TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
-  TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
-  TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
-  TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
-  TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection();
-  TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher();
-  TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection();
-  TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit();
-  TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher();
-  TestNewShaderRecompilerCfgConditionalLatchNoSelection();
-  TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection();
-  TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection();
-  TestNewShaderRecompilerCfgLoopGatewaySelection();
-  TestNewShaderRecompilerCfgConditionalLoopHeaderSelection();
-  TestNewShaderRecompilerCfgMultipleLoopLatches();
-  TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
-  TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
-  TestNewShaderRecompilerCfgExecSccSharedArm();
-  TestSharedReturnPreservesDescriptorDominance();
-  TestNewShaderRecompilerCfgNestedTailEarlyExit();
-  TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections();
-  TestNewShaderRecompilerCfgAlternatingSharedReturns();
-  TestNewShaderRecompilerCfgLoopSharedRegion();
-  TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop();
-  TestNewShaderRecompilerCfgExternalSelectionTailStructured();
-  TestNewShaderRecompilerCfgDirectSharedTailStructured();
-  TestNewShaderRecompilerCfgLoopedDirectSharedTailStructured();
-  TestNewShaderRecompilerCfgDualArmReturnContinueJoin();
-  TestUfc5Ps1bcc68ffb7b0469eFixture();
-  TestCfgDispatcherFullTinyShader();
-  TestUfc5PsDispatcherFullOracle();
-  TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
-  TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
-  TestNewShaderRecompilerCfgSharedTerminalEarlyExit();
-  TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry();
-  TestNewShaderRecompilerCfgIrreducibleDispatcher();
-  TestNewShaderRecompilerDispatcherSpillsU32x3();
-  TestNewShaderRecompilerU64PairTranslation();
-  TestComputeDispatchWaveSize();
-  TestNewShaderRecompilerBufferLoadsGuardedByExec();
-  TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
-  TestCapturedBufferAtomicsX2();
-  TestNewShaderRecompilerPixelImageSampleLodSelection();
-  TestNewShaderRecompilerBranchConditionForms();
-  TestNewShaderRecompilerSetpcBranch();
-  TestFusedShaderHandoffPreservesRegisters();
-  TestMeshExportStorage();
-  TestMergedShaderUserDataSnapshot();
-  TestMeshInputAssembly();
-  TestEmbeddedVertexFormatSwizzle();
-  TestNewShaderRecompilerSetpcJumpTable();
-  TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
-  TestNewShaderRecompilerSetpcDwordJumpTable();
-  TestTypedEntryStateIsMinimal();
+  RUN(TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured);
+  RUN(TestNewShaderRecompilerCfgLoopHeaderDsReadStructured);
+  RUN(TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured);
+  RUN(TestNewShaderRecompilerCfgSharedOuterAndLoopMerge);
+  RUN(TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection);
+  RUN(TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher);
+  RUN(TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection);
+  RUN(TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit);
+  RUN(TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher);
+  RUN(TestNewShaderRecompilerCfgConditionalLatchNoSelection);
+  RUN(TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection);
+  RUN(TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection);
+  RUN(TestNewShaderRecompilerCfgLoopGatewaySelection);
+  RUN(TestNewShaderRecompilerCfgConditionalLoopHeaderSelection);
+  RUN(TestNewShaderRecompilerCfgMultipleLoopLatches);
+  RUN(TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit);
+  RUN(TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders);
+  RUN(TestNewShaderRecompilerCfgExecSccSharedArm);
+  RUN(TestSharedReturnPreservesDescriptorDominance);
+  RUN(TestNewShaderRecompilerCfgNestedTailEarlyExit);
+  RUN(TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections);
+  RUN(TestNewShaderRecompilerCfgAlternatingSharedReturns);
+  RUN(TestNewShaderRecompilerCfgLoopSharedRegion);
+  RUN(TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop);
+  RUN(TestNewShaderRecompilerCfgExternalSelectionTailStructured);
+  RUN(TestNewShaderRecompilerCfgDirectSharedTailStructured);
+  RUN(TestNewShaderRecompilerCfgLoopedDirectSharedTailStructured);
+  RUN(TestNewShaderRecompilerCfgDualArmReturnContinueJoin);
+  RUN(TestUfc5Ps1bcc68ffb7b0469eFixture);
+  RUN(TestCfgDispatcherFullTinyShader);
+  RUN(TestUfc5PsDispatcherFullOracle);
+  RUN(TestUfc5PsLegacyStructurizedSpirv);
+  RUN(TestNewShaderRecompilerCfgOverlappingEarlyExitLadder);
+  RUN(TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal);
+  RUN(TestNewShaderRecompilerCfgSharedTerminalEarlyExit);
+  RUN(TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry);
+  RUN(TestNewShaderRecompilerCfgIrreducibleDispatcher);
+  RUN(TestNewShaderRecompilerDispatcherSpillsU32x3);
+  RUN(TestNewShaderRecompilerU64PairTranslation);
+  RUN(TestComputeDispatchWaveSize);
+  RUN(TestNewShaderRecompilerBufferLoadsGuardedByExec);
+  RUN(TestNewShaderRecompilerBufferAtomicsGuardedByBounds);
+  RUN(TestCapturedBufferAtomicsX2);
+  RUN(TestNewShaderRecompilerPixelImageSampleLodSelection);
+  RUN(TestNewShaderRecompilerBranchConditionForms);
+  RUN(TestNewShaderRecompilerSetpcBranch);
+  RUN(TestFusedShaderHandoffPreservesRegisters);
+  RUN(TestMeshExportStorage);
+  RUN(TestMergedShaderUserDataSnapshot);
+  RUN(TestMeshInputAssembly);
+  RUN(TestEmbeddedVertexFormatSwizzle);
+  RUN(TestNewShaderRecompilerSetpcJumpTable);
+  RUN(TestNewShaderRecompilerPrunesUnreachableSetpcMetadata);
+  RUN(TestNewShaderRecompilerSetpcDwordJumpTable);
+  RUN(TestTypedEntryStateIsMinimal);
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  TestFinalSsaRejectsRegisterStatePseudos();
+  RUN(TestFinalSsaRejectsRegisterStatePseudos);
 #endif
-  TestValuePhiValidation();
-  TestU64ShiftConstantPropagation();
+  RUN(TestValuePhiValidation);
+  RUN(TestU64ShiftConstantPropagation);
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  TestNativeWideValueValidation();
+  RUN(TestNativeWideValueValidation);
 #endif
-  TestNewShaderRecompilerZeroInitialRegisterState();
-  TestNewShaderRecompilerVertexSystemInputsWithoutMirrors();
-  TestNewShaderRecompilerVertexExportUsesInvocationExecMask();
-  TestNewShaderRecompilerPerInvocationMasksWithoutMirrors();
-  TestNewShaderRecompilerPerInvocationU64Complement();
-  TestNewShaderRecompilerExpPixelOutputs();
-  TestDualSourcePixelExports();
-  TestRenderTargetReverseExportMapping();
-  TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
-  TestTypedDescriptorRealWideMoveTranslation();
-  TestComputeImageFill();
-  TestTypedDescriptorRealCarryAndScalarLoads();
-  TestSrtWalkerRealSmemTranslation();
-  TestSrtWalkerVccBaseTranslation();
-  TestSrtWalkerRealSBufferTranslation();
-  TestScalarMemorySourcesCapturedBeforeWrites();
-  TestScalarMemoryLoadCrossesIntoVcc();
-  TestScalarMemoryUnusedTailDce();
-  TestResourceTrackingRealDensePatching();
-  TestDirectTranslationResetsAnalysisState();
-  TestNewShaderRecompilerNativeBindingPlan();
-  TestNewShaderRecompilerStageInputInfo();
-  TestCustomVintrpMovTranslation();
-  TestGraphicsCreateInterpolantMapping();
-  TestNewShaderRecompilerPixelPipelineEntry();
-  TestComputeLdsAllocationIdentity();
-  TestPixelProgramCacheBindingIdentity();
-  TestGraphicsPushConstantPlacement();
-  TestNewShaderRecompilerUnsupportedMemoryDecode();
+  RUN(TestNewShaderRecompilerZeroInitialRegisterState);
+  RUN(TestNewShaderRecompilerVertexSystemInputsWithoutMirrors);
+  RUN(TestNewShaderRecompilerVertexExportUsesInvocationExecMask);
+  RUN(TestNewShaderRecompilerPerInvocationMasksWithoutMirrors);
+  RUN(TestNewShaderRecompilerPerInvocationU64Complement);
+  RUN(TestNewShaderRecompilerExpPixelOutputs);
+  RUN(TestDualSourcePixelExports);
+  RUN(TestRenderTargetReverseExportMapping);
+  RUN(TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled);
+  RUN(TestTypedDescriptorRealWideMoveTranslation);
+  RUN(TestComputeImageFill);
+  RUN(TestTypedDescriptorRealCarryAndScalarLoads);
+  RUN(TestSrtWalkerRealSmemTranslation);
+  RUN(TestSrtWalkerVccBaseTranslation);
+  RUN(TestSrtWalkerRealSBufferTranslation);
+  RUN(TestScalarMemorySourcesCapturedBeforeWrites);
+  RUN(TestScalarMemoryLoadCrossesIntoVcc);
+  RUN(TestScalarMemoryUnusedTailDce);
+  RUN(TestResourceTrackingRealDensePatching);
+  RUN(TestDirectTranslationResetsAnalysisState);
+  RUN(TestNewShaderRecompilerNativeBindingPlan);
+  RUN(TestNewShaderRecompilerStageInputInfo);
+  RUN(TestCustomVintrpMovTranslation);
+  RUN(TestGraphicsCreateInterpolantMapping);
+  RUN(TestNewShaderRecompilerPixelPipelineEntry);
+  RUN(TestComputeLdsAllocationIdentity);
+  RUN(TestPixelProgramCacheBindingIdentity);
+  RUN(TestGraphicsPushConstantPlacement);
+  RUN(TestNewShaderRecompilerUnsupportedMemoryDecode);
 
-  return 0;
+  return ReportTestResults();
 }

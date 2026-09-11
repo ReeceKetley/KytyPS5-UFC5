@@ -1556,6 +1556,79 @@ bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
 	return true;
 }
 
+// A structured construct may only be left through its own merge, through a break/continue of
+// an enclosing loop, or by terminating the invocation. A *shared* terminal block silently
+// converts the third case into an illegal branch out of the construct.
+//
+// The UFC pixel ubershaders hit exactly this. `if (a) return; if (b) return; <join>` decodes to
+//
+//	16: cond -> 192(Return) : 17          192: Return, preds=[16,191]
+//	17: cond -> 191         : 18          191: -> 192,   preds=[17]
+//	18: -> 19                             19: join, preds=[15,18]
+//
+// Because 192 is reached from both 16 and 191, it is dominated by 16 rather than by 17, and
+// FindSelectionMerge(16) sees the false arm reach the true arm and hands block 16 the merge
+// 192 - stretching its construct to the function exit. Block 18 then leaves that construct to
+// the shared join 19, which is neither the merge nor a loop exit, and ValidateStructuredExits
+// (correctly) rejects the module.
+//
+// Giving every return edge a private copy of the terminal block restores "a return is always a
+// legal exit": 192 keeps pred 16 only, 191 branches to its own clone, and FindSelectionMerge
+// then picks the tight merges (17 for block 16, 18 for block 17) through the existing
+// HasLinearPathToTerminal rule. Terminal blocks have no successors and no phis of their own, so
+// duplicating them cannot disturb merge or phi placement anywhere else - the property the
+// earlier merge-widening attempt violated.
+bool SplitSharedTerminalBlocks(Graph& graph) {
+	std::vector<std::pair<uint32_t, std::vector<uint32_t>>> work;
+	for (const auto& block: graph.blocks) {
+		if (block.terminator.kind != TerminatorKind::Return || !block.successors.empty() ||
+		    block.predecessors.size() < 2u) {
+			continue;
+		}
+		std::vector<uint32_t> preds;
+		for (const auto pred: block.predecessors) {
+			const auto* pred_block = graph.FindBlock(pred);
+			// Only single- and two-target terminators can be retargeted by id; an indirect
+			// branch or dispatch switch keeps its own target tables.
+			if (pred_block == nullptr ||
+			    (pred_block->terminator.kind != TerminatorKind::Branch &&
+			     pred_block->terminator.kind != TerminatorKind::ConditionalBranch)) {
+				continue;
+			}
+			AddUnique(preds, pred);
+		}
+		if (preds.size() < 2u) {
+			continue;
+		}
+		// One predecessor keeps the original block; the rest get private clones.
+		preds.erase(preds.begin());
+		work.emplace_back(block.id, std::move(preds));
+	}
+
+	bool changed = false;
+	for (const auto& [terminal, preds]: work) {
+		for (const auto pred: preds) {
+			const auto clone = AppendClonedSemanticBlock(graph, terminal);
+			if (clone == UINT32_MAX) {
+				continue;
+			}
+			auto* pred_block = graph.FindBlock(pred);
+			if (pred_block == nullptr) {
+				continue;
+			}
+			ReplaceValue(pred_block->successors, terminal, clone);
+			ReplaceTerminatorTarget(pred_block->terminator, terminal, clone);
+			changed = true;
+		}
+	}
+
+	if (changed) {
+		RebuildPredecessors(graph);
+		RecomputeAnalyses(graph);
+	}
+	return changed;
+}
+
 bool SplitOneLoopMerge(Graph& graph) {
 	const auto& loops = graph.natural_loops;
 	for (const auto& loop: loops) {
@@ -2989,6 +3062,27 @@ bool StructurizeLegacy(Graph& graph) {
 		Graph routed = graph;
 		if (StructurizeImpl(routed)) {
 			graph = std::move(routed);
+			return true;
+		}
+	}
+
+	// Privatise shared return blocks and retry. Deliberately AFTER the routing loop: routing
+	// repairs several of these shapes without duplicating code, and TestNewShaderRecompilerCfg
+	// AlternatingSharedReturns / NestedEarlyExitSharedTerminal / OverlappingEarlyExitLadder
+	// assert the terminal epilogue is not duplicated when routing can do the job. Trying the
+	// split first structurizes the UFC ubershaders ~4x faster (82ms -> 20ms) but regresses
+	// those three, and 60ms of one-off compile time is not worth code duplication in shaders
+	// that already work.
+	Graph terminal_retry = original;
+	if (SplitSharedTerminalBlocks(terminal_retry)) {
+		Graph terminal_plain = terminal_retry;
+		if (StructurizeImpl(terminal_plain)) {
+			graph = std::move(terminal_plain);
+			return true;
+		}
+		Graph terminal_clone = std::move(terminal_retry);
+		if (StructurizeImpl(terminal_clone, true)) {
+			graph = std::move(terminal_clone);
 			return true;
 		}
 	}
