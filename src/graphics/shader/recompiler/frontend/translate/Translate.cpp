@@ -115,6 +115,22 @@ std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
 	        current_wave_size == 64u ? ir.CompositeExtract(mask, 1) : IR::U32(IR::Value(0u))};
 }
 
+// VCCZ / EXECZ are WAVE-WIDE flags: they test whether the entire mask word is zero, not whether
+// the current lane's bit is clear. Both read sites previously used `LogicalNot(GetVcc())` /
+// `LogicalNot(GetExec())`, which is the current lane's bit - so a branch on EXECZ took the wrong
+// direction whenever some other lane was still active. Upstream KytyPS5 fixed this in
+// ReadRawU32 (1af19ea); the U1 operand path below had the same bug and is fixed here too.
+//
+// RDNA2 ISA §3.3 "EXECute Mask" and §3.9 "Vector Compares: VCC and VCCZ": the Z flags test the
+// whole word. In wave64 that is the OR of both halves.
+IR::U1 Translator::MaskIsZero(bool vcc) {
+	auto mask = vcc ? ir.GetVccLo() : ir.GetExecLo();
+	if (current_wave_size == 64u) {
+		mask = ir.BitwiseOr(mask, vcc ? ir.GetVccHi() : ir.GetExecHi());
+	}
+	return ir.IEqual(mask, IR::U32(IR::Value(0u)));
+}
+
 IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 	switch (operand.kind) {
 		case Decoder::OperandKind::LiteralConstant:
@@ -134,11 +150,9 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::Scc:
 			return ir.Select(ir.GetScc(), IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u)));
 		case Decoder::OperandKind::VccZ:
-			return ir.Select(ir.LogicalNot(ir.GetVcc()), IR::U32(IR::Value(1u)),
-			                 IR::U32(IR::Value(0u)));
 		case Decoder::OperandKind::ExecZ:
-			return ir.Select(ir.LogicalNot(ir.GetExec()), IR::U32(IR::Value(1u)),
-			                 IR::U32(IR::Value(0u)));
+			return ir.Select(MaskIsZero(operand.kind == Decoder::OperandKind::VccZ),
+			                 IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u)));
 		default: EXIT("invalid decoded operand used as a raw U32 source");
 	}
 }
@@ -208,8 +222,8 @@ IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type
 			case Decoder::OperandKind::ExecHi: return ir.GetExec();
 			case Decoder::OperandKind::VccLo:
 			case Decoder::OperandKind::VccHi: return ir.GetVcc();
-			case Decoder::OperandKind::VccZ: return ir.LogicalNot(ir.GetVcc());
-			case Decoder::OperandKind::ExecZ: return ir.LogicalNot(ir.GetExec());
+			case Decoder::OperandKind::VccZ: return MaskIsZero(true);
+			case Decoder::OperandKind::ExecZ: return MaskIsZero(false);
 			default: break;
 		}
 		return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));

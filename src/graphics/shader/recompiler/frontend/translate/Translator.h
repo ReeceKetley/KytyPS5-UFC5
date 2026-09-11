@@ -51,6 +51,9 @@ private:
 	void    WriteU32Pair(const Decoder::Operand& operand, const std::array<IR::U32, 2>& value);
 	IR::U1  ReadCondition(const Decoder::Operand& operand);
 	IR::U32 ConditionBit(const Decoder::Operand& operand);
+	// True when the whole VCC (or EXEC) mask word is zero - the wave-wide VCCZ/EXECZ flag, not
+	// the current lane's bit. See the definition for why both read paths need it.
+	IR::U1  MaskIsZero(bool vcc);
 	IR::U1  ReadMask(const Decoder::Operand& operand);
 	IR::U1  ReadMaskValid(const Decoder::Operand& operand);
 	std::array<IR::U32, 2> WriteMask(const Decoder::Operand& operand, IR::U1 value,
@@ -237,7 +240,7 @@ private:
 	void ScalarSelect64(const Decoder::Instruction& inst, const Decoder::Operand& false_source);
 	void MOV_B32(const Decoder::Instruction& inst, bool apply_float_modifiers);
 	void S_MOV_B64(const Decoder::Instruction& inst);
-	void S_WQM_B64(const Decoder::Instruction& inst);
+	void S_WQM(const Decoder::Instruction& inst, bool wide);
 	void V_MOVRELS_B32(const Decoder::Instruction& inst);
 	void V_MOVRELD_B32(const Decoder::Instruction& inst);
 	void V_READFIRSTLANE_B32(const Decoder::Instruction& inst);
