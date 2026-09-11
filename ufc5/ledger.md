@@ -428,6 +428,51 @@ one frame.
 and `graphics_debug_dump_enabled()` keys off it, so without it every counter is silently
 discarded and the log looks fine but contains no measurements. The script always passes it.
 
+### Upstream sync — what was hand-woven in, and the trap next to it (2026-09-11)
+
+**Policy: do NOT merge or cherry-pick from upstream. Hand-apply what is relevant.** Our branch has
+diverged across **46 files that upstream also changed** — `ShaderCFG.cpp` (ours +995/-26 vs theirs
++48/-87, refactors that *delete* code we build on), `spirvEmitterMemory.cpp` (+104/-111 rewritten),
+`ShaderRecompilerComputeTests.cpp` (theirs +1278/-101). A rebase is a large, risky change and there is
+no reason to take it while the 5 fps is this fresh.
+
+**Woven in (commit `aad25ff`), all measured NEUTRAL:**
+- Wave-wide `VCCZ`/`EXECZ` **operand** reads (`Translator::MaskIsZero`). They test whether the whole
+  mask word is zero, not the current lane's bit. Upstream fixed one site (`1af19ea`, `ReadRawU32`);
+  **our tree had the same bug in the U1 operand path too**, so both are fixed.
+- `S_ORN2_SAVEEXEC_B32` (upstream `32ea086`) and `S_WQM_B32` (`c354657`) — we had B64 only.
+- Neutral confirmed by fair A/B, same build, validation off, comparable scenes (2,439 vs 2,536
+  draws/frame): **76.2 vs 79.0 us/draw**, buckets within noise. Expected: `unsupported=0` before and
+  after means no UFC5 shader used either opcode, and `MaskIsZero` only fires on a *data operand* read.
+- **Method note: an earlier reading of 90.3 us/draw for these was `--shader-validation` plus a 47%
+  heavier scene.** Always A/B with the same flags and check `draws/frame` before believing a delta.
+
+**DO NOT "FIX" `AddBranchCondition` (`Translate.cpp` ~line 801).** It branches `S_CBRANCH_EXECZ`/`VCCZ`
+on the invocation-local EXEC/VCC boolean, which looks like exactly the per-lane bug fixed above. It is
+**deliberate** — the comment above it says so: Kyty models each lane as its own invocation, so branching
+on the lane's own bit lets inactive invocations leave the region without reconstructing a host-subgroup
+mask. Upstream's merged fix does not touch this site either; PR #470, which would, is **open and
+conflicting**. Changing it is a semantic change to the hottest control-flow path and needs its own
+measurement. This was nearly "fixed" on the assumption it was the same bug.
+
+**Upstream work worth revisiting later (inspected 2026-09-11, none pulled):**
+- Wave64/EXEC: merged `c913951` (RDNA2 subvector loop mask/branch semantics); open **#470** (model EXEC
+  and VCC as subgroup ballots) — the right foundation for Stage 2, but conflicts with our Stage 1
+  `ThreadBit` constant-folding. Upstream's `ThreadBit` is the wave-wide `(word >> lane) & 1` form using
+  `program.wave_size`; ours folds compile-time-constant masks using `current_wave_size`. **Ours is an
+  optimisation that belongs on top of theirs**, not an alternative.
+- **Duplicated work:** upstream `e04007a` implements `DS_INC_RTN_U32`/`DS_DEC_RTN_U32`, which this fork
+  implemented independently across 5 files. Theirs ships 228 lines of tests. Adopting theirs and
+  dropping ours would cut divergence in files that already conflict.
+- Perf PRs in our exact area, unevaluated: **#506** (FPS overhead in GPU scheduling and resource
+  caching), **#473** (query host readability once per region during the SRT walk), **#562** (BDA upload
+  from CPU-dirty hints), **#537** (publish linear storage images before CPU access).
+- Possibly relevant to open correctness bugs: `a305a6c`/`fde550e`/`23e7df2` (shared texture channel
+  layouts and **swizzle decoding** — hypotheses 2 and 3 for the skin corruption, issue 4b);
+  `0b4e78c` + PR **#545** (DB_RENDER_OVERRIDE depth/stencil copies, stencil sync — our depth-alias bugs).
+- **DO NOT PULL #483** (skip GPU sync when unmapping non-GPU memory): already tried here, **livelocked**
+  the guest CPU on a stale value. #484 (SRT scratch reuse) is already in the tree as `a1fc490`.
+
 ## FPS profiling (2026-09-10) — read this before more perf work
 
 `FrameProfile:` now carries `process_ms` (whole `GuestGpu::Process(submission)` on the GPU worker thread — the single thread that does PM4 decode + Vulkan record + stalls + GC), `drawprep_ms` (`RenderExecutor::DrawIndex/DrawAuto` incl. pipeline lookup + `AcquireRenderTargets` + descriptor resolve + `hw_check`; nests `draw_ms`), `gc_ms`, `faultbuf_ms`, `flush_ms`, `sendcmd_ms`, `cp_rest` (= `process_ms` − drawprep − dispatch − submit − gc − flush − sendcmd = **raw PM4 decode + SET_*_REG / WAIT / EVENT handlers + per-`Process()` boilerplate**), and `process`/`gc`/`faultbuf` counts. `FlushAndWait` now counts as `Finish`.
