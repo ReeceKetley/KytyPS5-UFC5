@@ -1284,6 +1284,27 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                      state.ps_input_info.stage.program != nullptr
 	                                  ? state.ps_input_info.stage.program->shader_hash
 	                                  : uint64_t {0};
+	// Which colour target do the UFC5 pixel ubershaders actually draw into? Surface dumps show
+	// both dominant in-fight 1600x900 targets GPU-modified but containing EXACTLY zero, while
+	// GpuDraws shows these shaders costing 95-262us/draw - i.e. real per-pixel work. Those two
+	// facts cannot both describe the same surface, so log the bound attachment for these draws
+	// and find out which surface they write. Rate-limited; same watch list as the timestamps.
+	if (draw_ps_hash != 0 && IsWatchedDrawPixelShader(draw_ps_hash)) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 48) {
+			std::string targets;
+			for (uint32_t i = 0; i < state.color_count; i++) {
+				const auto& color = state.color_info[i];
+				const auto  ext   = color.Extent();
+				targets += fmt::format(" [{}]=0x{:016x} {}x{} fmt={} id={}", i,
+				                       color.desc.info.data.address, ext.width, ext.height,
+				                       static_cast<uint32_t>(color.desc.info.pixel_format),
+				                       color.image_id ? 1 : 0);
+			}
+			LOGF("WatchedDrawTarget: ps=0x%016" PRIx64 " colors=%u depth=%d%s\n", draw_ps_hash,
+			     state.color_count, state.depth_info.image_id ? 1 : 0, targets.c_str());
+		}
+	}
 	GpuTimestamps::Instance().BeginDraw(vk_buffer, draw_vs_hash, draw_ps_hash);
 	// Bracket the skipped draw too, so GpuDraws still reports it - at ~0us instead of ~21000us.
 	if (!ShouldSkipPixelShaderHash(draw_ps_hash)) {

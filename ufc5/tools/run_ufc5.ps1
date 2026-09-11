@@ -22,6 +22,7 @@ param(
     [switch] $Baseline,
     [switch] $Validate,
     [switch] $Verify,
+    [switch] $Timestamps,
     [string] $GameDir   = 'D:\PS5\Games\UFC5',
     [string] $BinDir    = 'D:\PS5\Emulators\KytyPS5-Bin',
     [string] $LogDir    = 'D:\PS5'
@@ -43,14 +44,17 @@ Start-Sleep -Seconds 2
 #                     compute shader is wave64 and TDRs on a wave32-only GPU
 #                     (RTX 3070). Skipping it is why the fight round renders
 #                     BLACK - that is expected, not a regression.
-# KYTY_GPU_TIMESTAMPS Real GPU timing. The three UFC5 pixel ubershader hashes
-#                     are already the default watch list, so GpuDraws attributes
-#                     per-draw GPU cost to them with no extra setup.
 # KYTY_SRT_LINEAR     Flat SRT evaluator. getprog -31%; does not show
 #                     end-to-end, but it is verified equivalent and free to run.
 $env:KYTY_SKIP_CS_HASH  = '0xea0aceac518ec52d'
-$env:KYTY_GPU_TIMESTAMPS = '1'
 $env:KYTY_SRT_LINEAR     = '1'
+# KYTY_GPU_TIMESTAMPS is NOT on by default. GpuTimestamps::Arm() resets the query pool from the
+# HOST while command buffers from the previous window can still be in flight, so a slot can be
+# written twice with only one intervening reset - Vulkan validation reports
+# "vkCmdWriteTimestamp2(): query N: query not reset", which is undefined behaviour and a
+# plausible cause of the intermittent ErrorDeviceLost seen on 2026-09-11. Opt in with
+# -Timestamps when you actually need per-draw/per-dispatch GPU attribution; frame_stats.py
+# reads FrameProfile and does not need it. Opted in AFTER the clear loop below.
 
 # Cleared explicitly so a value left over in the shell cannot silently change
 # the run. All of these are measured NEUTRAL or REGRESSIONS - see the ledger.
@@ -63,9 +67,11 @@ $env:KYTY_SRT_LINEAR     = '1'
 foreach ($name in @('KYTY_XFER_QUEUE','KYTY_GC_CRITICAL_MB','KYTY_GC_TRIGGER_MB',
                     'KYTY_TEXGC_AGE_FIX','KYTY_TEXGC_BUDGET_FIX',
                     'KYTY_BUFGC_OWN_SHARE','KYTY_SKIP_PS_HASH',
-                    'KYTY_GPU_TIMESTAMP_PS','KYTY_DEFER_READBACK')) {
+                    'KYTY_GPU_TIMESTAMP_PS','KYTY_DEFER_READBACK','KYTY_GPU_TIMESTAMPS')) {
     Remove-Item "Env:\$name" -ErrorAction SilentlyContinue
 }
+
+if ($Timestamps) { $env:KYTY_GPU_TIMESTAMPS = '1' }
 
 if ($Baseline) {
     # A/B control: the emulator as it behaves without this session's opt-ins.

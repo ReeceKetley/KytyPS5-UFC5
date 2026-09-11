@@ -1,6 +1,12 @@
 # UFC 5 / KytyPS5 ledger
 
-Last updated: 2026-09-11 session 3 — **IN-FIGHT 1.0 -> 5.0 FPS.** Two independent wins: the 3 pixel
+Last updated: 2026-09-11 session 3 — **THE BLACK ROUND IS A PRESENT BUG, NOT A CULLING BUG.** The fight
+scene renders fully into `0x1168360000` (1920x1080 HDR, 98.6% nonzero) every frame and never reaches the
+scanout (8.6%, HUD only). The "scene RT is empty" evidence that drove days of occlusion/wave64 work came
+from a surface dump with a **hardcoded address list that never contained the scene buffer**. Wave64
+Stage 2 is no longer justified by the black round. See "THE BLACK ROUND IS A COMPOSITE/PRESENT BUG".
+
+Also this session: **IN-FIGHT 1.0 -> 5.0 FPS.** Two independent wins: the 3 pixel
 ubershaders now structurize on the Legacy path (1.0 -> 2.9), and `BufferCache` no longer garbage-collects
 against memory it does not own (2.7 -> 4.6 median, 5.0-5.4 observed). Details below.
 
@@ -427,6 +433,41 @@ one frame.
 **`--printf-direction File` is not optional either** — `printf_direction` defaults to `Silent`
 and `graphics_debug_dump_enabled()` keys off it, so without it every counter is silently
 discarded and the log looks fine but contains no measurements. The script always passes it.
+
+### THE BLACK ROUND IS A COMPOSITE/PRESENT BUG. THE SCENE RENDERS FINE. (2026-09-11)
+
+**The fight scene is fully rendered every frame and never reaches the scanout.**
+
+```
+frame 1703, in-fight, screen is black:
+  rt68360000  0x1168360000  1920x1080 fmt=122 (B10G11R11_UFLOAT)  nonzero 2,044,948/2,073,600 = 98.6%
+  present     0x111a800000  1920x1080                              nonzero   177,654/2,073,600 =  8.6%  (HUD only)
+```
+Brightness distribution of that HDR buffer (8.5% black, 28% 1-3, 22% 4-15, **37% 16-63**, 4% 64-191,
+0.2% 192+) matches a known-good scene, and an ASCII render of it shows obvious structure - a lit figure,
+floor, gradients. It is a real image, not noise.
+
+**HOW THIS WAS MISSED FOR DAYS, AND THE LESSON.** `swapchain.cpp`'s surface dump used a **hardcoded
+address list** that never contained `0x1168360000`; it contained the neighbours `0x1168270000` and
+`0x1168260000`. So every in-fight dump found only unrelated buffers, and this ledger's
+*"scene RT `0x1162c00000` collapses to 400x225 empty"* was measuring a **quarter-res buffer that reuses
+that address** (1600x900 / 4 = 400x225). That one observation was the entire evidence for "the stubbed
+occlusion CS starves the fight", and it was an artifact of looking at the wrong surface.
+**A hardcoded list of addresses in a diagnostic is a trap: it silently answers a different question.**
+`KYTY_DUMP_SURFACES=<hex>[,...]` now overrides it, and the in-fight targets are in the default list.
+
+**How to find the right surfaces:** `WatchedDrawTarget` (`renderDraw.cpp`, rate-limited to 48 lines, keyed
+off the shared `IsWatchedDrawPixelShader` watch list) logs the bound colour attachments for the ubershader
+draws. In-fight they render to `0x1168360000` (1920x1080) and `0x1166f40000` (1600x904), both fmt=122.
+
+**WHAT THIS INVALIDATES:**
+- **The black round is NOT blocked on the occlusion CS, therefore NOT on wave64 Stage 2.** Stage 2's whole
+  justification was "the only way to make the round render". That is now false.
+- The ubershaders are not doing expensive work for nothing - they are drawing **the actual scene**.
+- The buffer-zeroing experiment below was aimed at the wrong layer entirely.
+
+**NEXT: why does the game's tonemap/composite pass not get `0x1168360000` into the scanout?** That is in
+the presentation path - code this fork has already worked in - not in wave64 emulation.
 
 ### FAILED, AND IT CLOSES OPTION (a) FOR THE BLACK ROUND: zeroing the occlusion CS's two big buffers
 

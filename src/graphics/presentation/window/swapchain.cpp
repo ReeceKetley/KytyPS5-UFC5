@@ -407,11 +407,46 @@ void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCac
 	}
 	DumpGpuImage(command, renderer, scanout, "display", scanout_address, true);
 	DumpGpuImage(command, renderer, presented, "present", presented.info.data.address, true);
-	static constexpr uint64_t kSurfaces[] = {
-	    0x0000001162c00000ull, 0x0000001163470000ull, 0x0000001167150000ull,
-	    0x0000001169860000ull, 0x0000001168270000ull, 0x0000001168260000ull,
-	    0x0000001164240000ull, 0x0000001164e50000ull, 0x00000011592b0000ull,
-	};
+	// Surfaces to dump. The hardcoded list below was captured from an earlier scene and misses
+	// the in-fight scene targets entirely: in a round the only two it finds are 0x1162c00000 at
+	// 400x225 and 0x1169860000 at 96x54, both empty, which made it look like nothing was drawn.
+	// The game actually renders at 1600x900 (14,409 occurrences in one in-fight log, vs a
+	// 1920x1080 present), so 400x225 is just a quarter-res buffer that happens to reuse that
+	// address. KYTY_DUMP_SURFACES=<hex>[,<hex>...] overrides the list so a dump can be pointed at
+	// whatever the current scene actually uses.
+	static const std::vector<uint64_t> kSurfaces = [] {
+		std::vector<uint64_t> list {
+		    0x0000001162c00000ull, 0x0000001163470000ull, 0x0000001167150000ull,
+		    0x0000001169860000ull, 0x0000001168270000ull, 0x0000001168260000ull,
+		    0x0000001164240000ull, 0x0000001164e50000ull, 0x00000011592b0000ull,
+		    // In-fight 1600x900 targets, the dominant render extent in a round.
+		    0x0000001170e40000ull, 0x0000001170210000ull, 0x000000116d5b0000ull,
+		};
+		const char* env = std::getenv("KYTY_DUMP_SURFACES");
+		if (env == nullptr || env[0] == '\0') {
+			return list;
+		}
+		list.clear();
+		for (const char* cursor = env; *cursor != '\0';) {
+			while (*cursor == ',' || *cursor == ' ') {
+				++cursor;
+			}
+			if (*cursor == '\0') {
+				break;
+			}
+			if (cursor[0] == '0' && (cursor[1] == 'x' || cursor[1] == 'X')) {
+				cursor += 2;
+			}
+			char*      end   = nullptr;
+			const auto value = std::strtoull(cursor, &end, 16);
+			if (end == cursor) {
+				break;
+			}
+			list.push_back(value);
+			cursor = end;
+		}
+		return list;
+	}();
 	for (const auto address: kSurfaces) {
 		auto id = cache.FindImageFromRange(address, 0x0000000002000000ull, false);
 		if (!id) {

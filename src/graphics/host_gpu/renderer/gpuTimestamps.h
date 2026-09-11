@@ -80,6 +80,11 @@ private:
 	std::vector<Entry>    m_entries;
 };
 
+// The watched pixel-shader list (the three UFC5 ubershaders by default, overridable with
+// KYTY_GPU_TIMESTAMP_PS). Exposed so callers outside the timestamp collector can key off the
+// same list instead of copying the hashes - two copies of a hash list drift.
+[[nodiscard]] bool IsWatchedDrawPixelShader(uint64_t hash);
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GPUTIMESTAMPS_H_

@@ -120,7 +120,7 @@ void GpuTimestamps::EndDispatch(vk::CommandBuffer buffer) {
 // 1-in-16 sampling on draws this rare gave per-frame extrapolations from 214ms to 1284ms -
 // the per-draw cost was solid but the total share was not. Defaults to the three UFC
 // ubershaders that fall back to DispatcherFull; override with a comma-separated hex list.
-static bool IsWatchedPixelShader(uint64_t hash) {
+bool IsWatchedDrawPixelShader(uint64_t hash) {
 	static const std::vector<uint64_t> watched = [] {
 		const char* env = std::getenv("KYTY_GPU_TIMESTAMP_PS");
 		if (env == nullptr) {
@@ -151,7 +151,7 @@ static bool IsWatchedPixelShader(uint64_t hash) {
 
 void GpuTimestamps::BeginDraw(vk::CommandBuffer buffer, uint64_t vs_hash, uint64_t ps_hash) {
 	const auto rate    = DrawSampleRate();
-	const bool watched = ps_hash != 0 && IsWatchedPixelShader(ps_hash);
+	const bool watched = ps_hash != 0 && IsWatchedDrawPixelShader(ps_hash);
 	const bool sampled = rate != 0 && (m_draw_counter % rate) == 0;
 	m_draw_counter++;
 	if (!watched && !sampled) {
