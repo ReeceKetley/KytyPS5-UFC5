@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -38,11 +39,18 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+
+	// Brackets the whole buffer so the GPU total covers draws, not just dispatches. The
+	// arm/resolve cycle is driven from the compute path, which sees the frame number and runs
+	// hundreds of times per frame; this only records into a window that is already open.
+	GpuTimestamps::Instance().BeginCommandBuffer(buffer);
 }
 
 void CommandBuffer::End() const {
 	EndRendering();
 	auto buffer = Handle();
+
+	GpuTimestamps::Instance().EndCommandBuffer(buffer);
 
 	auto result = buffer.end();
 

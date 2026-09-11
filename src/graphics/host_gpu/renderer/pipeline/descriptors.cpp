@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include "common/assert.h"
+#include "common/timer.h"
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -791,6 +792,60 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+namespace {
+
+// Descriptor handling is ~50us/draw in a fight, the largest item left in the frame. Split it
+// across the stages that build and commit a draw's bindings so the expensive one is named.
+struct BindPhaseStats {
+	std::atomic<uint64_t> textures_ns {0};
+	std::atomic<uint64_t> samplers_ns {0};
+	std::atomic<uint64_t> shaderdata_ns {0};
+	std::atomic<uint64_t> findbuffers_ns {0};
+	// PrepareBda() walks every mapped guest range and synchronizes every buffer in it. It
+	// was inside the findbuffers bucket, so its cost was being read as buffer lookup.
+	std::atomic<uint64_t> bda_ns {0};
+	std::atomic<uint32_t> bda_draws {0};
+	// Inside FindBuffers: ClampRangeSize takes the global kernel VM mutex, FindBuffer is a
+	// page-table probe that falls through to CreateBuffer on a miss.
+	std::atomic<uint64_t> clamp_ns {0};
+	std::atomic<uint64_t> lookup_ns {0};
+	std::atomic<uint32_t> descriptors {0};
+	std::atomic<uint64_t> rebind_ns {0};
+	std::atomic<uint64_t> commit_ns {0};
+	std::atomic<uint32_t> draws {0};
+};
+
+BindPhaseStats g_bind_phase;
+
+uint64_t BindPhaseNs(uint64_t begin, uint64_t end) {
+	const auto freq = Common::Timer::QueryPerformanceFrequency();
+	return freq == 0 ? 0ull : (end - begin) * 1000000000ull / freq;
+}
+
+void NoteBindPhaseDraw() {
+	const auto n = g_bind_phase.draws.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((n % 8192) != 0) {
+		return;
+	}
+	constexpr double kPerDraw = 8192.0 * 1000.0;
+	LOGF("BindPhase/8192: textures=%.1fus samplers=%.1fus shaderdata=%.1fus findbuffers=%.1fus "
+	     "rebind=%.1fus commit=%.1fus\n",
+	     g_bind_phase.textures_ns.exchange(0) / kPerDraw,
+	     g_bind_phase.samplers_ns.exchange(0) / kPerDraw,
+	     g_bind_phase.shaderdata_ns.exchange(0) / kPerDraw,
+	     g_bind_phase.findbuffers_ns.exchange(0) / kPerDraw,
+	     g_bind_phase.rebind_ns.exchange(0) / kPerDraw,
+	     g_bind_phase.commit_ns.exchange(0) / kPerDraw);
+	LOGF("BdaSplit/8192: bda=%.1fus/draw bda_draws=%u clamp=%.1fus/draw lookup=%.1fus/draw "
+	     "descriptors=%.1f/draw\n",
+	     g_bind_phase.bda_ns.exchange(0) / kPerDraw, g_bind_phase.bda_draws.exchange(0),
+	     g_bind_phase.clamp_ns.exchange(0) / kPerDraw,
+	     g_bind_phase.lookup_ns.exchange(0) / kPerDraw,
+	     g_bind_phase.descriptors.exchange(0) / 8192.0);
+}
+
+} // namespace
+
 PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
@@ -799,16 +854,21 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	PreparedBindings prepared;
 	prepared.program  = runtime.program;
 	prepared.snapshot = &runtime.resources;
+	const auto bp_t0 = Common::Timer::QueryPerformanceCounter();
 	prepared.images.reserve(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		prepared.images.push_back(std::move(binding));
 	}
+	const auto bp_t1 = Common::Timer::QueryPerformanceCounter();
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
 	}
+	const auto bp_t2 = Common::Timer::QueryPerformanceCounter();
+	g_bind_phase.textures_ns.fetch_add(BindPhaseNs(bp_t0, bp_t1), std::memory_order_relaxed);
+	g_bind_phase.samplers_ns.fetch_add(BindPhaseNs(bp_t1, bp_t2), std::memory_order_relaxed);
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.bindings.user_data_registers) {
 		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
@@ -818,6 +878,8 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}
+	g_bind_phase.shaderdata_ns.fetch_add(
+	    BindPhaseNs(bp_t2, Common::Timer::QueryPerformanceCounter()), std::memory_order_relaxed);
 	return prepared;
 }
 
@@ -841,7 +903,10 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
-		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+		const auto cl_t0 = Common::Timer::QueryPerformanceCounter();
+		const auto size  = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+		const auto cl_t1 = Common::Timer::QueryPerformanceCounter();
+		g_bind_phase.clamp_ns.fetch_add(BindPhaseNs(cl_t0, cl_t1), std::memory_order_relaxed);
 		if (TraceResourceAddress(address, size)) {
 			const auto& resource = program.info.buffers[i];
 			TraceResourceBinding(m_context.GetGpu().GetFrameNum(),
@@ -851,7 +916,13 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			                address, size, resource.read, resource.written, resource.atomic,
 			                stride, records, static_cast<uint32_t>(descriptor.Format())));
 		}
-		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+		const auto fb_t0 = Common::Timer::QueryPerformanceCounter();
+		const auto id    = cache.FindBuffer(address, size);
+		g_bind_phase.lookup_ns.fetch_add(
+		    BindPhaseNs(fb_t0, Common::Timer::QueryPerformanceCounter()),
+		    std::memory_order_relaxed);
+		g_bind_phase.descriptors.fetch_add(1, std::memory_order_relaxed);
+		prepared.buffer_sources.push_back({address, size, id});
 	}
 }
 
@@ -997,14 +1068,18 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	if (pixel_active) {
 		bindings.pixel.emplace(PrepareBindings(pixel));
 	}
+	const auto bp_t0 = Common::Timer::QueryPerformanceCounter();
 	FindBuffers(bindings.vertex);
 	if (bindings.pixel) {
 		FindBuffers(*bindings.pixel);
 	}
+	const auto bp_t0b = Common::Timer::QueryPerformanceCounter();
 	if (bindings.vertex.program->info.uses_dma ||
 	    (bindings.pixel && bindings.pixel->program->info.uses_dma)) {
 		m_context.GetGpuResources().PrepareBda();
+		g_bind_phase.bda_draws.fetch_add(1, std::memory_order_relaxed);
 	}
+	const auto bp_t1 = Common::Timer::QueryPerformanceCounter();
 	RebindBuffers(bindings.vertex);
 	if (bindings.pixel) {
 		RebindBuffers(*bindings.pixel);
@@ -1013,6 +1088,10 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	if (bindings.pixel) {
 		RebindImages(*bindings.pixel);
 	}
+	const auto bp_t2 = Common::Timer::QueryPerformanceCounter();
+	g_bind_phase.findbuffers_ns.fetch_add(BindPhaseNs(bp_t0, bp_t0b), std::memory_order_relaxed);
+	g_bind_phase.bda_ns.fetch_add(BindPhaseNs(bp_t0b, bp_t1), std::memory_order_relaxed);
+	g_bind_phase.rebind_ns.fetch_add(BindPhaseNs(bp_t1, bp_t2), std::memory_order_relaxed);
 	return bindings;
 }
 
@@ -1021,6 +1100,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
+	struct CommitTimer {
+		uint64_t begin = Common::Timer::QueryPerformanceCounter();
+		~CommitTimer() {
+			g_bind_phase.commit_ns.fetch_add(
+			    BindPhaseNs(begin, Common::Timer::QueryPerformanceCounter()),
+			    std::memory_order_relaxed);
+			NoteBindPhaseDraw();
+		}
+	} bp_commit_timer;
 	auto   vk_buffer        = buffer.Handle();
 	size_t descriptor_count = 0;
 	size_t write_count      = 0;

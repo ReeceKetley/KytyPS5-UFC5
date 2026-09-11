@@ -104,9 +104,12 @@ public:
 	void EmitGlobalBarrier();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
-	                    uint32_t mode);
+	                    uint32_t mode, uint64_t indirect_args_addr = 0);
 	void DispatchIndirect(uint32_t data_offset, uint32_t mode);
 	void DispatchIndirectFromArgs(uint64_t args_addr, uint32_t mode);
+	// Records an indirect dispatch straight onto the GPU, avoiding the host read of the
+	// arg block. Returns false when that is not legal and the caller must read the counts.
+	bool TryDispatchIndirectOnGpu(uint64_t args_addr, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 

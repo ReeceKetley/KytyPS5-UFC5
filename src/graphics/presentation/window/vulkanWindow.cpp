@@ -71,6 +71,10 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.shaderBufferInt64Atomics  = VK_TRUE;
+	// Lets the GPU timestamp pool be reset from the host instead of through a recorded
+	// vkCmdResetQueryPool, which would have to be ordered against every command buffer the
+	// scheduler opens and closes mid-frame. Core since 1.2, and the device is already 1.3.
+	features.hostQueryReset            = VK_TRUE;
 	return features;
 }
 

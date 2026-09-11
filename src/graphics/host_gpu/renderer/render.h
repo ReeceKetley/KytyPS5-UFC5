@@ -154,8 +154,15 @@ public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
+	// `indirect_args_addr` non-zero means the group counts live in GPU memory and must not
+	// be read CPU-side: the dispatch is recorded as vkCmdDispatchIndirect and the passed
+	// thread_group_* are unknown (zero). Paths that genuinely need the counts are skipped;
+	// the caller falls back to the direct path when they are required.
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	                    uint64_t indirect_args_addr = 0);
+	// KYTY_INDIRECT_DISPATCH=1 opts into the indirect path (default off).
+	[[nodiscard]] static bool IndirectDispatchEnabled();
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void                           FindBuffers(PreparedBindings& bindings);

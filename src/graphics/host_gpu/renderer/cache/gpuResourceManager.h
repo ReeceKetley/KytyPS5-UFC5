@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include <cstdint>
+#include <atomic>
 #include <shared_mutex>
 
 namespace Libs::Graphics {
@@ -42,6 +43,8 @@ private:
 	RangeSet                  m_mapped_ranges;
 	GuestGpu*                 m_gpu = nullptr;
 	bool                      m_fault_process_pending = false;
+	// One deferred-operation pump in flight at a time for skipped unmaps.
+	std::atomic<bool>         m_deferred_pump_queued {false};
 };
 
 } // namespace Libs::Graphics

@@ -23,6 +23,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
 #include "kernel/pthread.h"
@@ -46,6 +47,7 @@
 
 namespace Libs::Graphics {
 constexpr uint64_t kUfcHangCsHash = 0xea0aceac518ec52dull;
+
 
 bool ParseHexU64(const char* text, uint64_t* out) {
 	if (text == nullptr || out == nullptr) {
@@ -339,10 +341,22 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	return true;
 }
 
+bool RenderExecutor::IndirectDispatchEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_DISPATCH");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
-                                    uint32_t thread_group_z, uint32_t mode) {
+                                    uint32_t thread_group_z, uint32_t mode,
+                                    uint64_t indirect_args_addr) {
 	EXIT_IF(buffer.IsInvalid());
+	// The group counts are unknown on the host in this mode, so every decision that reads
+	// them is skipped rather than made on zeros.
+	const bool indirect = indirect_args_addr != 0;
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
@@ -410,7 +424,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		const char* value = std::getenv("KYTY_UFC_UI_MASK_FALLBACK");
 		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
-	if (ufc_ui_mask_fallback && program.shader_hash == 0x5942a92ebef7b363ull &&
+	if (ufc_ui_mask_fallback && !indirect && program.shader_hash == 0x5942a92ebef7b363ull &&
 	    !use_thread_dimensions && thread_group_x == 15 && thread_group_y == 135 &&
 	    thread_group_z == 1 && input_info.threads_num[0] == 32 &&
 	    input_info.threads_num[1] == 2 && input_info.threads_num[2] == 1 &&
@@ -440,8 +454,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
-	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
-	                                thread_group_z, mode)) {
+	if (!indirect && TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
+	                                             thread_group_y, thread_group_z, mode)) {
 		ResetBindings();
 		return;
 	}
@@ -451,7 +465,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    });
 	const bool                   has_sampler = !program.info.samplers.empty();
 	const bool                   fullscreen_cs =
-	    thread_group_x >= 200 && thread_group_y >= 100 && thread_group_z <= 1;
+	    !indirect && thread_group_x >= 200 && thread_group_y >= 100 && thread_group_z <= 1;
 	const uint64_t shader_hash = program.shader_hash;
 	const bool     skip_cs     = ShouldSkipComputeHash(shader_hash);
 	const bool     watch_cs =
@@ -576,7 +590,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
+	// Zero group counts are a no-op on the GPU, so the indirect path needs no host check.
+	if (!indirect && (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0)) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
 			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
@@ -585,6 +600,50 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			     sh_ctx.GetCs().cs_regs.data_addr);
 		}
 		return;
+	}
+
+	GpuTimestamps::Instance().NoteFrame(m_context.GetGraphics(), frame_num);
+
+	// Wave-size census. The heavy scenes put ~470ms/frame on the GPU and wave64 emulation is
+	// the prime suspect, but that is inference: wave64 costs 2 GCN lanes per invocation plus
+	// exec-as-data, so it only explains the GPU time if the expensive passes are actually
+	// wave64. Count dispatches and invocations by wave size so Option A is aimed at measured
+	// work rather than an assumption. Per-frame totals, because the existing dispatch log is
+	// rate-limited and cannot give them.
+	{
+		const auto     wave = static_cast<uint32_t>(cs_regs.cs_regs.wave_size);
+		const uint64_t local =
+		    static_cast<uint64_t>(std::max(input_info.threads_num[0], 1u)) *
+		    std::max(input_info.threads_num[1], 1u) * std::max(input_info.threads_num[2], 1u);
+		const uint64_t invocations = static_cast<uint64_t>(thread_group_x) * thread_group_y *
+		                             thread_group_z * local;
+		static std::atomic<uint32_t> w64 {0}, w32 {0}, frames {0};
+		static std::atomic<uint64_t> inv64 {0}, inv32 {0};
+		static std::atomic<uint32_t> last_frame {UINT32_MAX};
+		if (wave == 64u) {
+			w64.fetch_add(1, std::memory_order_relaxed);
+			inv64.fetch_add(invocations, std::memory_order_relaxed);
+		} else {
+			w32.fetch_add(1, std::memory_order_relaxed);
+			inv32.fetch_add(invocations, std::memory_order_relaxed);
+		}
+		// 16 frames, not 64: in-fight frames take ~1s, so a 64-frame window is over a minute
+		// and the printed line lags a scene change badly enough to look like a stuck counter.
+		constexpr uint32_t kWindow = 16;
+		const auto previous = last_frame.exchange(frame_num, std::memory_order_relaxed);
+		if (previous != frame_num && previous != UINT32_MAX &&
+		    (frames.fetch_add(1, std::memory_order_relaxed) % kWindow) == kWindow - 1) {
+			const auto d64   = w64.exchange(0);
+			const auto d32   = w32.exchange(0);
+			const auto i64   = inv64.exchange(0);
+			const auto i32   = inv32.exchange(0);
+			const auto total = i64 + i32;
+			LOGF("WaveCensus/16f: wave64=%.1f disp/f (%.1fM inv/f) wave32=%.1f disp/f "
+			     "(%.1fM inv/f) wave64_inv_share=%.1f%% frame=%u\n",
+			     d64 / static_cast<double>(kWindow), i64 / static_cast<double>(kWindow) / 1e6,
+			     d32 / static_cast<double>(kWindow), i32 / static_cast<double>(kWindow) / 1e6,
+			     total == 0 ? 0.0 : i64 * 100.0 / static_cast<double>(total), frame_num);
+		}
 	}
 
 	if (skip_cs) {
@@ -681,14 +740,38 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			// ordering while allowing the queue to execute asynchronously.
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
+		GpuTimestamps::Instance().BeginDispatch(
+		    vk_buffer, shader_hash, static_cast<uint32_t>(cs_regs.cs_regs.wave_size));
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		if (indirect) {
+			// The args were produced by GPU work whose ShaderAccessBarrier already makes
+			// them visible (dst eMemoryRead at eAllCommands covers indirect command reads).
+			// Cache buffers carry eIndirectBuffer usage, so this needs no staging copy -
+			// and, crucially, no host read of the counts, which is what stalls the CP.
+			constexpr uint64_t args_size = 3 * sizeof(uint32_t);
+			auto [args_buffer, args_offset] =
+			    m_context.GetBufferCache().ObtainBuffer(indirect_args_addr, args_size, false);
+			if (args_buffer != nullptr && args_buffer->Handle() != nullptr) {
+				vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+			} else {
+				static std::atomic<uint32_t> log_count {0};
+				if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+					LOGF("GraphicsRenderDispatchDirect: indirect args buffer unavailable "
+					     "addr=0x%016" PRIx64 "\n",
+					     indirect_args_addr);
+				}
+			}
+		} else {
+			vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		}
+		GpuTimestamps::Instance().EndDispatch(vk_buffer);
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader, writes_memory);
 		ResetBindings();
 	};
 
 	auto*      gds         = m_context.GetBufferCache().GetGdsBuffer();
-	const bool chunk_queue = shader_hash == kUfcHangCsHash && gds_chunk > 0 &&
+	// Chunking rewrites the GDS work window per submit and needs host-side counts.
+	const bool chunk_queue = !indirect && shader_hash == kUfcHangCsHash && gds_chunk > 0 &&
 	                         work_limit > gds_chunk && gds != nullptr && gds->Handle() != nullptr;
 	if (chunk_queue) {
 		uint32_t start = work_counter < work_limit ? work_counter : 0;

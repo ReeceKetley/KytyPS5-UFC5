@@ -1198,7 +1198,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 }
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
-                                      uint32_t thread_group_z, uint32_t mode) {
+                                      uint32_t thread_group_z, uint32_t mode,
+                                      uint64_t indirect_args_addr) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 
 	uint32_t frame_num = 0;
@@ -1243,7 +1244,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		}
 
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
-		                                              thread_group_y, thread_group_z, mode);
+		                                              thread_group_y, thread_group_z, mode,
+		                                              indirect_args_addr);
 	}
 
 	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
@@ -1269,6 +1271,88 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	}*/
 }
 
+namespace {
+
+// Times the guest-memory dereference of an indirect dispatch's arg block. These bytes are
+// written by the GPU, so if the page is GPU-owned the read traps into the fault handler and
+// drains the GPU - a stall that shows up in neither finish_ms nor dispatch_ms. `slow` counts
+// reads over 1ms, i.e. ones that certainly blocked on the GPU rather than hitting memory.
+template <typename Read>
+auto NoteIndirectArgRead(uint64_t args_addr, Read&& read) {
+	const auto t0     = Common::Timer::QueryPerformanceCounter();
+	auto       result = read();
+	const auto t1     = Common::Timer::QueryPerformanceCounter();
+	const auto freq   = Common::Timer::QueryPerformanceFrequency();
+	const auto ns     = freq == 0 ? 0ull : (t1 - t0) * 1000000000ull / freq;
+
+	static std::atomic<uint32_t> calls {0};
+	static std::atomic<uint32_t> slow {0};
+	static std::atomic<uint64_t> total_ns {0};
+	static std::atomic<uint64_t> slow_ns {0};
+	total_ns.fetch_add(ns, std::memory_order_relaxed);
+	if (ns > 1000000ull) {
+		slow.fetch_add(1, std::memory_order_relaxed);
+		slow_ns.fetch_add(ns, std::memory_order_relaxed);
+	}
+	const auto n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((n % 128) == 0) {
+		const auto s = slow.exchange(0);
+		LOGF("IndirectArgs/128: total=%.1fms slow=%u slow_total=%.1fms last_addr=0x%016" PRIx64
+		     "\n",
+		     total_ns.exchange(0) / 1000000.0, s, slow_ns.exchange(0) / 1000000.0, args_addr);
+	}
+	return result;
+}
+
+} // namespace
+
+bool CommandProcessor::TryDispatchIndirectOnGpu(uint64_t args_addr, uint32_t mode) {
+	// Reading the arg block host-side stalls the command processor until the GPU work that
+	// produced it drains (~13ms per call in a fight, ~450ms/frame). vkCmdDispatchIndirect
+	// hands the block to the GPU instead. Only legal when the counts are not needed on the
+	// host: the thread-dimensions bit folds them into the compute shader's specialization
+	// key, so those keep the read.
+	constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
+	constexpr uint64_t ArgsSize = 3 * sizeof(uint32_t);
+	const bool         eligible = args_addr != 0 && (mode & DispatchInitiatorUseThreadDimensions) == 0;
+
+	// Only worth it when the host read would actually block. When the arg block is already
+	// current in guest memory the read costs ~27us, and the direct path is strictly better:
+	// it keeps the zero-group early-out, which skips descriptor binding entirely for the
+	// GPU-driven passes that resolve to "nothing to do". Going indirect there would bind ~15
+	// textures for a dispatch that does nothing. Measured: ~12-14% of reads are the blocking
+	// kind, and they carry ~99% of the time.
+	const bool would_stall =
+	    eligible && GetGpuResources().GetBufferCache().HasGpuDirtyBytes(args_addr, ArgsSize);
+
+	static std::atomic<uint32_t> total {0};
+	static std::atomic<uint32_t> eligible_count {0};
+	static std::atomic<uint32_t> stall_count {0};
+	if (eligible) {
+		eligible_count.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (would_stall) {
+		stall_count.fetch_add(1, std::memory_order_relaxed);
+	}
+	const auto n = total.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((n % 128) == 0) {
+		LOGF("IndirectEligible/128: eligible=%u would_stall=%u enabled=%u\n",
+		     eligible_count.exchange(0), stall_count.exchange(0),
+		     RenderExecutor::IndirectDispatchEnabled() ? 1u : 0u);
+	}
+
+	if (!would_stall || !RenderExecutor::IndirectDispatchEnabled()) {
+		return false;
+	}
+	static std::atomic<uint32_t> taken {0};
+	if (taken.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("IndirectDispatch: recording on GPU args=0x%016" PRIx64 " mode=0x%08" PRIx32 "\n",
+		     args_addr, mode);
+	}
+	DispatchDirect(0, 0, 0, mode, args_addr);
+	return true;
+}
+
 void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 	struct DispatchIndirectArgs {
 		uint32_t thread_group_x;
@@ -1279,10 +1363,22 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
 
 	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
+	if (TryDispatchIndirectOnGpu(args_addr, mode)) {
+		return;
+	}
 	GetGpuResources().GetBufferCache().EnsureCurrentForCpu(args_addr, sizeof(DispatchIndirectArgs));
 	auto* args = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
 
-	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
+	// PM4 op 0x16 measures ~15-22ms per call in a fight (~470ms/frame, ~a third of the
+	// frame) and lands in cp_rest because neither Finish nor dispatch accounts for it.
+	// EnsureCurrentForCpu is a no-op unless deferred readback is armed, so the only
+	// candidate left is this dereference faulting on GPU-owned memory. Time the read
+	// itself, separately from recording the dispatch.
+	const auto argread = NoteIndirectArgRead(args_addr, [&] {
+		return DispatchIndirectArgs {args->thread_group_x, args->thread_group_y,
+		                             args->thread_group_z};
+	});
+	DispatchDirect(argread.thread_group_x, argread.thread_group_y, argread.thread_group_z, mode);
 }
 
 void CommandProcessor::DispatchIndirectFromArgs(uint64_t args_addr, uint32_t mode) {
@@ -1292,9 +1388,16 @@ void CommandProcessor::DispatchIndirectFromArgs(uint64_t args_addr, uint32_t mod
 		uint32_t thread_group_z;
 	};
 	EXIT_NOT_IMPLEMENTED(args_addr == 0);
+	if (TryDispatchIndirectOnGpu(args_addr, mode)) {
+		return;
+	}
 	GetGpuResources().GetBufferCache().EnsureCurrentForCpu(args_addr, sizeof(DispatchIndirectArgs));
-	const auto* args = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
-	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
+	const auto* args    = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
+	const auto  argread = NoteIndirectArgRead(args_addr, [&] {
+        return DispatchIndirectArgs {args->thread_group_x, args->thread_group_y,
+                                     args->thread_group_z};
+	});
+	DispatchDirect(argread.thread_group_x, argread.thread_group_y, argread.thread_group_z, mode);
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
