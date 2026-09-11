@@ -135,22 +135,64 @@ static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR 
 	std::vector<vk::QueueFamilyProperties> queue_families(queue_family_count);
 	device.getQueueFamilyProperties(&queue_family_count, queue_families.data());
 
-	const auto required = vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute;
+	const auto required  = vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute;
+	auto       universal = static_cast<uint32_t>(-1);
+	// Log every family, not only those up to the first match: choosing a readback queue
+	// needs to know what else the device offers.
 	for (uint32_t family = 0; family < queue_family_count; family++) {
 		const auto& properties             = queue_families[family];
 		vk::Bool32  presentation_supported = VK_FALSE;
 		RequireVulkanSuccess(device.getSurfaceSupportKHR(family, surface, &presentation_supported),
 		                     "vkGetPhysicalDeviceSurfaceSupportKHR");
 
-		LOGF("\tqueue family: %s [count = %u], [present = %s]\n",
+		LOGF("\tqueue family %u: %s [count = %u], [present = %s]\n", family,
 		     vk::to_string(properties.queueFlags).c_str(), properties.queueCount,
 		     (presentation_supported == VK_TRUE ? "true" : "false"));
-		if (properties.queueCount != 0 && (properties.queueFlags & required) == required &&
-		    presentation_supported == VK_TRUE) {
-			LOGF("\tselected universal queue family %u\n", family);
+		if (universal == static_cast<uint32_t>(-1) && properties.queueCount != 0 &&
+		    (properties.queueFlags & required) == required && presentation_supported == VK_TRUE) {
+			universal = family;
+		}
+	}
+	if (universal != static_cast<uint32_t>(-1)) {
+		LOGF("\tselected universal queue family %u\n", universal);
+	}
+	return universal;
+}
+
+// Picks the queue used for readback copies. A dedicated transfer family is a real DMA engine
+// and overlaps graphics properly, so prefer it; otherwise take a second queue from the
+// universal family, which still lets the copy be waited on independently of later graphics
+// submissions. Returns -1 when neither is available.
+static uint32_t VulkanFindTransferQueueFamily(vk::PhysicalDevice device, uint32_t universal_family,
+                                              uint32_t& out_queue_index) {
+	uint32_t queue_family_count = 0;
+	device.getQueueFamilyProperties(&queue_family_count, nullptr);
+	std::vector<vk::QueueFamilyProperties> queue_families(queue_family_count);
+	device.getQueueFamilyProperties(&queue_family_count, queue_families.data());
+
+	for (uint32_t family = 0; family < queue_family_count; family++) {
+		const auto& properties = queue_families[family];
+		const bool  dedicated =
+		    properties.queueCount != 0 &&
+		    static_cast<bool>(properties.queueFlags & vk::QueueFlagBits::eTransfer) &&
+		    !(properties.queueFlags & vk::QueueFlagBits::eGraphics) &&
+		    !(properties.queueFlags & vk::QueueFlagBits::eCompute);
+		if (dedicated) {
+			LOGF("\tselected dedicated transfer queue family %u\n", family);
+			out_queue_index = 0;
 			return family;
 		}
 	}
+	if (universal_family != static_cast<uint32_t>(-1) &&
+	    universal_family < queue_families.size() &&
+	    queue_families[universal_family].queueCount > 1) {
+		LOGF("\tno dedicated transfer family; using universal family %u queue 1\n",
+		     universal_family);
+		out_queue_index = 1;
+		return universal_family;
+	}
+	LOGF("\tno transfer queue available; readback stays on the graphics queue\n");
+	out_queue_index = 0;
 	return static_cast<uint32_t>(-1);
 }
 
@@ -558,12 +600,35 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
-	vk::DeviceQueueCreateInfo queue_create_info {};
-	queue_create_info.sType            = vk::StructureType::eDeviceQueueCreateInfo;
-	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	const std::array<float, 2> queue_priorities = {1.0f, 1.0f};
+
+	// Discover a readback queue before device creation: it has to be requested here.
+	uint32_t   transfer_queue_index  = 0;
+	const auto transfer_queue_family =
+	    VulkanFindTransferQueueFamily(physical_device, queue_family, transfer_queue_index);
+	graphics.transfer_queue_family = transfer_queue_family;
+	graphics.transfer_queue_foreign =
+	    transfer_queue_family != static_cast<uint32_t>(-1) && transfer_queue_family != queue_family;
+
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
+	uint32_t                                 queue_create_count = 1;
+	queue_create_infos[0].sType            = vk::StructureType::eDeviceQueueCreateInfo;
+	queue_create_infos[0].queueFamilyIndex = queue_family;
+	queue_create_infos[0].queueCount       = 1;
+	queue_create_infos[0].pQueuePriorities = queue_priorities.data();
+	if (transfer_queue_family != static_cast<uint32_t>(-1)) {
+		if (transfer_queue_family == queue_family) {
+			// Same family: ask for a second queue rather than a second create-info, which
+			// Vulkan forbids for a duplicated family index.
+			queue_create_infos[0].queueCount = transfer_queue_index + 1;
+		} else {
+			queue_create_infos[1].sType            = vk::StructureType::eDeviceQueueCreateInfo;
+			queue_create_infos[1].queueFamilyIndex = transfer_queue_family;
+			queue_create_infos[1].queueCount       = 1;
+			queue_create_infos[1].pQueuePriorities = queue_priorities.data();
+			queue_create_count                     = 2;
+		}
+	}
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.sType = vk::StructureType::ePhysicalDeviceColorWriteEnableFeaturesEXT;
@@ -755,8 +820,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	                        ? static_cast<void*>(&feedback_layout)
 	                        : feedback_dynamic.pNext;
 	create_info.flags                   = {};
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_create_infos.data();
+	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1174,6 +1239,21 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.queue_family = queue_family;
 	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.transfer_queue_family != static_cast<uint32_t>(-1)) {
+		const uint32_t transfer_index =
+		    graphic_ctx.transfer_queue_family == queue_family ? 1u : 0u;
+		graphic_ctx.device.getQueue(graphic_ctx.transfer_queue_family, transfer_index,
+		                            &graphic_ctx.transfer_queue);
+		if (graphic_ctx.transfer_queue == nullptr) {
+			LOGF("transfer queue unavailable; readback stays on the graphics queue\n");
+			graphic_ctx.transfer_queue_family  = static_cast<uint32_t>(-1);
+			graphic_ctx.transfer_queue_foreign = false;
+		} else {
+			LOGF("transfer queue ready: family=%u index=%u foreign=%s\n",
+			     graphic_ctx.transfer_queue_family, transfer_index,
+			     graphic_ctx.transfer_queue_foreign ? "true" : "false");
+		}
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

@@ -43,6 +43,18 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// Optional second queue used for GPU->staging readback copies. A readback otherwise
+	// rides the graphics command buffer, so waiting for it means waiting for every draw
+	// recorded ahead of it. On its own queue the copy waits only on the timeline value of
+	// the submission that produced the data.
+	Common::Mutex                      transfer_queue_mutex;
+	uint32_t                           transfer_queue_family = static_cast<uint32_t>(-1);
+	vk::Queue                          transfer_queue        = nullptr;
+	// True when transfer_queue_family differs from queue_family, so buffers crossing
+	// between them need ownership transfer (or concurrent sharing).
+	bool                               transfer_queue_foreign = false;
+
+	[[nodiscard]] bool HasTransferQueue() const noexcept { return transfer_queue != nullptr; }
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

@@ -9,6 +9,8 @@
 #include <condition_variable>
 #include <mutex>
 
+#include <functional>
+#include <memory>
 #include <queue>
 
 #include <thread>
@@ -52,6 +54,18 @@ public:
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
+	// Readback on the dedicated transfer queue. A GPU->staging copy recorded into the
+	// graphics command buffer can only be waited on by draining everything queued ahead of
+	// it; on its own queue the copy waits on the graphics timeline at the tick that actually
+	// produced the data, so unrelated later draws do not gate the CPU.
+	//
+	// Returns false when no transfer queue exists or the feature is disabled, in which case
+	// the caller keeps the old in-line path. `record` must only record transfer commands.
+	[[nodiscard]] static bool TransferQueueEnabled();
+	[[nodiscard]] bool        TransferReadbackAvailable() const noexcept;
+	[[nodiscard]] bool        SubmitTransferReadback(
+	           const std::function<void(vk::CommandBuffer)>& record, uint64_t producer_tick);
+
 private:
 	class CommandPool {
 	public:
@@ -86,11 +100,36 @@ private:
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
+	// Command buffers + timeline for the transfer queue. Separate from m_command_pool,
+	// which is tied to the graphics family.
+	class TransferPool {
+	public:
+		TransferPool(GraphicContext& graphics, MasterSemaphore& timeline);
+		~TransferPool();
+		KYTY_CLASS_NO_COPY(TransferPool);
+
+		[[nodiscard]] bool Valid() const noexcept { return m_pool != nullptr; }
+		vk::CommandBuffer  Commit();
+
+	private:
+		static constexpr size_t GrowStep = 4;
+
+		GraphicContext&                m_graphics;
+		MasterSemaphore&               m_timeline;
+		vk::CommandPool                m_pool = nullptr;
+		std::vector<vk::CommandBuffer> m_buffers;
+		std::vector<uint64_t>          m_ticks;
+		size_t                         m_hint = 0;
+	};
+
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
+	std::unique_ptr<MasterSemaphore> m_transfer_timeline;
+	std::unique_ptr<TransferPool>    m_transfer_pool;
+	Common::Mutex                    m_transfer_mutex;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

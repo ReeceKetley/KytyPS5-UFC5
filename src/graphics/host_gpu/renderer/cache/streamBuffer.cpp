@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include "common/assert.h"
+
+#include <array>
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -70,6 +72,17 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
+
+	// Readback copies run on a dedicated transfer family, so buffers must be reachable from
+	// both. Concurrent sharing avoids threading ownership-transfer barriers through every
+	// producer; buffers carry no compression metadata, so the cost is negligible in practice.
+	const std::array<uint32_t, 2> shared_families = {graphics.queue_family,
+	                                                 graphics.transfer_queue_family};
+	if (graphics.transfer_queue_foreign) {
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = static_cast<uint32_t>(shared_families.size());
+		buffer_info.pQueueFamilyIndices   = shared_families.data();
+	}
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =

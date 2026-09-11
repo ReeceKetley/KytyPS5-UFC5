@@ -1,6 +1,10 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include <memory>
+#include <functional>
+#include <cstdlib>
+#include <array>
 #include "common/logging/log.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -100,7 +104,16 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	if (graphics.transfer_queue != nullptr) {
+		m_transfer_timeline = std::make_unique<MasterSemaphore>(graphics);
+		m_transfer_pool     = std::make_unique<TransferPool>(graphics, *m_transfer_timeline);
+		if (!m_transfer_pool->Valid()) {
+			m_transfer_pool.reset();
+			m_transfer_timeline.reset();
+		}
+	}
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -181,11 +194,24 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 
 void CommandScheduler::FlushAndWait() {
 	FrameWorkScope frame_work(FrameWorkKind::Finish);
-	const auto tick = Submit();
+	// FlushAndWait carries no Finish() reason tag, so it is invisible in the
+	// SchedFinish breakdown even though it counts toward finish_ms. Account for it
+	// separately: this is the WaitRegMem/EOP path, not a buffer download.
+	const auto stall_t0 = Common::Timer::QueryPerformanceCounter();
+	const auto tick     = Submit();
 	m_master.Wait(tick);
 	BeginNext();
 	WaitPriorityOperations(tick);
 	PopPendingOperations();
+	static std::atomic<uint32_t> count {0};
+	static std::atomic<uint64_t> us {0};
+	const auto                   freq = Common::Timer::QueryPerformanceFrequency();
+	const auto total = freq == 0 ? 0 : (Common::Timer::QueryPerformanceCounter() - stall_t0) *
+	                                       1000000ull / freq;
+	us.fetch_add(total, std::memory_order_relaxed);
+	if ((count.fetch_add(1, std::memory_order_relaxed) % 200) == 199) {
+		LOGF("SchedFlushAndWait/200: %.1fms total\n", us.exchange(0) / 1000.0);
+	}
 }
 
 void CommandScheduler::Finish(const char* reason) {
@@ -227,11 +253,32 @@ void CommandScheduler::Finish(const char* reason) {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
+	const auto fin_t1         = Common::Timer::QueryPerformanceCounter();
 	const auto completed_tick = CurrentTick() - 1;
 	m_master.Wait(completed_tick);
+	const auto fin_t2 = Common::Timer::QueryPerformanceCounter();
 	BeginNext();
 	WaitPriorityOperations(completed_tick);
 	PopPendingOperations();
+	const auto fin_t3 = Common::Timer::QueryPerformanceCounter();
+	{
+		// Is a 21ms "stall" the GPU actually executing (master.Wait), or host-side
+		// bookkeeping around it? Those need opposite fixes.
+		static std::atomic<uint32_t> fn {0};
+		static std::atomic<uint64_t> sub_us {0}, wait_us {0}, post_us {0};
+		const auto                   f = Common::Timer::QueryPerformanceFrequency();
+		const auto conv = [f](uint64_t a, uint64_t b) {
+			return f == 0 ? 0ull : (b - a) * 1000000ull / f;
+		};
+		sub_us.fetch_add(conv(stall_t0, fin_t1), std::memory_order_relaxed);
+		wait_us.fetch_add(conv(fin_t1, fin_t2), std::memory_order_relaxed);
+		post_us.fetch_add(conv(fin_t2, fin_t3), std::memory_order_relaxed);
+		if ((fn.fetch_add(1, std::memory_order_relaxed) % 200) == 199) {
+			LOGF("FinishSplit/200: submit=%.1fms gpuwait=%.1fms post=%.1fms\n",
+			     sub_us.exchange(0) / 1000.0, wait_us.exchange(0) / 1000.0,
+			     post_us.exchange(0) / 1000.0);
+		}
+	}
 
 	const auto freq = Common::Timer::QueryPerformanceFrequency();
 	const auto us   = freq == 0
@@ -470,6 +517,141 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	m_command.m_buffer = nullptr;
 	return tick;
+}
+
+// ------------------------------------------------------------------ transfer readback queue
+
+CommandScheduler::TransferPool::TransferPool(GraphicContext& graphics, MasterSemaphore& timeline)
+    : m_graphics(graphics), m_timeline(timeline) {
+	if (graphics.transfer_queue == nullptr ||
+	    graphics.transfer_queue_family == static_cast<uint32_t>(-1)) {
+		return;
+	}
+	vk::CommandPoolCreateInfo create {};
+	create.queueFamilyIndex = graphics.transfer_queue_family;
+	create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+	                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+	if (graphics.device.createCommandPool(&create, nullptr, &m_pool) != vk::Result::eSuccess) {
+		m_pool = nullptr;
+	}
+}
+
+CommandScheduler::TransferPool::~TransferPool() {
+	if (m_pool != nullptr) {
+		m_graphics.device.destroyCommandPool(m_pool, nullptr);
+	}
+}
+
+vk::CommandBuffer CommandScheduler::TransferPool::Commit() {
+	if (m_pool == nullptr) {
+		return nullptr;
+	}
+	// Reuse the oldest buffer whose submission the GPU has already signalled.
+	for (size_t i = 0; i < m_buffers.size(); i++) {
+		const auto index = (m_hint + i) % m_buffers.size();
+		if (m_timeline.IsFree(m_ticks[index])) {
+			m_hint = (index + 1) % m_buffers.size();
+			return m_buffers[index];
+		}
+	}
+	m_timeline.Refresh();
+	for (size_t i = 0; i < m_buffers.size(); i++) {
+		if (m_timeline.IsFree(m_ticks[i])) {
+			m_hint = (i + 1) % m_buffers.size();
+			return m_buffers[i];
+		}
+	}
+	const auto                    first = m_buffers.size();
+	vk::CommandBufferAllocateInfo allocate {};
+	allocate.commandPool        = m_pool;
+	allocate.level              = vk::CommandBufferLevel::ePrimary;
+	allocate.commandBufferCount = GrowStep;
+	std::array<vk::CommandBuffer, GrowStep> grown {};
+	if (m_graphics.device.allocateCommandBuffers(&allocate, grown.data()) !=
+	    vk::Result::eSuccess) {
+		return nullptr;
+	}
+	m_buffers.insert(m_buffers.end(), grown.begin(), grown.end());
+	m_ticks.resize(m_buffers.size(), 0);
+	m_hint = first + 1;
+	return m_buffers[first];
+}
+
+bool CommandScheduler::TransferQueueEnabled() {
+	// Opt-in: cross-queue readback is a behaviour change on a path that can corrupt guest
+	// memory if it is wrong, so it does not become the default without evidence.
+	static const bool enabled = [] {
+		const char* e = std::getenv("KYTY_XFER_QUEUE");
+		return e != nullptr && e[0] != '0';
+	}();
+	return enabled;
+}
+
+bool CommandScheduler::TransferReadbackAvailable() const noexcept {
+	return TransferQueueEnabled() && m_transfer_pool != nullptr && m_transfer_pool->Valid() &&
+	       m_graphics.transfer_queue != nullptr;
+}
+
+bool CommandScheduler::SubmitTransferReadback(
+    const std::function<void(vk::CommandBuffer)>& record, uint64_t producer_tick) {
+	if (!TransferReadbackAvailable()) {
+		return false;
+	}
+	// The producing work must actually be in flight, otherwise its timeline value is never
+	// signalled and the transfer would wait forever. Anything still being recorded belongs
+	// to CurrentTick(), so submit that first.
+	if (producer_tick >= CurrentTick() && !m_command.IsInvalid()) {
+		Submit();
+		BeginNext();
+	}
+	if (producer_tick >= CurrentTick()) {
+		return false;
+	}
+
+	Common::LockGuard lock(m_transfer_mutex);
+	const auto        buffer = m_transfer_pool->Commit();
+	if (buffer == nullptr) {
+		return false;
+	}
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	if (buffer.begin(&begin) != vk::Result::eSuccess) {
+		return false;
+	}
+	record(buffer);
+	if (buffer.end() != vk::Result::eSuccess) {
+		return false;
+	}
+
+	const auto                   transfer_tick    = m_transfer_timeline->NextTick();
+	const auto                   wait_semaphore   = m_master.Handle();
+	const auto                   signal_semaphore = m_transfer_timeline->Handle();
+	const vk::PipelineStageFlags wait_stage       = vk::PipelineStageFlagBits::eTransfer;
+
+	vk::TimelineSemaphoreSubmitInfo timeline {};
+	timeline.waitSemaphoreValueCount   = 1;
+	timeline.pWaitSemaphoreValues      = &producer_tick;
+	timeline.signalSemaphoreValueCount = 1;
+	timeline.pSignalSemaphoreValues    = &transfer_tick;
+
+	vk::SubmitInfo submit {};
+	submit.pNext                = &timeline;
+	submit.waitSemaphoreCount   = 1;
+	submit.pWaitSemaphores      = &wait_semaphore;
+	submit.pWaitDstStageMask    = &wait_stage;
+	submit.commandBufferCount   = 1;
+	submit.pCommandBuffers      = &buffer;
+	submit.signalSemaphoreCount = 1;
+	submit.pSignalSemaphores    = &signal_semaphore;
+
+	{
+		Common::LockGuard queue_lock(m_graphics.transfer_queue_mutex);
+		if (m_graphics.transfer_queue.submit(1, &submit, nullptr) != vk::Result::eSuccess) {
+			return false;
+		}
+	}
+	m_transfer_timeline->Wait(transfer_tick);
+	return true;
 }
 
 void CommandScheduler::BeginNext() {

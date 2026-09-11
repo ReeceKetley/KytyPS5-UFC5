@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -220,6 +221,21 @@ std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& 
 	return {begin, end - begin};
 }
 
+namespace {
+
+// How often a readback actually made it onto the transfer queue rather than falling back to
+// draining the graphics queue.
+void NoteTransferReadback(bool on_transfer_queue) {
+	static std::atomic<uint32_t> total {0}, on_queue {0};
+	on_queue.fetch_add(on_transfer_queue ? 1u : 0u, std::memory_order_relaxed);
+	if ((total.fetch_add(1, std::memory_order_relaxed) % 256) == 255) {
+		const auto n = on_queue.exchange(0);
+		LOGF("XferReadback/256: on_transfer_queue=%u (%.1f%%)\n", n, n / 256.0 * 100.0);
+	}
+}
+
+} // namespace
+
 void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 	{
 		static std::atomic<uint32_t> calls {0};
@@ -262,20 +278,83 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 		rb.mapped      = mapped;
 		rb.base_offset = base_offset;
 		rb.parts.reserve(batch.size());
+
+		// Only the data this batch reads has to be finished, not everything queued behind
+		// it. Per-buffer is a safe over-approximation of per-range.
+		uint64_t producer_tick = 0;
+		for (const auto& copy: batch) {
+			producer_tick = std::max(producer_tick, copy.buffer->LastGpuWriteTick());
+		}
+		const bool synchronous = max_copy_size < defer_min_copy;
+		const bool try_transfer_queue = synchronous && m_scheduler.TransferReadbackAvailable();
+
+		// Geometry of the batch, shared by both recording paths.
+		struct PlannedCopy {
+			Buffer*    owner;
+			vk::Buffer source;
+			uint64_t   source_begin;
+			uint64_t   staging_offset;
+			uint64_t   bytes;
+		};
+		std::vector<PlannedCopy> planned;
+		planned.reserve(batch.size());
 		for (const auto& copy: batch) {
 			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
-			download.CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin, base_offset + cursor,
-			                  envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
-			                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-			                  vk::AccessFlagBits::eHostRead);
+			planned.push_back({copy.buffer, copy.buffer->Handle(), source_begin,
+			                   base_offset + cursor, envelope_size});
 			const auto write_offset = cursor + copy.source_offset - source_begin;
 			rb.parts.push_back({copy.address, base_offset + write_offset, copy.size});
 			cursor += AlignDownload(envelope_size);
 		}
+
+		bool transferred = false;
+		if (try_transfer_queue) {
+			const auto destination = download.Handle();
+			transferred            = m_scheduler.SubmitTransferReadback(
+                [&planned, destination](vk::CommandBuffer command) {
+                    std::vector<vk::BufferCopy> regions;
+                    regions.reserve(planned.size());
+                    for (const auto& item: planned) {
+                        // The semaphore wait already makes the producer's writes visible,
+                        // so only the host-read dependency after the copy is needed.
+                        regions.push_back({.srcOffset = item.source_begin,
+                                           .dstOffset = item.staging_offset,
+                                           .size      = item.bytes});
+                        command.copyBuffer(item.source, destination, 1, &regions.back());
+                    }
+                    vk::MemoryBarrier host_barrier {};
+                    host_barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+                    host_barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+                    command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                            vk::PipelineStageFlagBits::eHost, {}, 1,
+                                            &host_barrier, 0, nullptr, 0, nullptr);
+                },
+                producer_tick);
+		}
+		if (!transferred) {
+			for (const auto& item: planned) {
+				download.CopyFrom(m_scheduler.Current(), *item.owner, item.source_begin,
+				                  item.staging_offset, item.bytes,
+				                  vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
+				                  vk::AccessFlagBits::eMemoryRead |
+				                      vk::AccessFlagBits::eMemoryWrite,
+				                  vk::AccessFlagBits::eHostRead);
+			}
+		}
 		download.Commit();
 		rb.tick = m_scheduler.CurrentTick();
 
-		if (max_copy_size < defer_min_copy) {
+		if (transferred) {
+			// SubmitTransferReadback already waited on its own timeline; the staging data
+			// is present without draining the graphics queue.
+			NoteTransferReadback(true);
+			for (const auto& part: rb.parts) {
+				download.Invalidate(part.staging_offset, part.size);
+				Libs::LibKernel::Memory::WriteBacking(
+				    part.address, mapped + (part.staging_offset - base_offset), part.size);
+			}
+		} else if (synchronous) {
+			NoteTransferReadback(false);
 			m_scheduler.Finish("buffer-download");
 			m_scheduler.WaitPriorityOperations(rb.tick);
 			for (const auto& p: rb.parts) {
@@ -464,8 +543,96 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	// Split a readback's cost: how much is the GPU actually being waited on
+	// (ReadMemoryOnGpu, which contains the Finish), and how much is the guest thread
+	// queueing behind a saturated GPU worker thread before its command is even run?
+	// Those need completely different fixes.
+	const bool on_gpu_thread = GuestGpu::IsGpuThread();
+	const auto t0            = Common::Timer::QueryPerformanceCounter();
+	uint64_t   work_ticks    = 0;
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, &work_ticks] {
+		const auto w0 = Common::Timer::QueryPerformanceCounter();
+		ReadMemoryOnGpu(vaddr, size, is_write);
+		work_ticks = Common::Timer::QueryPerformanceCounter() - w0;
+	});
+	{
+		static std::atomic<uint64_t> n_gpu {0}, n_guest {0}, us_gpu {0}, us_guest {0},
+		    us_guest_work {0};
+		const auto freq = Common::Timer::QueryPerformanceFrequency();
+		if (freq != 0) {
+			const auto total_us = (Common::Timer::QueryPerformanceCounter() - t0) * 1000000ull / freq;
+			const auto work_us  = work_ticks * 1000000ull / freq;
+			uint64_t   c        = 0;
+			if (on_gpu_thread) {
+				us_gpu.fetch_add(total_us, std::memory_order_relaxed);
+				c = n_gpu.fetch_add(1, std::memory_order_relaxed) + 1;
+			} else {
+				us_guest.fetch_add(total_us, std::memory_order_relaxed);
+				us_guest_work.fetch_add(work_us, std::memory_order_relaxed);
+				c = n_guest.fetch_add(1, std::memory_order_relaxed) + 1;
+			}
+			if (((n_gpu.load(std::memory_order_relaxed) +
+			      n_guest.load(std::memory_order_relaxed)) %
+			     512) == 0) {
+				const auto ng = n_gpu.load(std::memory_order_relaxed);
+				const auto nq = n_guest.load(std::memory_order_relaxed);
+				const auto tg = us_gpu.load(std::memory_order_relaxed);
+				const auto tq = us_guest.load(std::memory_order_relaxed);
+				const auto wq = us_guest_work.load(std::memory_order_relaxed);
+				LOGF("ReadbackSplit: gpu_thread=%" PRIu64 "/%.0fms  guest_thread=%" PRIu64
+				     "/%.0fms (of which gpu_work=%.0fms, queued=%.0fms)\n",
+				     ng, tg / 1000.0, nq, tq / 1000.0, wq / 1000.0, (tq - wq) / 1000.0);
+			}
+			(void)c;
+		}
+	}
+}
+
+void BufferCache::DiscardMemory(uint64_t vaddr, uint64_t size) {
+	// KYTY_UNMAP_DISCARD=0 restores the old write-back-on-unmap behaviour.
+	static const bool discard = [] {
+		const char* e = std::getenv("KYTY_UNMAP_DISCARD");
+		return e == nullptr || (e[0] != '0' || e[1] != '\0');
+	}();
+	if (!discard) {
+		InvalidateMemory(vaddr, size);
+		return;
+	}
+	if (vaddr == 0 || size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
 	m_scheduler.Context().GetGpu().SendCommandSync(
-	    [this, vaddr, size, is_write] { ReadMemoryOnGpu(vaddr, size, is_write); });
+	    [this, vaddr, size] { DiscardMemoryOnGpu(vaddr, size); });
+}
+
+void BufferCache::DiscardMemoryOnGpu(uint64_t vaddr, uint64_t size) {
+	// The guest is unmapping this range, so it can never observe these bytes again:
+	// downloading GPU-dirty data back into memory that is about to be destroyed is
+	// pure waste. InvalidateMemory() would do exactly that, and it widens to a
+	// 512 KiB window first, dragging unrelated dirty ranges into the same GPU-idle
+	// Finish("buffer-download"). Drop GPU ownership instead, keeping the tracker and
+	// the range set consistent so the GC still retires the buffers cleanly.
+	if (!IsRegionRegistered(vaddr, size)) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		return;
+	}
+	static std::atomic<uint32_t> discards {0};
+	const auto                   n = discards.fetch_add(1, std::memory_order_relaxed);
+	if (n < 8 || (n % 4096) == 0) {
+		LOGF("UnmapDiscard #%u: addr=0x%016" PRIx64 " size=%" PRIu64 " gpu_dirty=%d\n", n, vaddr,
+		     size, m_gpu_modified_ranges.Intersects(vaddr, size) ? 1 : 0);
+	}
+	m_gpu_modified_ranges.Subtract(vaddr, size);
+	// Tracker bits are 4 KiB pages: release a page only when no GPU-dirty bytes
+	// remain on it, so a partially covered edge page keeps its siblings' state.
+	const auto page_begin = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	const auto page_end   = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	for (auto page = page_begin; page < page_end; page += TRACKER_PAGE_SIZE) {
+		if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+		}
+	}
+	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 }
 
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -725,6 +892,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		// The write is being recorded into the command buffer that owns this tick.
+		buffer->NoteGpuWrite(m_scheduler.CurrentTick());
 	}
 	return {buffer, buffer->Offset(vaddr)};
 }

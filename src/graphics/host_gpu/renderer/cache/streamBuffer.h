@@ -69,6 +69,15 @@ public:
 	                                                   vk::AccessFlagBits::eMemoryWrite);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
+	// Scheduler tick of the most recent submission that recorded a GPU write here. A readback
+	// only needs that submission to complete, not everything queued behind it.
+	[[nodiscard]] uint64_t LastGpuWriteTick() const noexcept { return m_last_gpu_write_tick; }
+	void                   NoteGpuWrite(uint64_t tick) noexcept {
+        if (tick > m_last_gpu_write_tick) {
+            m_last_gpu_write_tick = tick;
+        }
+	}
+
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;
 	int    stream_score = 0;
@@ -87,6 +96,7 @@ private:
 	CommandScheduler*             m_scheduler   = nullptr;
 	MemoryUsage                   m_usage       = MemoryUsage::DeviceLocal;
 	uint64_t                      m_cpu_address = 0;
+	uint64_t                      m_last_gpu_write_tick = 0;
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
