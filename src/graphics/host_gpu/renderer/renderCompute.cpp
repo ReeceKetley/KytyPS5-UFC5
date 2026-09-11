@@ -661,6 +661,48 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 				                shader_hash, i, descriptor.Base48(), size, resource.read, resource.written));
 			}
 		}
+		// KYTY_STUB_CLEAR_BUFFERS=1: also zero the shader's written buffers, not just its
+		// images. **TESTED 2026-09-11 AND REFUTED - LEAVE OFF.** Kept so the experiment is not
+		// repeated; see the ledger.
+		//
+		// The hypothesis: the images are already cleared to 0 on the "0 = nothing occludes,
+		// reverse-Z far plane" reading, and that is what made the intro and corner scenes
+		// render, so extending the same value to the two large buffers (0x1163920000, 18MB and
+		// 0x1170776e00, 36MB) should make the fight round render too. The prior objection - that
+		// a blind fill risks a GPU hang via an indirect-args buffer - had been weakened by
+		// measurement: 0x1163920000 is bound as `CS texture[3/4/6]`, read-only sampled,
+		// 1068x600, i.e. a Hi-Z pyramid consumed by other compute shaders, and the whole frame
+		// issues only ~21 IT_DRAW_INDIRECT.
+		//
+		// Result: `cleared_images=2 cleared_buffers=2` over 450 firings - it did clear exactly
+		// the two intended buffers - and **the round stayed black while the HUD became
+		// corrupted** (health bars scrambled; they are clean with this off). So these buffers
+		// carry structured state the rest of the frame consumes, not a visibility mask that
+		// zero satisfies. Zero is not an "all visible" value for them, and there is no reason to
+		// think any other single constant is either.
+		static const bool clear_stub_buffers = [] {
+			const char* env = std::getenv("KYTY_STUB_CLEAR_BUFFERS");
+			return env != nullptr && env[0] == '1';
+		}();
+		uint32_t cleared_buffers = 0;
+		if (clear_stub_buffers) {
+			auto& buffer_cache = buffer.GetContext().GetGpuResources().GetBufferCache();
+			for (uint32_t i = 0; i < program.info.buffers.size() && i < resources.buffers.size();
+			     i++) {
+				if (!program.info.buffers[i].written) {
+					continue;
+				}
+				const auto descriptor =
+				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+				const auto size = BufferDescriptorSize(descriptor);
+				if (size == 0) {
+					continue;
+				}
+				buffer_cache.FillBuffer(descriptor.Base48(), size, 0u, false);
+				cleared_buffers++;
+			}
+		}
+
 		auto&    cache        = buffer.GetContext().GetTextureCache();
 		uint32_t cleared      = 0;
 		for (uint32_t i = 0; i < program.info.images.size() && i < resources.images.size(); i++) {
@@ -692,10 +734,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			cleared++;
 		}
 		LOGF("GraphicsRenderDispatchDirect: stubbing watched compute shader hash=0x%016" PRIx64
-		     " addr=0x%016" PRIx64 " groups=%ux%ux%u local=%ux%ux%u cleared_images=%u\n",
+		     " addr=0x%016" PRIx64 " groups=%ux%ux%u local=%ux%ux%u cleared_images=%u "
+		     "cleared_buffers=%u\n",
 		     shader_hash, sh_ctx.GetCs().cs_regs.data_addr, thread_group_x, thread_group_y,
 		     thread_group_z, input_info.threads_num[0], input_info.threads_num[1],
-		     input_info.threads_num[2], cleared);
+		     input_info.threads_num[2], cleared, cleared_buffers);
 		ResetBindings();
 		return;
 	}

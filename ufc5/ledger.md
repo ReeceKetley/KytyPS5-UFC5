@@ -428,6 +428,31 @@ one frame.
 and `graphics_debug_dump_enabled()` keys off it, so without it every counter is silently
 discarded and the log looks fine but contains no measurements. The script always passes it.
 
+### FAILED, AND IT CLOSES OPTION (a) FOR THE BLACK ROUND: zeroing the occlusion CS's two big buffers
+
+`KYTY_STUB_CLEAR_BUFFERS=1` (`renderCompute.cpp`, default OFF, kept only so this is not retried).
+Extends the existing stub — which already clears the CS's written *images* to 0 — to also zero its
+written *buffers*, i.e. `0x1163920000` (18 MB) and `0x1170776e00` (36 MB).
+
+**Hypothesis, and why it looked good:** the image clear uses "0 = nothing occludes, reverse-Z far
+plane", and that is exactly what made the intro and corner scenes render. The long-standing objection
+to filling the buffers — "sizes don't reveal the layout; filling blind risks a GPU hang from a wrong
+value in an indirect-args buffer" — had been weakened by measurement this session: `0x1163920000` is
+bound as **`CS texture[3/4/6]`, read-only sampled, 1068x600** (a Hi-Z pyramid consumed by *other*
+compute shaders, not draw args), and the whole frame issues only **~21 `IT_DRAW_INDIRECT`**.
+
+**Result: refuted, and a regression.** `cleared_images=2 cleared_buffers=2` over 450 firings, so it
+did clear exactly the two intended buffers. The fight round **stayed black**, and the **HUD became
+corrupted** (health bars scrambled; clean with the flag off). The walkout still rendered.
+
+**What this establishes:** those buffers carry structured state the rest of the frame consumes, not a
+visibility mask that a constant satisfies. Zero is not an "all visible" value, and nothing suggests
+another single constant would be. **Option (a) in "Next steps" — extend the stub to fill the buffers —
+is closed.** The black round needs the real CS running, i.e. wave64 Stage 2, or a hand-written
+replacement of the occlusion algorithm.
+- Cost note if anything like this is tried again: the fill ran per stub firing, 54 MB x 450 = ~24 GB
+  of `vkCmdFillBuffer` in one session. Any future experiment here should fill once, not per dispatch.
+
 ### Upstream sync — what was hand-woven in, and the trap next to it (2026-09-11)
 
 **Policy: do NOT merge or cherry-pick from upstream. Hand-apply what is relevant.** Our branch has
