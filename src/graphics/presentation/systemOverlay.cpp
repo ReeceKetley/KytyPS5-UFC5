@@ -6,6 +6,8 @@
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/dispatchInspector.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/translate/ProbeConfig.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include "libs/controller.h"
@@ -20,14 +22,20 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <limits>
 #include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -453,6 +461,51 @@ PFN_vkVoidFunction LoadVulkanFunction(const char* name, void* user_data) {
 
 void CheckVulkanResult(VkResult result) {
 	EXIT_IF(result != VK_SUCCESS);
+}
+
+bool WriteDiagnosticTrigger(const char* path, std::string_view contents, std::string* error) {
+	std::error_code ec;
+	const std::filesystem::path output_path {path};
+	std::filesystem::create_directories(output_path.parent_path(), ec);
+	if (ec) {
+		*error = "could not create dump directory: " + ec.message();
+		return false;
+	}
+	std::ofstream file {output_path, std::ios::binary | std::ios::trunc};
+	if (!file) {
+		*error = "could not open " + output_path.string();
+		return false;
+	}
+	file.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+	file.close();
+	if (!file.good()) {
+		*error = "could not finish writing " + output_path.string();
+		return false;
+	}
+	return true;
+}
+
+uint64_t ParseExactInspectorHash(const char* text) {
+	while (*text == ' ' || *text == '\t') ++text;
+	if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) text += 2;
+	char* end = nullptr;
+	const auto value = std::strtoull(text, &end, 16);
+	if (end == text) return 0;
+	while (*end == ' ' || *end == '\t') ++end;
+	return *end == '\0' ? value : 0;
+}
+
+bool InspectorRangesOverlap(uint64_t first_address, uint64_t first_size, uint64_t second_address,
+	                        uint64_t second_size) {
+	if (first_address == 0 || second_address == 0) return false;
+	const auto saturating_end = [](uint64_t address, uint64_t size) {
+		const auto length = std::max<uint64_t>(size, 1);
+		return length > std::numeric_limits<uint64_t>::max() - address
+		           ? std::numeric_limits<uint64_t>::max()
+		           : address + length;
+	};
+	return first_address < saturating_end(second_address, second_size) &&
+	       second_address < saturating_end(first_address, first_size);
 }
 
 } // namespace
@@ -1053,6 +1106,7 @@ struct SystemOverlay::Impl {
 				inspector_frame = std::move(newest);
 				if (changed) {
 					selected_operation = UINT32_MAX;
+					selected_resource_address = 0;
 				}
 				if (inspector_waiting_frame != 0 &&
 				    inspector_frame.frame > inspector_waiting_frame) {
@@ -1106,6 +1160,39 @@ struct SystemOverlay::Impl {
 		ImGui::SameLine();
 		ImGui::Checkbox("Draws", &inspector_show_draws);
 
+		const uint64_t exact_filter = ParseExactInspectorHash(inspector_filter.data());
+		if (ImGui::Button("Dump frame (.txt + .json)")) {
+			const auto result = DumpDispatchInspectorFrame(inspector_frame);
+			inspector_status = result.success ? "wrote " + result.text_path + " and " + result.json_path
+			                                  : "dump failed: " + result.error;
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Dump exact hash")) {
+			if (exact_filter == 0) {
+				inspector_status = "enter a complete non-zero shader hash before dumping a filter";
+			} else {
+				const auto result = DumpDispatchInspectorFrame(inspector_frame, exact_filter);
+				inspector_status = result.success
+				                       ? "wrote " + result.text_path + " and " + result.json_path
+				                       : "dump failed: " + result.error;
+			}
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Dump selected")) {
+			const auto operation = selected_operation < inspector_frame.operations.size()
+			                           ? static_cast<int32_t>(selected_operation)
+			                           : -1;
+			if (operation < 0) {
+				inspector_status = "select an operation before dumping it";
+			} else {
+				const auto result = DumpDispatchInspectorFrame(inspector_frame, 0, operation);
+				inspector_status = result.success
+				                       ? "wrote " + result.text_path + " and " + result.json_path
+				                       : "dump failed: " + result.error;
+			}
+		}
+		if (!inspector_status.empty()) ImGui::TextWrapped("%s", inspector_status.c_str());
+
 		const char* filter = inspector_filter.data();
 		while (filter[0] == '0' && (filter[1] == 'x' || filter[1] == 'X')) {
 			filter += 2;
@@ -1128,6 +1215,27 @@ struct SystemOverlay::Impl {
 			if (matches) {
 				visible.push_back(index);
 			}
+		}
+		std::unordered_map<uint64_t, std::unordered_set<uint64_t>> image_ids_by_address;
+		auto note_alias = [&](const InspectorResource& resource) {
+			if (resource.address != 0 && resource.image_id != 0) {
+				image_ids_by_address[resource.address].insert(
+				    (static_cast<uint64_t>(resource.image_id) << 32) | resource.image_generation);
+			}
+		};
+		for (const auto& operation: inspector_frame.operations) {
+			for (const auto& stage: operation.stages) {
+				for (const auto& resource: stage.resources) note_alias(resource);
+			}
+			for (const auto& resource: operation.attachments) note_alias(resource);
+		}
+		const auto alias_count = std::ranges::count_if(image_ids_by_address, [](const auto& entry) {
+			return entry.second.size() > 1;
+		});
+		if (alias_count != 0) {
+			ImGui::TextColored({1.0f, 0.55f, 0.15f, 1.0f},
+			                   "ALIAS WARNING: %zu guest address(es) resolve to multiple image IDs",
+			                   static_cast<size_t>(alias_count));
 		}
 
 		constexpr ImGuiTableFlags list_flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
@@ -1191,11 +1299,35 @@ struct SystemOverlay::Impl {
 
 		if (selected_operation < inspector_frame.operations.size()) {
 			const auto& selected = inspector_frame.operations[selected_operation];
+			const auto selected_hash = selected.stages.empty() ? 0 : selected.stages.back().shader_hash;
+			if (ImGui::Button("Filter to selected shader") && selected_hash != 0) {
+				std::snprintf(inspector_filter.data(), inspector_filter.size(), "%016" PRIx64,
+				              selected_hash);
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Arm shader input capture")) {
+				if (selected_hash == 0) {
+					inspector_status = "selected operation has no shader hash";
+				} else {
+					char hash_text[32] {};
+					char occurrence_text[16] {};
+					std::snprintf(hash_text, sizeof(hash_text), "%016" PRIx64 "\n", selected_hash);
+					std::snprintf(occurrence_text, sizeof(occurrence_text), "%u\n",
+					              std::max(selected.occurrence_count, 1u));
+					std::string error;
+					if (WriteDiagnosticTrigger("D:/PS5/dumps/CAPTURE_HASHES", hash_text, &error) &&
+					    WriteDiagnosticTrigger("D:/PS5/dumps/DUMP_INPUTS", occurrence_text, &error)) {
+						inspector_status = "armed input capture for selected hash (all observed occurrences)";
+					} else {
+						inspector_status = "capture arm failed: " + error;
+					}
+				}
+			}
 			ImGui::SeparatorText("Resolved resources");
 			constexpr ImGuiTableFlags resource_flags =
 			    ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
 			    ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit;
-			if (ImGui::BeginTable("##Resources", 8, resource_flags, {0.0f, 0.0f})) {
+			if (ImGui::BeginTable("##Resources", 8, resource_flags, {0.0f, 220.0f})) {
 				ImGui::TableSetupScrollFreeze(0, 1);
 				ImGui::TableSetupColumn("Stage");
 				ImGui::TableSetupColumn("Resource");
@@ -1206,12 +1338,26 @@ struct SystemOverlay::Impl {
 				ImGui::TableSetupColumn("Access");
 				ImGui::TableSetupColumn("Bytes");
 				ImGui::TableHeadersRow();
-				auto draw_resource = [](const char* stage_name, const InspectorResource& resource) {
+				uint32_t resource_row = 0;
+				auto draw_resource = [&](const char* stage_name, const InspectorResource& resource) {
 					ImGui::TableNextRow();
 					ImGui::TableNextColumn();
 					ImGui::TextUnformatted(stage_name);
 					ImGui::TableNextColumn();
-					ImGui::Text("%s[%u]", InspectorResourceName(resource.kind), resource.index);
+					char resource_label[64] {};
+					std::snprintf(resource_label, sizeof(resource_label), "%s[%u]##resource%u",
+					              InspectorResourceName(resource.kind), resource.index, resource_row++);
+					const bool resource_selected = resource.address != 0 &&
+					                               resource.address == selected_resource_address &&
+					                               resource.image_id == selected_resource_image_id &&
+					                               resource.image_generation == selected_resource_generation;
+					if (ImGui::Selectable(resource_label, resource_selected,
+					                      ImGuiSelectableFlags_SpanAllColumns)) {
+						selected_resource_address    = resource.address;
+						selected_resource_size       = resource.size;
+						selected_resource_image_id   = resource.image_id;
+						selected_resource_generation = resource.image_generation;
+					}
 					ImGui::TableNextColumn();
 					ImGui::Text("0x%016" PRIx64, resource.address);
 					ImGui::TableNextColumn();
@@ -1249,9 +1395,255 @@ struct SystemOverlay::Impl {
 				}
 				ImGui::EndTable();
 			}
+
+			if (selected.kind == InspectorOperationKind::Dispatch && selected_hash != 0 &&
+			    ImGui::CollapsingHeader("Repeated-dispatch comparison",
+			                            ImGuiTreeNodeFlags_DefaultOpen)) {
+				int32_t previous_index = -1;
+				for (int32_t index = static_cast<int32_t>(selected_operation) - 1; index >= 0; --index) {
+					const auto& candidate = inspector_frame.operations[static_cast<size_t>(index)];
+					if (candidate.kind == InspectorOperationKind::Dispatch && !candidate.stages.empty() &&
+					    candidate.stages.back().shader_hash == selected_hash) {
+						previous_index = index;
+						break;
+					}
+				}
+				if (previous_index < 0) {
+					ImGui::TextDisabled("No earlier dispatch with this shader in the captured frame.");
+				} else {
+					struct ComparedBinding {
+						uint32_t stage = 0;
+						const InspectorResource* resource = nullptr;
+					};
+					std::unordered_map<uint64_t, ComparedBinding> before;
+					std::unordered_map<uint64_t, ComparedBinding> after;
+					auto collect = [](const InspectorOperation& operation, auto& bindings) {
+						for (const auto& stage: operation.stages) {
+							for (const auto& resource: stage.resources) {
+								const uint64_t key = (static_cast<uint64_t>(stage.stage) << 40) |
+								                     (static_cast<uint64_t>(resource.kind) << 32) |
+								                     resource.index;
+								bindings[key] = {stage.stage, &resource};
+							}
+						}
+					};
+					collect(inspector_frame.operations[static_cast<size_t>(previous_index)], before);
+					collect(selected, after);
+					std::unordered_set<uint64_t> keys;
+					for (const auto& [key, binding]: before) keys.insert(key);
+					for (const auto& [key, binding]: after) keys.insert(key);
+					auto differs = [](const InspectorResource* lhs, const InspectorResource* rhs) {
+						return lhs == nullptr || rhs == nullptr || lhs->address != rhs->address ||
+						       lhs->size != rhs->size || lhs->image_id != rhs->image_id ||
+						       lhs->image_generation != rhs->image_generation ||
+						       lhs->actual_vk != rhs->actual_vk || lhs->width != rhs->width ||
+						       lhs->height != rhs->height || lhs->depth != rhs->depth ||
+						       lhs->read != rhs->read || lhs->written != rhs->written ||
+						       lhs->atomic != rhs->atomic;
+					};
+					size_t changed = 0;
+					for (const auto key: keys) {
+						const auto old = before.find(key);
+						const auto now = after.find(key);
+						changed += differs(old == before.end() ? nullptr : old->second.resource,
+						                   now == after.end() ? nullptr : now->second.resource);
+					}
+					ImGui::Text("Compared with operation %d: %zu changed binding(s)", previous_index,
+					            changed);
+					if (changed != 0 && ImGui::BeginTable("##DispatchDiff", 4, resource_flags,
+					                                       {0.0f, 150.0f})) {
+						ImGui::TableSetupColumn("Binding");
+						ImGui::TableSetupColumn("Previous address / image");
+						ImGui::TableSetupColumn("Selected address / image");
+						ImGui::TableSetupColumn("Selected access");
+						ImGui::TableHeadersRow();
+						for (const auto key: keys) {
+							const auto old = before.find(key);
+							const auto now = after.find(key);
+							const auto* old_resource = old == before.end() ? nullptr : old->second.resource;
+							const auto* now_resource = now == after.end() ? nullptr : now->second.resource;
+							if (!differs(old_resource, now_resource)) continue;
+							const auto& binding = now != after.end() ? now->second : old->second;
+							const auto* resource = now_resource != nullptr ? now_resource : old_resource;
+							ImGui::TableNextRow();
+							ImGui::TableNextColumn();
+							ImGui::Text("%s %s[%u]", InspectorStageName(binding.stage),
+							            InspectorResourceName(resource->kind), resource->index);
+							auto draw_identity = [](const InspectorResource* item) {
+								if (item == nullptr) ImGui::TextUnformatted("missing");
+								else ImGui::Text("0x%016" PRIx64 " / %u.%u", item->address,
+								                 item->image_id, item->image_generation);
+							};
+							ImGui::TableNextColumn();
+							draw_identity(old_resource);
+							ImGui::TableNextColumn();
+							draw_identity(now_resource);
+							ImGui::TableNextColumn();
+							if (now_resource != nullptr) {
+								ImGui::Text("%s%s%s", now_resource->read ? "R" : "-",
+								            now_resource->written ? "W" : "-",
+								            now_resource->atomic ? "A" : "-");
+							} else {
+								ImGui::TextUnformatted("removed");
+							}
+						}
+						ImGui::EndTable();
+					}
+				}
+			}
+
+			if (selected_resource_address != 0 &&
+			    ImGui::CollapsingHeader("Selected resource timeline",
+			                            ImGuiTreeNodeFlags_DefaultOpen)) {
+				ImGui::Text("address=0x%016" PRIx64 " bytes=%" PRIu64 " image=%u.%u",
+				            selected_resource_address, selected_resource_size,
+				            selected_resource_image_id, selected_resource_generation);
+				const auto aliases = image_ids_by_address.find(selected_resource_address);
+				if (aliases != image_ids_by_address.end() && aliases->second.size() > 1) {
+					ImGui::TextColored({1.0f, 0.45f, 0.1f, 1.0f},
+					                   "This exact address resolves to %zu image IDs in this frame.",
+					                   aliases->second.size());
+				}
+				if (ImGui::Button("Trace address")) {
+					char address[32] {};
+					std::snprintf(address, sizeof(address), "%016" PRIx64 "\n",
+					              selected_resource_address);
+					std::string error;
+					inspector_status = WriteDiagnosticTrigger("D:/PS5/dumps/TRACE_ADDRS", address, &error)
+					                       ? "TRACE_ADDRS now watches the selected address"
+					                       : "trace request failed: " + error;
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Clear images once at address")) {
+					char address[32] {};
+					std::snprintf(address, sizeof(address), "%016" PRIx64 "\n",
+					              selected_resource_address);
+					std::string error;
+					inspector_status = WriteDiagnosticTrigger("D:/PS5/dumps/CLEAR_IMAGES", address, &error)
+					                       ? "armed one-frame image clear for selected address"
+					                       : "clear request failed: " + error;
+				}
+
+				struct ResourceUse {
+					uint32_t operation = 0;
+					const char* stage = nullptr;
+					uint64_t hash = 0;
+					const InspectorResource* resource = nullptr;
+				};
+				std::vector<ResourceUse> uses;
+				for (uint32_t operation_index = 0; operation_index < inspector_frame.operations.size();
+				     ++operation_index) {
+					const auto& operation = inspector_frame.operations[operation_index];
+					for (const auto& stage: operation.stages) {
+						for (const auto& resource: stage.resources) {
+							if (InspectorRangesOverlap(selected_resource_address,
+							                           selected_resource_size, resource.address,
+							                           resource.size)) {
+								uses.push_back({operation_index, InspectorStageName(stage.stage),
+								                stage.shader_hash, &resource});
+							}
+						}
+					}
+					for (const auto& resource: operation.attachments) {
+						if (InspectorRangesOverlap(selected_resource_address, selected_resource_size,
+						                           resource.address, resource.size)) {
+							uses.push_back({operation_index, "RT", 0, &resource});
+						}
+					}
+				}
+				ImGui::Text("%zu overlapping producer/consumer use(s) in this frame", uses.size());
+				if (ImGui::BeginTable("##ResourceTimeline", 7, resource_flags, {0.0f, 210.0f})) {
+					ImGui::TableSetupScrollFreeze(0, 1);
+					ImGui::TableSetupColumn("Op");
+					ImGui::TableSetupColumn("Stage / shader");
+					ImGui::TableSetupColumn("Binding");
+					ImGui::TableSetupColumn("Address");
+					ImGui::TableSetupColumn("image_id");
+					ImGui::TableSetupColumn("Access");
+					ImGui::TableSetupColumn("Format / extent");
+					ImGui::TableHeadersRow();
+					for (const auto& use: uses) {
+						const auto& resource = *use.resource;
+						ImGui::TableNextRow();
+						ImGui::TableNextColumn();
+						ImGui::Text("%u", use.operation);
+						ImGui::TableNextColumn();
+						if (use.hash != 0) ImGui::Text("%s 0x%016" PRIx64, use.stage, use.hash);
+						else ImGui::TextUnformatted(use.stage);
+						ImGui::TableNextColumn();
+						ImGui::Text("%s[%u]", InspectorResourceName(resource.kind), resource.index);
+						ImGui::TableNextColumn();
+						ImGui::Text("0x%016" PRIx64 " +%" PRIu64, resource.address, resource.size);
+						ImGui::TableNextColumn();
+						ImGui::Text("%u.%u", resource.image_id, resource.image_generation);
+						ImGui::TableNextColumn();
+						ImGui::Text("%s%s%s", resource.read ? "R" : "-",
+						            resource.written ? "W" : "-", resource.atomic ? "A" : "-");
+						ImGui::TableNextColumn();
+						ImGui::Text("vk=%d %ux%ux%u", resource.actual_vk, resource.width,
+						            resource.height, resource.depth);
+					}
+					ImGui::EndTable();
+				}
+			}
 		} else {
 			ImGui::TextDisabled("Select an operation to inspect every resolved binding.");
 			ImGui::TextDisabled("Headless snapshot: create D:/PS5/dumps/DUMP_INSPECTOR (optional hash contents).");
+		}
+
+		if (ImGui::CollapsingHeader("Shader probe / capture controls")) {
+			namespace Probe = ShaderRecompiler::Frontend;
+			auto load_probe_editor = [&] {
+				const auto text = Probe::GetProbeConfigText();
+				inspector_probe_text.fill('\0');
+				std::memcpy(inspector_probe_text.data(), text.data(),
+				            std::min(text.size(), inspector_probe_text.size() - 1));
+				inspector_probe_initialized = true;
+			};
+			if (!inspector_probe_initialized) load_probe_editor();
+			const auto config = Probe::GetProbeConfig();
+			const auto generation = ShaderRecompiler::ProbeConfigGeneration();
+			ImGui::Text("PROBE: %s", Probe::GetProbeConfigFilePath());
+			ImGui::Text("active generation=%u hash=0x%016" PRIx64 " pc=0x%x taps=%zu",
+			            generation, config->hash, config->store_pc, config->taps.size());
+			if (config->hash != 0) {
+				const auto translated_generation = InspectorShaderProbeGeneration(config->hash);
+				if (translated_generation == generation && generation != 0) {
+					ImGui::TextColored({0.3f, 1.0f, 0.4f, 1.0f},
+					                   "target shader translated for generation %u", generation);
+				} else {
+					ImGui::TextColored({1.0f, 0.72f, 0.2f, 1.0f},
+					                   "waiting for target dispatch/retranslation (compiled generation %u)",
+					                   translated_generation);
+				}
+			}
+			ImGui::InputTextMultiline("##ProbeEditor", inspector_probe_text.data(),
+			                          inspector_probe_text.size(), {0.0f, 145.0f},
+			                          ImGuiInputTextFlags_AllowTabInput);
+			if (ImGui::Button("Apply PROBE file")) {
+				std::string error;
+				if (Probe::WriteProbeConfigText(inspector_probe_text.data(), &error)) {
+					inspector_status = "PROBE written without BOM; waiting for reload and target dispatch";
+				} else {
+					inspector_status = "PROBE write failed: " + error;
+				}
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Reload editor")) {
+				load_probe_editor();
+				inspector_status = "reloaded editor from the authoritative PROBE state";
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Remove PROBE (revert to env)")) {
+				std::string error;
+				if (Probe::RemoveProbeConfigFile(&error)) {
+					inspector_probe_initialized = false;
+					inspector_status = "PROBE removed; waiting for reload to restore environment settings";
+				} else {
+					inspector_status = "PROBE remove failed: " + error;
+				}
+			}
+			ImGui::TextDisabled("Keys: hash, pc, vgpr, tap, mark, markx, execlo, execz. File/env state remains authoritative.");
 		}
 		ImGui::End();
 	}
@@ -1353,8 +1745,15 @@ struct SystemOverlay::Impl {
 	std::chrono::steady_clock::time_point last_frame;
 	InspectorFrame                        inspector_frame;
 	std::array<char, 32>                  inspector_filter {};
+	std::array<char, 4096>                inspector_probe_text {};
+	std::string                           inspector_status;
 	uint64_t                              inspector_waiting_frame = 0;
+	uint64_t                              selected_resource_address = 0;
+	uint64_t                              selected_resource_size = 0;
+	uint32_t                              selected_resource_image_id = 0;
+	uint32_t                              selected_resource_generation = 0;
 	uint32_t                              selected_operation = UINT32_MAX;
+	bool                                  inspector_probe_initialized = false;
 	bool                                  inspector_live = true;
 	bool                                  inspector_show_dispatches = true;
 	bool                                  inspector_show_draws = true;

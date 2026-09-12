@@ -1,6 +1,6 @@
 # UFC 5 / KytyPS5 ledger
 
-Last updated: 2026-09-12 session 9 — **THE P0 GPU DISPATCH/DRAW INSPECTOR IS BUILT AND MENU-VALIDATED.**
+Last updated: 2026-09-12 session 9 — **THE GPU INSPECTOR NOW DUMPS AND TRACES BLACK-RENDER DATA.**
 It records every real draw/dispatch in the current frame after resource resolution, numbers repeated
 dispatches of one shader, and shows guest addresses, texture-cache image ids, extents, actual Vulkan
 view formats and access flags. It is default-off behind `KYTY_DEBUG_PANEL=1`; F10 toggles it. Panel-on
@@ -796,6 +796,36 @@ The first two validation relaunches failed before Vulkan initialization with the
 the same binary then started normally. At diagnosis the machine had 18.9/31.9 GB physical RAM used
 but 31.8/46.6 GB committed; Firefox's 28 processes accounted for 8.1 GB private commit. Do not call
 this startup failure an emulator crash.
+
+**Session 9 extension — dump and black-render diagnosis tools.** The panel now exposes the existing
+headless machinery as controls without creating a parallel state path:
+
+- **Dump frame / exact hash / selected operation** writes paired human-readable `.txt` and
+  machine-readable `.json` snapshots. JSON keeps 64-bit values as hex strings, includes operation
+  order and every resolved binding, and reports exact-address image aliases. The same writer is used
+  by `DUMP_INSPECTOR`.
+- Selecting a resource builds an ordered producer/consumer timeline of every overlapping range in
+  the frame. Exact guest addresses that resolve to multiple `image_id.generation` values are called
+  out both in the panel and dumps. The panel can write the selected address to the authoritative
+  `TRACE_ADDRS` or one-shot `CLEAR_IMAGES` files.
+- A repeated-dispatch comparison shows every binding changed since the previous occurrence of the
+  same shader. This makes ping-pong outputs and per-pass constants explicit.
+- **Arm shader input capture** writes `CAPTURE_HASHES` plus `DUMP_INPUTS`. The trigger file may now
+  contain a decimal occurrence count; the panel writes the selected dispatch's observed total so a
+  two/eight-pass shader is not silently truncated to pass one.
+- The raw PROBE editor reads/writes/removes the same `PROBE` file (binary text, no BOM), shows the
+  active generation, and confirms when the target hash has actually been retranslated for it.
+
+**Extension proof:** release `ninja -j 4` build and `shader_cfg_tests` passed. A live filtered dump
+for `0x48b8d705615cffba` parsed successfully as JSON: frame 191 had 196 captured operations, eight
+matching dispatches, and zero drops. The final unfiltered writer captured frame 216 with 98/98
+operations, zero drops, and **nine exact-address image alias warnings** in both JSON and text. A live
+`DUMP_INPUTS=8` test logged exactly one `InputCapture: armed occurrences=8` and consumed the trigger;
+the first attempt found and fixed a Windows open-file deletion bug. A temporary PROBE advanced to
+generation 1 and forced the target CS to compile as shader id 183, then deletion restored env state.
+A validation-enabled panel run accumulated 82 `FrameProfile` windows with zero VUID/validation
+errors, device losses, or compile failures. Temporary `PROBE`, `CAPTURE_HASHES`, and `DUMP_INPUTS`
+control files were removed after testing.
 
 ### SUPERSEDED (session 8 refutes this by direct markers): BLOCK 4 OF THE UPSCALER NEVER EXECUTES
 

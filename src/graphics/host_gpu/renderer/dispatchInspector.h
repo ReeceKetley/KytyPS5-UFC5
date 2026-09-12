@@ -55,15 +55,27 @@ struct InspectorFrame {
 	uint32_t                        dropped_resources  = 0;
 };
 
+struct InspectorDumpResult {
+	bool        success = false;
+	std::string text_path;
+	std::string json_path;
+	std::string error;
+};
+
 // The whole recorder is inert unless KYTY_DEBUG_PANEL is set to a non-zero value.
 [[nodiscard]] bool           DispatchInspectorEnabled() noexcept;
 [[nodiscard]] InspectorStage CaptureInspectorStage(const PreparedBindings& bindings,
                                                    TextureCache&           texture_cache);
 void                         RecordInspectorOperation(uint64_t frame, InspectorOperation operation);
 [[nodiscard]] bool           GetDispatchInspectorFrame(InspectorFrame* frame);
+[[nodiscard]] InspectorDumpResult DumpDispatchInspectorFrame(const InspectorFrame& frame,
+                                                             uint64_t shader_filter = 0,
+                                                             int32_t operation_index = -1);
+void NoteInspectorShaderCompile(uint64_t shader_hash, uint32_t probe_generation);
+[[nodiscard]] uint32_t InspectorShaderProbeGeneration(uint64_t shader_hash);
 
 // Consumes D:/PS5/dumps/DUMP_INSPECTOR and writes the same snapshot shown by the panel to
-// dispatch-inspector-f<N>.txt. The optional file contents are a shader hash filter.
+// paired dispatch-inspector-f<N>.txt/.json files. Optional contents are a shader hash filter.
 void RefreshDispatchInspector();
 
 [[nodiscard]] const char* InspectorStageName(uint32_t stage) noexcept;

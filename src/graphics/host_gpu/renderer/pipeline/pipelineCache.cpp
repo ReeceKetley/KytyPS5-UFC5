@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/dispatchInspector.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -468,6 +469,7 @@ struct PipelineCache::ProgramCache {
 		    counts[static_cast<size_t>(ShaderType::Pixel)],
 		    counts[static_cast<size_t>(ShaderType::Compute)],
 		    counts[static_cast<size_t>(ShaderType::Mesh)]);
+		NoteInspectorShaderCompile(params.hash, lookup_key.probe_generation);
 		return permutation.handle;
 	}
 

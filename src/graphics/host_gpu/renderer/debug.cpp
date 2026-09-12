@@ -48,13 +48,27 @@ int CaptureShaderInputs(uint64_t hash, uint64_t frame) {
 	static uint64_t checked_frame = UINT64_MAX;
 	static uint64_t capture_frame = UINT64_MAX;
 	static bool armed = false;
+	static uint32_t capture_occurrences = std::max(occurrences, 1u);
 	std::scoped_lock guard {lock};
 	if (checked_frame != frame) {
 		checked_frame = frame;
 		std::error_code error;
-		if (std::filesystem::remove("D:/PS5/dumps/DUMP_INPUTS", error)) {
-			captured.clear();
-			armed = true;
+		const auto trigger_path = "D:/PS5/dumps/DUMP_INPUTS";
+		if (std::filesystem::exists(trigger_path, error)) {
+			std::string requested;
+			std::ifstream trigger {trigger_path};
+			std::getline(trigger, requested);
+			trigger.close();
+			char* end = nullptr;
+			const auto value = std::strtoul(requested.c_str(), &end, 10);
+			capture_occurrences = end != requested.c_str() && value != 0
+			                          ? static_cast<uint32_t>(value)
+			                          : std::max(occurrences, 1u);
+			if (std::filesystem::remove(trigger_path, error)) {
+				captured.clear();
+				armed = true;
+				LOGF("InputCapture: armed occurrences=%u\n", capture_occurrences);
+			}
 		}
 	}
 	if (after_hash != 0) {
@@ -71,7 +85,7 @@ int CaptureShaderInputs(uint64_t hash, uint64_t frame) {
 		if (AnyCapturedShaderHash() && !IsCapturedShaderHash(hash)) return -1;
 	}
 	const auto seen = captured[hash]++;
-	return seen < occurrences ? static_cast<int>(seen) : -1;
+	return seen < capture_occurrences ? static_cast<int>(seen) : -1;
 }
 
 // The watch list is read on every image and buffer binding - tens of thousands of calls per

@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fmt/format.h>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -186,6 +187,71 @@ uint32_t ProbeConfig::ScratchVectorLimit() const {
 std::shared_ptr<const ProbeConfig> GetProbeConfig() {
 	std::scoped_lock guard {ConfigLock()};
 	return CurrentConfig();
+}
+
+const char* GetProbeConfigFilePath() { return ProbeFilePath(); }
+
+std::string GetProbeConfigText() {
+	std::ifstream file {ProbeFilePath(), std::ios::binary};
+	if (file) {
+		std::string text;
+		std::getline(file, text, '\0');
+		return text;
+	}
+
+	const auto config = GetProbeConfig();
+	std::string text = fmt::format("hash={:016x}\npc={:x}\nvgpr={},{},{},{}\n", config->hash,
+	                               config->store_pc, config->vgpr[0], config->vgpr[1],
+	                               config->vgpr[2], config->vgpr[3]);
+	auto append_taps = [&](const char* key, ProbeTap::Kind kind, bool masked) {
+		bool first = true;
+		for (const auto& tap: config->taps) {
+			if (tap.kind != kind || tap.masked != masked) continue;
+			text += first ? fmt::format("{}=", key) : ",";
+			text += kind == ProbeTap::Kind::Copy ? fmt::format("{:x}:{}:{}", tap.pc, tap.src, tap.dst)
+			                                    : fmt::format("{:x}:{}", tap.pc, tap.dst);
+			first = false;
+		}
+		if (!first) text += '\n';
+	};
+	append_taps("tap", ProbeTap::Kind::Copy, false);
+	append_taps("mark", ProbeTap::Kind::Marker, false);
+	append_taps("markx", ProbeTap::Kind::Marker, true);
+	append_taps("execlo", ProbeTap::Kind::ExecLo, false);
+	append_taps("execz", ProbeTap::Kind::ExecZ, false);
+	return text;
+}
+
+bool WriteProbeConfigText(std::string_view text, std::string* error) {
+	std::error_code ec;
+	const std::filesystem::path path {ProbeFilePath()};
+	if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), ec);
+	if (ec) {
+		if (error != nullptr) *error = fmt::format("could not create PROBE directory: {}", ec.message());
+		return false;
+	}
+	std::ofstream file {path, std::ios::binary | std::ios::trunc};
+	if (!file) {
+		if (error != nullptr) *error = fmt::format("could not open {}", path.string());
+		return false;
+	}
+	file.write(text.data(), static_cast<std::streamsize>(text.size()));
+	file.close();
+	if (!file.good()) {
+		if (error != nullptr) *error = fmt::format("could not finish writing {}", path.string());
+		return false;
+	}
+	return true;
+}
+
+bool RemoveProbeConfigFile(std::string* error) {
+	std::error_code ec;
+	std::filesystem::remove(ProbeFilePath(), ec);
+	if (ec) {
+		if (error != nullptr) *error = fmt::format("could not remove PROBE: {}", ec.message());
+		return false;
+	}
+	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

@@ -5,6 +5,8 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -56,5 +58,12 @@ struct ProbeConfig {
 // A snapshot, stable for as long as the caller holds it. Take it once per Translator rather than
 // per instruction; a reload swaps the pointer and leaves existing readers on the old snapshot.
 std::shared_ptr<const ProbeConfig> GetProbeConfig();
+
+// File-backed controls used by the diagnostic panel. The PROBE file remains authoritative: the
+// panel only edits or removes the same file that headless tooling uses.
+[[nodiscard]] const char* GetProbeConfigFilePath();
+[[nodiscard]] std::string GetProbeConfigText();
+bool WriteProbeConfigText(std::string_view text, std::string* error);
+bool RemoveProbeConfigFile(std::string* error);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend
