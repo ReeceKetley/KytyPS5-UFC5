@@ -883,6 +883,62 @@ block 4 executing, but the **uniformity** in it was never the part that was wron
 The survivor geometry in point 5 is a real measurement and stands; only the interpretation hung on it
 is withdrawn.
 
+**7. POINT 6 WAS ALSO TOO AGGRESSIVE. THERE *IS* A TRANSITION, AND IT IS THE FIGHT'S RENDER-TARGET
+REALLOCATION. THE UPSCALER CANNOT COLD-START FROM A ZEROED HISTORY. REPLICATED IN TWO RUNS.**
+
+Point 6 concluded "the history was never clean" from the archived captures. **Every one of those
+captures was taken after the reallocation**, i.e. already in the fight — which is why they all looked
+degenerate. Two fresh instrumented runs (2026-09-13, `dumps/run1-walkout-*`, `dumps/run2-walkout-*`,
+150 history captures) show the actual sequence:
+```
+run 1                                      run 2
+f1260 @11a4800000  ch0 15834 distinct      f862 @11a5800000  ch0 23310 distinct
+f1266 @11a4800000  ch0 12598 distinct      f876 @11a5800000  ch0  1329 distinct
+                   ALL FOUR HEALTHY                          ALL FOUR HEALTHY   [walkout]
+        ---------------- fight begins, render targets reallocated ----------------
+f1339 @12c2000000  all four ALL ZERO       f944 @12a2000000  all four ALL ZERO   [fresh alloc]
+f1340 @12c3000000  0 / -65504 / +65504     f945 @12a4800000  all four ALL ZERO
+f1343 @12c3000000  ch0-2 100% NaN          f948 @12a4800000  ch0-2 100% NaN      [dead]
+```
+Healthy -> zero-filled on reallocation -> dead within 3-4 frames. **Twice, at four different
+addresses, in runs whose walkouts looked completely different on screen.** Deterministic, not seeded.
+
+**THE UPSCALER WORKS.** During the walkout all four channels carry 12,000-27,000 distinct values.
+This is not a broken shader. It is a shader that cannot bootstrap.
+
+This also explains the user-visible variability: the walkout runs on the **old, pre-fight** history,
+so how good it looks depends on what that history holds. Run 1's red/white washout was very likely
+photographed at or just after the reallocation, not mid-walkout, which is why its appearance
+disagreed with its (healthy) capture numbers.
+
+Menu-era captures on the pre-fight allocation are degenerate (ch0=0, ch1=-2^-17, ch2=+2^-16) simply
+because the menu does not drive the upscaler with a real scene; the same allocation goes healthy the
+moment the walkout starts.
+
+**NEXT, AND IT NEEDS NO NAVIGATION:** feed the shader an all-zero history through
+`tests/ShaderRecompilerComputeTests.cpp` (raw RDNA2 code + real GPU readback) and see whether one
+dispatch produces NaN. That either confirms the cold-start failure outright or kills it, and it
+becomes a permanent regression test either way.
+
+**HYPOTHESIS, DECLARED AND NOT ADOPTED.** `run_ufc5.ps1` skips CS `0xea0aceac518ec52d` (wave64,
+TDRs on the RTX 3070) and its own comment says "Skipping it is why the fight round renders BLACK".
+The unification would be: the skipped occlusion CS is what should write into the freshly-allocated
+targets; without it they stay zero; the upscaler cannot bootstrap from zero; NaN; black round. That
+would make one cause of all of it. **Session 5 proposed a version of this and it was withdrawn** -
+treat it as a hypothesis and test it, do not adopt it because it is tidy.
+
+**NEGATIVE RESULT — the on-screen green/red speckle is NOT the history.** The user's screenshots show
+a fine dotted lattice in hard-edged rectangular regions that persists into the match. Tested the NaN
+mask for lattice structure: exactly 50/50 on `x&1`, `y&1`, `(x+y)&1` and 25/25/25/25 on `x&3`, `y&3`
+— perfectly uniform, no checkerboard. The speckle comes from a different buffer. Note the ledger
+already records "walkout-floor speckle" (see the mip-clamp entry) and the rainbow skin (issue 4b) as
+separate symptoms with a suspected shared root in the stubbed occlusion CS. **Three distinct
+symptoms — do not conflate them.**
+
+Tooling added: `tools/capture_walkin.ps1` (fires DUMP_INPUTS on a cadence so a walk-in needs no
+keyboard; writes the occurrence count into the trigger file, which removes the
+`KYTY_CAPTURE_OCCURRENCES` footgun entirely), `tools/history_content.py`, `tools/nan_seed.py`.
+
 ### SESSION 8 (2026-09-12) — BLOCK 4 **DOES** EXECUTE. 7c WITHDRAWN. THE PROBE WAS READING TWO PASSES AT ONCE.
 
 **THE MEASUREMENT DEFECT, AND IT INVALIDATES EVERY PROBE NUMBER IN SESSION 7.**
