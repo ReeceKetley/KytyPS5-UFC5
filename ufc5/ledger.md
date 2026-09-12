@@ -741,6 +741,107 @@ within two, from mixed passes). With block 4 skipped under NaN, the fresh-colour
 look at what block 2 puts in `v29/v30/v31` from the history sample and at the first frame after a
 clear. Probe through `0x16c4` so the loop stays real.
 
+### SESSION 12 (2026-09-13) — THE DECODE IS CONFIRMED BY A SECOND TRANSLATOR, AND THE THIRD DEAD CHANNEL IS **v36**
+
+No navigation spent. Everything here is offline, from a cross-check against **SharpEmu**
+(`D:\PS5\src\sharpemu`, an independent C# PS5 emulator with its own gfx10 decoder). The point of
+keeping both emulators is that they are not behind in the same places — where one is blind the other
+usually is not.
+
+**1. KYTY'S DECODE OF `CS 0xe17349e0d437757b` IS CORRECT. This retires the standing caveat that the
+RDNA2 block structure was one person's reading.**
+
+`SharpEmu.Tools.ShaderDump --inspect <shader.bin>` runs raw Gen5 words through SharpEmu's real
+decode pipeline. It stopped at `unknown-vop1 op=0x54`; SharpEmu's VOP1 table has **no f16 family at
+all**. Our shader's only VOP1 f16 op is `V_RCP_F16`, so one line unblocked the whole thing
+(`Gen5ShaderTranslator.cs:950`, `0x54 => "VRcpF16"`, **uncommitted local edit**, no open upstream PR
+covers it — #784 explicitly does not add individual opcodes).
+
+Against `shader-dumps/hang_cs/CS_e17349e0d437757b.rdna2`:
+```
+instruction boundaries   969 vs 969, ZERO disagreements
+opcode names             858/969 exact; all 111 mismatches explained
+```
+The boundary result is the important one: a decode-length bug garbles everything after it, and there
+is none. The 111 name mismatches are `V_MAD_MIXLO/HI_F16`->`VFmaMixlo/hiF16` (94, gfx9 vs gfx10
+naming for the same op), `V_ADD_NC_U32`->`VAddI32` (6, naming era), `V_FMA_F32`->`VFmaMixF32` (3, see
+below) and `V_MIN3/MAX3_F16`->`Vop3Raw351/354` (8, SharpEmu gaps — Kyty is ahead).
+
+**2. THE THIRD DEAD CHANNEL IS `v36`. The ledger has only ever tracked v29/v30.**
+```
+0x16F0  v0 = v1 * v36
+0x16F4  v2 = v1 * v30
+0x16F8  v1 = v1 * v29
+0x16FC  IMAGE_STORE dmask=0xf, data=v0..v3
+```
+`v3` is never touched at the store — **that is why channel 3 is the clean one**. The three dead
+channels are v36, v30, v29. **v36 has never been measured.** Measure it next to v29/v30: if v36 is
+not NaN where they are, the "three channels, one cause" story is wrong.
+
+All three converge on `V_MAC_F32 <reg>, X, v2` at `0x166c`/`0x1670`/`0x1674`, and before that on
+adds involving `v31` at `0x15c8`/`0x15cc`/`0x15d0`.
+
+**3. NEGATIVE RESULT — the shared multiplier `v2` is not it.** The three MACs above share `v2`, which
+would explain "three dead, one clean" from a single register. `v2` traces to `0x1630 V_RCP_F32 v2,
+v5` -> `0x164c V_MUL_F32 v2, v2, v33` — **already on the do-not-redo list**, measured at 0.013..1.0,
+0% NaN. Hypothesis dead before it cost anything. The list worked exactly as intended.
+
+**4. WITHDRAWN, same session: "Kyty's dump hides the mix ops."** It prints `.opsel(...)` on the three
+VOP3P mix-F32 at `0x7ec`/`0x7fc`/`0x804`, which distinguishes them from the genuine VOP3 `V_FMA_F32`
+at `0xa98`. The dump is not misleading here.
+
+**Reusable:** the `--inspect` path now works on any `.bin` in `shader-dumps/` at near-zero cost. Full
+disassembly kept at `scratchpad/sharpemu_disasm.txt`.
+
+**5. THE SURVIVING PIXELS ARE AN EDGE BAND, AND THE EDGE MOVES. THE NaN SPREADS SPATIALLY.**
+
+Pure offline analysis of `input-...-i3-*.bin` already on disk (binding i3, `actual_vk=97` =
+`R16G16B16A16_SFLOAT`, 1600x900, verified from `CaptureBinding`, not assumed). No navigation spent.
+
+MEASURED — interior survivors (outer 1px border excluded), non-NaN in ch0:
+```
+frame  pass  alive    x percentiles 1/25/50/99      where
+ 3907   p0    2020    1 / 1 / 2 / 864               LEFT edge
+ 3907   p1    3300    1 / 1 / 2 / 875               LEFT edge
+ 5507   p0   11690    1 / 4 / 7 / 1598              LEFT edge
+ 5528   p1     812    1597 / 1598 / 1598 / 1598     RIGHT edge
+ 5534   p0    6116    1375 / 1593 / 1595 / 1598     RIGHT edge
+ 5534   p1    4753    1410 / 1594 / 1596 / 1598     RIGHT edge
+```
+In f5534 p1 the right band is near-solid at x=1596..1598 (~898/900 per column) and decays inward
+(1595:623, 1594:572, 1593:290, 1592:173, 1591:95, 1590:17) with **zero interior survivors anywhere
+left of x=1300**. The survivors are never interior — always a band hugging one edge.
+
+INTERPRETATION (not yet measured): these are the pixels whose history reprojection lands outside the
+history image, so the history sample is rejected, block 4's fresh-colour path runs, and the pixel
+comes out clean. Which edge survives should then depend on camera motion direction that frame —
+which matches the left/right flip above.
+
+**WHY THIS MATTERS MORE THAN THE GEOMETRY.** If NaN re-enters through the history sample, it spreads
+spatially frame over frame, and the only pixels that recover are the disocclusion band at the
+leading edge. **So the injection event only ever had to corrupt ONE pixel, ONCE.** Every hunt so far
+has looked for a mechanism that could NaN 99.5% of pixels, and has correctly rejected candidates for
+being too rare. That filter was wrong. A mechanism that fires on one pixel in one frame is now
+sufficient and should be treated as a live candidate.
+
+Corroborating: **f55 (menu-era) is 0.0000% NaN in all four channels, both passes.** The history does
+start clean and turn, so a transition exists.
+
+**Within-frame erosion:** f5534 p0 history 6116 interior survivors -> p1 history 4753. Overlap 4520,
+1596 lost, 233 gained. Net erosion in one pass step, with a small gain where reprojection newly went
+out of bounds.
+
+**ANOMALIES, PROVENANCE UNKNOWN — do not read into these before checking which experiment produced
+them** (several of these captures came from sessions that were firing `CLEAR_IMAGES`):
+- `f4075` both passes: ch0-2 **0%** NaN but ch3 **100%** NaN — the exact inverse channel pattern.
+  Possibly a different resource at that address; get `CaptureBinding` for that frame before using it.
+- `f4232/4319/4446/4563`: ch0 exactly **100.0000%** NaN, zero survivors, while ch3 stays healthy.
+- `f5341` and `f5361`: both passes **0%** NaN — fully clean mid-series.
+
+Tooling: `scratchpad/nanmap.py`, `nanmap2.py`, `nanmap3.py`, `series.py`. **Decode half data with
+`.view(np.float16)`, never `.astype`** — astype converts the integer value and silently produces a
+clean-looking, entirely wrong result (cost one iteration here).
+
 ### SESSION 8 (2026-09-12) — BLOCK 4 **DOES** EXECUTE. 7c WITHDRAWN. THE PROBE WAS READING TWO PASSES AT ONCE.
 
 **THE MEASUREMENT DEFECT, AND IT INVALIDATES EVERY PROBE NUMBER IN SESSION 7.**
