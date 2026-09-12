@@ -707,6 +707,34 @@ input one frame later, and `v5`/`v29` read back as the probe's own NaN. **Probe 
 control. Taps must also be at a pc **before** the hijacked store, or they have not run when it
 executes.
 
+**8. THE GUEST'S DIVIDE-BY-ZERO GUARD IS NOT LEAKING — HYPOTHESIS TESTED AND DEAD.** Block 4
+deliberately computes an unguarded reciprocal and masks the result:
+`0x1500 V_RCP_F32 v13, v12.abs` -> `0x1554 V_MAD_F32 v9, v9.abs, v13, v10` (Inf, or NaN when
+`v9 == 0`) -> `0x1520 V_CMP_NEQ_F32 s3, 0, v12` + `0x156c V_CNDMASK_B32 v9, v10, v9, s3` discards it.
+A leak there would fit every symptom, including why the culprit hides (block 4 stops running once
+NaN exists). **It does not leak.** Probing `v9` immediately before (`0x156c`) and after (`0x1580`)
+the select, on every frame where the block-4 entry marker fired:
+```
+v9 before cndmask   0.496094    0% NaN   0% Inf
+v9 after  cndmask   0.492188    0% NaN   0% Inf
+```
+Consistent across both passes and five sampled frames plus four post-clear frames. **Wherever block 4
+executes, the guarded region is finite.**
+
+**9. TWO QUANTITATIVE SURPRISES FROM THAT RUN.**
+- **In steady state block 4 runs on 0.02-0.07% of pixels**, not zero and not many — consistent with
+  the NaN lock, and it means a marker reading of "0%" and "0.02%" are different states worth
+  distinguishing.
+- **Clearing the history does NOT restore a healthy frame.** One frame after clearing both halves,
+  block 4 ran on only **5.57%** of pixels. A zeroed history is a *degenerate* state, not a clean one:
+  with `v29/v30/v31 = 0` the block-3 differences that feed the entry compares are mostly zero too, so
+  the compares stay false. **Session 7's clear experiment therefore never demonstrated "one clean
+  frame" in the sense it was read as.** Design any future clear experiment around this.
+- Caution on the readout format: through `0x16c4` these values came back as **2 distinct values per
+  channel**. `B10G11R11` has a ~6-bit mantissa and crushes real data. It is fine for boolean
+  questions (is it NaN / Inf / zero) and useless for value bisection. Use the f16 store for values,
+  accepting the history poisoning, or ask only boolean questions here.
+
 **NEXT.** The origin question is now narrow: with the history authentic, what injects the first NaN?
 Redo session 7's `CLEAR_IMAGES` experiment **per pass** (it reported one clean frame then NaN back
 within two, from mixed passes). With block 4 skipped under NaN, the fresh-colour path never runs, so
