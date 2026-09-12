@@ -481,10 +481,33 @@ Stage 2 was therefore a correctness requirement. **The CS's buffer 9 is 99.9% fu
 intermediate is 100% full** - the data is alive right up to the last step. Whatever wave64 is needed
 for, it is not this.
 
-**Fix direction:** resolving the compositor/scanout source for `0x1162c00000` must pick the image
-that matches the scene extent (or the most recently GPU-written one) rather than whichever twin
-`FindImageFromRange` happens to return. Same family as the documented depth-as-colour and A2R/A2B
-alias bugs.
+**REFINED, AND THE FIRST FIX DIRECTION WAS WRONG.** `0x1162c00000` is not "the scene address" - it
+is a **recycled scratch address** the game binds as at least five different resources in one frame:
+```
+CS buffer[4]   read-only   stride=4 records=182400            (raw buffer)
+CS texture[0]  33x33x33    fmt=50 type=10                     (3D colour-grading LUT)
+CS texture[0]  1920x1080   fmt=22
+CS texture[0]  1920x1080   fmt=36  (read-only AND read-write)
+CS texture[0]  1600x900    fmt=36                             (the scene)
+draw targets   1600x900 and 400x225                           (the three fullscreen passes)
+```
+So the cache holds a *family* of images at one address and every consumer gets whichever one
+lookup returns. `FindImageFromRange`'s scoring (+4 size, +8 gpu-modified, +16 render-target,
++32 RGBA8) cannot distinguish a 33-cubed LUT from a 1600x900 scene, and the two scene-sized twins
+**tie at 24, so the winner is iteration order.** The fix is descriptor-exact resolution
+(extent + format + tile), not "prefer the bigger/newer twin".
+
+**THE PRESENTER IS INNOCENT - do not chase it.** `Presenter::PrepareFrame`'s `consider()` rejects
+any candidate under 1280x720, so it cannot pick the 400x225 twin, and its `0x1162c00000` fallback
+only runs when `!native_scanout`. In-fight the scanout IS GPU-written, so the presenter never
+consults that address; it presents the scanout (0x111a800000), which carries only the HUD (8.6%).
+
+**STILL UNPROVEN - this is the next measurement.** That the aliases exist and that resolution
+between them is arbitrary is established. That the *composite* reads the wrong one is NOT. The
+scanout is written by a compute dispatch binding `CS texture[3] read-write @0x111a800000
+1920x1080 fmt=50`, whose inputs include `0x1162c00000`. **Log which ImageId that dispatch binds
+for its 0x1162c00000 input and compare it against the 1600x900 scene image.** Same-id means the
+alias is not the bug and the composite is failing for another reason.
 
 **Tooling added (uncommitted):** `sceneDrawDebug.{h,cpp}` - lock-free per-draw id assignment, a
 one-frame armed capture (F2 twice), single-draw stepping (F3/F5), suppression toggle (F4), select
