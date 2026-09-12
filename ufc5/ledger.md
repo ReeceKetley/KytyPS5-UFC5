@@ -1,6 +1,14 @@
 # UFC 5 / KytyPS5 ledger
 
-Last updated: 2026-09-12 session 10 — **THE INSPECTOR CAN TRACE ONE GUEST RESOURCE THROUGH A FRAME.**
+Last updated: 2026-09-12 session 11 — **THE NaN COMES FIRST; BLOCK 4 BEING SKIPPED IS ITS EFFECT.**
+Block 4 is entered on three `V_CMP_LT_F32` compares, and an ordered compare against NaN is FALSE, so
+a NaN colour clears EXEC and skips the block. The real per-pass history is **99.7% NaN** in the three
+channels that share the `v1` multiplier and **0% NaN** in the fourth; `v29`/`v30` are already NaN
+before that multiplier is applied, and the unguarded reciprocal is innocent on clean data. The two
+dispatches are a **chain** — pass 1 reads what pass 0 just wrote, same frame. Read "session 11"
+before touching block 4 again; that thread is closed.
+
+Previously: 2026-09-12 session 10 — **THE INSPECTOR CAN TRACE ONE GUEST RESOURCE THROUGH A FRAME.**
 Hold a frame, filter `0x1163770000` (or any overlapping range), walk previous-writer / next-reader /
 next-writer, inspect inputs vs outputs, and arm a before+after dump of that exact operation. Alias
 warnings open an evidence-only inspector. CPU submit RIP is recorded from `AgcDriverSubmit*` return
@@ -624,6 +632,86 @@ Two known causes, both fixable: **the shader has two `IMAGE_STORE`s** (`0x16c4` 
 read; and **block 6 rewrites v29/v30 at `0x166c`/`0x1674` before the store**, so probing them there
 reads post-accumulate values, not the block-5 values. Fix: let the probe select a store index, and
 probe only registers block 6 does not overwrite.
+
+### SESSION 11 (2026-09-12) — THE NaN COMES FIRST AND BLOCK 4 SKIPPING IS ITS **EFFECT**. THE TWO PASSES ARE CHAINED.
+
+**Five probe configurations in ONE navigation, re-aimed live through `D:/PS5/dumps/PROBE`
+(generations 1-4, no restart).** That is the tooling from session 8 paying for itself; every number
+below would previously have cost a separate fight.
+
+**1. THE TWO DISPATCHES ARE A CHAIN, NOT A PAIR.** Straight from `CaptureBinding` with
+`KYTY_CAPTURE_OCCURRENCES=2`:
+```
+pass=0  reads 0x12a1800000   writes 0x12a2800000  (image_id 3064.2)
+pass=1  reads 0x12a2800000   writes 0x12a1800000  (image_id 2630.3)
+```
+**Pass 1 reads exactly what pass 0 just wrote, same frame, same image id.** The history is advanced
+twice per frame. Any measurement that does not say which pass it came from is averaging two
+different stages of one pipeline — which is what every session-7 number did.
+
+**2. THE REAL HISTORY, UNPROBED, PER PASS. Session 7's "37-41% NaN" is superseded.**
+```
+            NaN        the non-NaN remainder
+ch0      99.70%        exactly 0        (1 distinct value)
+ch1      99.70%        exactly -65504   (1 distinct value)
+ch2      99.70%        exactly +65504   (1 distinct value)
+ch3       0.00%        3067 distinct, 0.502..4.0, mean 3.33   HEALTHY
+```
+Both passes agree (99.70% / 99.79%). **The surviving non-NaN pixels carry no per-pixel information
+at all** — one saturated constant per channel. This was measured with no probe running, so it is the
+shader's own output.
+
+**3. WHY THOSE THREE CHANNELS AND NOT THE FOURTH — and it is not what the ledger assumed.**
+```
+0x16ec V_MUL_F32 v1, v0, v1     <- shared multiplier
+0x16f0 V_MUL_F32 v0, v1, v36    -> ch0
+0x16f4 V_MUL_F32 v2, v1, v30    -> ch2
+0x16f8 V_MUL_F32 v1, v1, v29    -> ch1
+       (ch3 = v3, which never touches v1)
+```
+The three corrupt channels are exactly the three multiplied by `v1`. **But the multiplier is a
+victim, not the cause:** with the history left authentic, `v29` and `v30` are **already NaN at
+100%** by `0x16b8`, and `v5 = 1 - max3(v30,v36,v29)` is NaN as a consequence.
+
+**4. THE UNGUARDED RECIPROCAL IS INNOCENT — re-confirmed on clean per-pass data.** The old proof
+rested on a pass-mixed reading and had to be redone:
+```
+v5 (rcp input, = v33+v87)  179-185 distinct   0.156 .. 12     0% NaN, never 0
+v2 (rcp product)           345-355 distinct   0.013 .. 1.0    0% NaN
+```
+`0x1630 V_RCP_F32 v2, v5` cannot be producing this. Nor can the `0x166c` MAC — `v2` is clean and
+`v29` is already NaN going in.
+
+**5. `v4` IS ZERO EVERYWHERE, AND THAT IS FINE.** `0x15fc IMAGE_LOAD v4` (texel 0,0, dmask=0x1)
+reads **0 on 100% of pixels** in both passes. The guest guards it — `0x16dc V_CMP_EQ_F32 vcc, 0, v4`
++ `0x16e0 V_CNDMASK_B32 v1, v4, 1.0` substitutes 1.0 — so a zero there is expected, not a defect.
+
+**6. THE HEADLINE: BLOCK 4 IS SKIPPED *BECAUSE* OF THE NaN, NOT THE OTHER WAY ROUND.**
+Block 4 is entered on `V_CMP_LT_F32 vcc, 0, v13` / `v15` / `v2` OR'd together. **All three compares
+are FALSE when their operand is NaN** — that is IEEE ordered-compare semantics, faithfully
+implemented — so `vcc` is zero, `S_AND_SAVEEXEC` clears EXEC, and `S_CBRANCH_EXECZ` skips block 4.
+Measured both ways within this session: the block-4 entry marker read **1.0 on 100%** of pixels in
+one frame and **0 on 100%** in another, tracking how much of the frame is NaN.
+**This closes the thread sessions 7c and 8 were both pulling on.** Block-4 execution is an effect.
+Session 7c's uniform registers, session 8's markers, and the whole
+`S_AND_SAVEEXEC -> EXEC -> structurizer` lead were all downstream of a NaN that arrives earlier.
+The loop is self-sustaining: NaN history -> compares false -> block 4 skipped -> `v29/v30/v31` keep
+their NaN history values -> stored -> NaN history.
+
+**7. METHOD — PROBING THE RGBA16F STORE POISONS THE THING IT MEASURES.** The probe at `0x16fc`
+writes into the ping-pong the shader samples as its own history, so the probe's output becomes its
+input one frame later, and `v5`/`v29` read back as the probe's own NaN. **Probe `0x16c4` instead**
+(the `B10G11R11` store): the RGBA16F history stays authentic. Cost: that format is **unsigned with
+~6-bit mantissa**, so negatives clamp to 0 and the sign is lost — a reading of exactly 0 there means
+"zero, negative, or never written", which is why a `mark` in the same block is mandatory as a
+control. Taps must also be at a pc **before** the hijacked store, or they have not run when it
+executes.
+
+**NEXT.** The origin question is now narrow: with the history authentic, what injects the first NaN?
+Redo session 7's `CLEAR_IMAGES` experiment **per pass** (it reported one clean frame then NaN back
+within two, from mixed passes). With block 4 skipped under NaN, the fresh-colour path never runs, so
+look at what block 2 puts in `v29/v30/v31` from the history sample and at the first frame after a
+clear. Probe through `0x16c4` so the loop stays real.
 
 ### SESSION 8 (2026-09-12) — BLOCK 4 **DOES** EXECUTE. 7c WITHDRAWN. THE PROBE WAS READING TWO PASSES AT ONCE.
 
