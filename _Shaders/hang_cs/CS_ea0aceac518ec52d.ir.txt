@@ -1,0 +1,50 @@
+CFG:
+entry_block=0 irreducible=0 unsupported=0 failure=None failure_block=4294967295
+block_0 pc=0x00000000 end=0x000000cc inst=[0,38)
+  predecessors=[] successors=[]
+  dominators=[0] post_dominators=[0]
+  terminator=4 condition=always true=4294967295 false=4294967295 merge=4294967295 continue=4294967295 loop_header=0 indirect_sgpr=4294967295 indirect_selector=4294967295 indirect_targets=[] selector_values=[] goto_variable=4294967295 goto_value=-1 dispatch_next=4294967295
+scc blocks=[0] entries=[] irreducible=0
+
+IR:
+mode=structured scratch_dwords=0
+Block $0 pc=0x00000000..0x00000000
+  %1     = GetUserData s48 (U32; uses=5)
+  %2     = GetUserData s49 (U32; uses=5)
+  %3     = GetUserData s50 (U32; uses=5)
+  %4     = GetUserData s51 (U32; uses=5)
+  %5     = GetBuiltin 0x0000000a, 0x00000000 (U32; uses=9)
+Block $1 pc=0x00000000..0x000000cc
+  %6     = IAdd32 %5, 0x00000064 (U32; uses=3)
+  %7     = ReadLane %6, 0x0000002f (U32; uses=1)
+  %8     = ShiftLeftLogical32 %5, 0x00000002 (U32; uses=1)
+  %9     = GetBufferResource %1, %2, %3, %4 (BufferResource; uses=1)
+          StoreBufferU32 %9, 0x00000000, %8, 0x00000000, %7, true (Void; uses=0)
+  %11    = BitwiseAnd32 0x0000003f, %5 (U32; uses=1)
+  %12    = IEqual32 0x00000028, %11 (U1; uses=2)
+  %13    = Ballot %12 (U32x4; uses=2)
+  %14    = CompositeExtractU32x4 %13, 0x00000000 (U32; uses=1)
+  %15    = CompositeExtractU32x4 %13, 0x00000001 (U32; uses=1)
+  %16    = ReadFirstLane %6, %12 (U32; uses=1)
+  %17    = IAdd32 %5, 0x00000080 (U32; uses=1)
+  %18    = ShiftLeftLogical32 %17, 0x00000002 (U32; uses=1)
+  %19    = GetBufferResource %1, %2, %3, %4 (BufferResource; uses=1)
+          StoreBufferU32 %19, 0x00000000, %18, 0x00000000, %16, true (Void; uses=0)
+  %21    = IAdd32 %5, 0x00000100 (U32; uses=1)
+  %22    = ShiftLeftLogical32 %21, 0x00000002 (U32; uses=1)
+  %23    = GetBufferResource %1, %2, %3, %4 (BufferResource; uses=1)
+          StoreBufferU32 %23, 0x00000000, %22, 0x00000000, %14, true (Void; uses=0)
+  %25    = IAdd32 %5, 0x00000180 (U32; uses=1)
+  %26    = ShiftLeftLogical32 %25, 0x00000002 (U32; uses=1)
+  %27    = GetBufferResource %1, %2, %3, %4 (BufferResource; uses=1)
+          StoreBufferU32 %27, 0x00000000, %26, 0x00000000, %15, true (Void; uses=0)
+  %29    = ShiftLeftLogical32 %5, 0x00000002 (U32; uses=1)
+          WriteSharedU32 %29, %6, true (Void; uses=0)
+          Barrier (Void; uses=0)
+  %32    = BitwiseXor32 0x00000040, %5 (U32; uses=1)
+  %33    = ShiftLeftLogical32 %32, 0x00000002 (U32; uses=1)
+  %34    = LoadSharedU32 %33, true (U32; uses=1)
+  %35    = IAdd32 %5, 0x00000200 (U32; uses=1)
+  %36    = ShiftLeftLogical32 %35, 0x00000002 (U32; uses=1)
+  %37    = GetBufferResource %1, %2, %3, %4 (BufferResource; uses=1)
+          StoreBufferU32 %37, 0x00000000, %36, 0x00000000, %34, true (Void; uses=0)

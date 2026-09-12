@@ -400,6 +400,12 @@ struct EmitterState {
 	uint32_t                   cull_distance_count                   = 0;
 	uint32_t                   depth_variable                        = 0;
 	uint32_t                   sample_mask_variable                  = 0;
+	uint32_t                   diagnostic_loop_cap_variable          = 0;
+	uint32_t                   diagnostic_loop_cap_header            = UINT32_MAX;
+	uint32_t                   diagnostic_loop_cap_preheader         = UINT32_MAX;
+	uint32_t                   diagnostic_loop_cap_latch             = UINT32_MAX;
+	uint32_t                   diagnostic_loop_cap_merge             = UINT32_MAX;
+	uint32_t                   diagnostic_loop_cap_iterations        = 0;
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;

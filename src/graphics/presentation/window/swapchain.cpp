@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -458,8 +459,23 @@ void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCac
 		// WatchedDrawTarget: if the draws write a different ImageId than the dump reads for the
 		// same guest address, the surface is aliased and the compositor is reading the wrong
 		// one - which is what a frozen dump alongside a live game would mean.
-		LOGF("DumpResolve: %s addr=0x%016" PRIx64 " img=%u\n", tag, address, id.index);
+		uint32_t draw_img        = UINT32_MAX;
+		uint32_t draw_generation = 0;
+		uint32_t draw_frame      = UINT32_MAX;
+		const bool tracked =
+		    GetTrackedDrawTarget(address, draw_img, draw_generation, draw_frame);
+		LOGF("DumpResolve: %s addr=0x%016" PRIx64
+		     " img=%u:%u draw_img=%u:%u draw_frame=%u dump_frame=%d tracked=%d\n",
+		     tag, address, id.index, id.generation, draw_img, draw_generation, draw_frame,
+		     renderer.GetGpu().GetFrameNum(), tracked ? 1 : 0);
 		DumpGpuImage(command, renderer, cache.GetImage(id), tag, address, true);
+		if (tracked && draw_frame == static_cast<uint32_t>(renderer.GetGpu().GetFrameNum()) &&
+		    (draw_img != id.index || draw_generation != id.generation)) {
+			const ImageId draw_id {draw_img, draw_generation};
+			char          draw_tag[40];
+			std::snprintf(draw_tag, sizeof(draw_tag), "%s-draw", tag);
+			DumpGpuImage(command, renderer, cache.GetImage(draw_id), draw_tag, address, true);
+		}
 	}
 }
 

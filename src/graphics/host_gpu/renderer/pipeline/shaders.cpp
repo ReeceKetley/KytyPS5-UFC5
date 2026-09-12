@@ -711,6 +711,7 @@ void CreatePipelineInternal(
 	    vk::DynamicState::eDepthCompareOp,
 	    vk::DynamicState::eDepthBiasEnable,
 	    vk::DynamicState::eDepthBias,
+	    vk::DynamicState::eStencilTestEnable,
 	    vk::DynamicState::eStencilCompareMask,
 	    vk::DynamicState::eStencilReference,
 	    vk::DynamicState::eStencilWriteMask,

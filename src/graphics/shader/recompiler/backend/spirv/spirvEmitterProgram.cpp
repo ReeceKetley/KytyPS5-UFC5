@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <unordered_map>
@@ -100,6 +101,56 @@ struct DispatcherFunctionState {
 	uint32_t                                      continue_label     = 0;
 	uint32_t                                      merge_label        = 0;
 };
+
+void ConfigureDiagnosticLoopCap(EmitterState& state, const IR::Program& program) {
+	constexpr uint64_t kUfcHangCsHash = 0xea0aceac518ec52dull;
+	if (program.shader_hash != kUfcHangCsHash || program.dispatcher_fallback) {
+		return;
+	}
+	const char* header_env = std::getenv("KYTY_WAVE64_LOOP_CAP_HEADER");
+	const char* count_env  = std::getenv("KYTY_WAVE64_LOOP_CAP");
+	if (header_env == nullptr || count_env == nullptr) {
+		return;
+	}
+	char*               header_end = nullptr;
+	char*               count_end  = nullptr;
+	const unsigned long header      = std::strtoul(header_env, &header_end, 0);
+	const unsigned long count       = std::strtoul(count_env, &count_end, 0);
+	if (header_end == header_env || count_end == count_env || header > UINT32_MAX || count == 0 ||
+	    count > UINT32_MAX) {
+		return;
+	}
+	const auto header_it = std::ranges::find_if(program.block_info, [&](const auto& info) {
+		return info.id == static_cast<uint32_t>(header) && info.terminator.loop_header;
+	});
+	if (header_it == program.block_info.end() || header_it->terminator.merge_block == UINT32_MAX) {
+		return;
+	}
+	const uint32_t merge     = header_it->terminator.merge_block;
+	uint32_t       preheader = UINT32_MAX;
+	uint32_t       latch     = UINT32_MAX;
+	for (const auto& info: program.block_info) {
+		if (info.terminator.kind != CFG::TerminatorKind::Branch ||
+		    info.terminator.true_block != header) {
+			continue;
+		}
+		if (info.id >= header && info.id < merge) {
+			latch = info.id;
+		} else {
+			preheader = info.id;
+		}
+	}
+	if (preheader == UINT32_MAX || latch == UINT32_MAX) {
+		return;
+	}
+	state.diagnostic_loop_cap_variable   = state.builder.AllocateId();
+	state.diagnostic_loop_cap_header     = static_cast<uint32_t>(header);
+	state.diagnostic_loop_cap_preheader  = preheader;
+	state.diagnostic_loop_cap_latch      = latch;
+	state.diagnostic_loop_cap_merge      = merge;
+	state.diagnostic_loop_cap_iterations = static_cast<uint32_t>(count);
+	state.builder.AddName(state.diagnostic_loop_cap_variable, "diagnostic_loop_cap_counter");
+}
 
 void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
                             const IR::Block* from, const IR::Block* to) {
@@ -239,6 +290,35 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			const auto* target = TargetBlock(ctx.program, term.true_block);
 			if (target == nullptr) {
 				EmitReturn(ctx);
+				return;
+			}
+			if (info.id == ctx.state.diagnostic_loop_cap_preheader &&
+			    term.true_block == ctx.state.diagnostic_loop_cap_header) {
+				ctx.state.builder.AddFunction(
+				    {OpStore, ctx.state.diagnostic_loop_cap_variable, ConstantU32(ctx.state, 0)});
+			}
+			if (info.id == ctx.state.diagnostic_loop_cap_latch &&
+			    term.true_block == ctx.state.diagnostic_loop_cap_header) {
+				const auto current = ctx.state.builder.AllocateId();
+				const auto next    = ctx.state.builder.AllocateId();
+				const auto repeat  = ctx.state.builder.AllocateId();
+				ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), current,
+				                               ctx.state.diagnostic_loop_cap_variable});
+				ctx.state.builder.AddFunction({OpIAdd, TypeU32(ctx.state), next, current,
+				                               ConstantU32(ctx.state, 1)});
+				ctx.state.builder.AddFunction(
+				    {OpStore, ctx.state.diagnostic_loop_cap_variable, next});
+				ctx.state.builder.AddFunction(
+				    {OpULessThan, TypeBool(ctx.state), repeat, next,
+				     ConstantU32(ctx.state, ctx.state.diagnostic_loop_cap_iterations)});
+				const auto* merge =
+				    TargetBlock(ctx.program, ctx.state.diagnostic_loop_cap_merge);
+				if (merge == nullptr) {
+					EmitReturn(ctx);
+				} else {
+					ctx.state.builder.AddFunction({OpBranchConditional, repeat, ctx.Label(target),
+					                               ctx.Label(merge)});
+				}
 				return;
 			}
 			emit_merge();
@@ -756,6 +836,7 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 		ctx.labels.emplace(block, label);
 		high.labels.emplace(block, label);
 	}
+	ConfigureDiagnosticLoopCap(state, program);
 	if (state.program.dispatcher_fallback) {
 		auto& dispatch = dispatcher.emplace();
 		for (const auto* block: program.blocks) {
@@ -852,6 +933,11 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 	                           state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                           FunctionControlNone, TypeFunction(state)});
 	EmitLabel(state, state.entry_label);
+	if (state.diagnostic_loop_cap_variable != 0) {
+		state.builder.AddFunction(
+		    {OpVariable, TypePointer(state, StorageClassFunction, TypeU32(state)),
+		     state.diagnostic_loop_cap_variable, StorageClassFunction});
+	}
 	if (state.requirements.function_lds) {
 		state.builder.AddFunction(
 		    {OpVariable, TypeU32ArrayPointer(state, StorageClassFunction, LdsDwordCount(state)),

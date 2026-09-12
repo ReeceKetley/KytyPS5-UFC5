@@ -1,0 +1,38 @@
+0x00000000: V_MOV_B32 v1, 0x00000064
+0x00000008: V_ADD_NC_U32 v1, v0, v1
+0x0000000c: V_READLANE_B32 s8, v1, 47
+0x00000014: V_MOV_B32 v30, s8
+0x00000018: V_LSHLREV_B32 v31, 2, v0
+0x0000001c: BUFFER_STORE_DWORD v30, v31, s48, 0 ; offset=0 offset2=0 dwords=1 bits=32 dfmt=0 nfmt=0 signed=0 typed=0 formatted=0 segment=0 gds=0 glc=0 slc=0 idxen=0 offen=1
+0x00000024: S_MOV_B64 s10, exec_lo
+0x00000028: V_AND_B32 v2, 63, v0
+0x0000002c: V_CMP_EQ_U32 vcc_lo, 40, v2
+0x00000030: S_MOV_B64 exec_lo, vcc_lo
+0x00000034: V_READFIRSTLANE_B32 s9, v1
+0x00000038: S_MOV_B64 exec_lo, s10
+0x0000003c: V_MOV_B32 v30, s9
+0x00000040: V_MOV_B32 v31, 0x00000080
+0x00000048: V_ADD_NC_U32 v31, v0, v31
+0x0000004c: V_LSHLREV_B32 v31, 2, v31
+0x00000050: BUFFER_STORE_DWORD v30, v31, s48, 0 ; offset=0 offset2=0 dwords=1 bits=32 dfmt=0 nfmt=0 signed=0 typed=0 formatted=0 segment=0 gds=0 glc=0 slc=0 idxen=0 offen=1
+0x00000058: V_MOV_B32 v30, vcc_lo
+0x0000005c: V_MOV_B32 v31, 0x00000100
+0x00000064: V_ADD_NC_U32 v31, v0, v31
+0x00000068: V_LSHLREV_B32 v31, 2, v31
+0x0000006c: BUFFER_STORE_DWORD v30, v31, s48, 0 ; offset=0 offset2=0 dwords=1 bits=32 dfmt=0 nfmt=0 signed=0 typed=0 formatted=0 segment=0 gds=0 glc=0 slc=0 idxen=0 offen=1
+0x00000074: V_MOV_B32 v30, vcc_hi
+0x00000078: V_MOV_B32 v31, 0x00000180
+0x00000080: V_ADD_NC_U32 v31, v0, v31
+0x00000084: V_LSHLREV_B32 v31, 2, v31
+0x00000088: BUFFER_STORE_DWORD v30, v31, s48, 0 ; offset=0 offset2=0 dwords=1 bits=32 dfmt=0 nfmt=0 signed=0 typed=0 formatted=0 segment=0 gds=0 glc=0 slc=0 idxen=0 offen=1
+0x00000090: V_LSHLREV_B32 v2, 2, v0
+0x00000094: DS_WRITE_B32 v0, v2, v1 ; offset=0 offset2=0 dwords=1 bits=32 dfmt=0 nfmt=0 signed=0 typed=0 formatted=0 segment=0 gds=0 glc=0 slc=0 idxen=0 offen=0
+0x0000009c: s_barrier
+0x000000a0: V_XOR_B32 v3, 64, v0
+0x000000a4: V_LSHLREV_B32 v3, 2, v3
+0x000000a8: DS_READ_B32 v4, v3 ; offset=0 offset2=0 dwords=1 bits=32 dfmt=0 nfmt=0 signed=0 typed=0 formatted=0 segment=0 gds=0 glc=0 slc=0 idxen=0 offen=0
+0x000000b0: V_MOV_B32 v31, 0x00000200
+0x000000b8: V_ADD_NC_U32 v31, v0, v31
+0x000000bc: V_LSHLREV_B32 v31, 2, v31
+0x000000c0: BUFFER_STORE_DWORD v4, v31, s48, 0 ; offset=0 offset2=0 dwords=1 bits=32 dfmt=0 nfmt=0 signed=0 typed=0 formatted=0 segment=0 gds=0 glc=0 slc=0 idxen=0 offen=1
+0x000000c8: s_endpgm

@@ -1,0 +1,6 @@
+entry_block=0 irreducible=0 unsupported=0 failure=None failure_block=4294967295
+block_0 pc=0x00000000 end=0x000000cc inst=[0,38)
+  predecessors=[] successors=[]
+  dominators=[0] post_dominators=[0]
+  terminator=4 condition=always true=4294967295 false=4294967295 merge=4294967295 continue=4294967295 loop_header=0 indirect_sgpr=4294967295 indirect_selector=4294967295 indirect_targets=[] selector_values=[] goto_variable=4294967295 goto_value=-1 dispatch_next=4294967295
+scc blocks=[0] entries=[] irreducible=0

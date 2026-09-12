@@ -590,6 +590,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	uint32_t group_cap = 0;
+	if (!indirect && !skip_cs && shader_hash == kUfcHangCsHash &&
+	    TryParseEnvU32("KYTY_GDS_GROUP_CAP", group_cap) && group_cap > 0 &&
+	    group_cap < thread_group_x) {
+		LOGF("GraphicsRenderDispatchDirect: GDS group cap hash=0x%016" PRIx64
+		     " groups_x=%u original=%u\n",
+		     shader_hash, group_cap, thread_group_x);
+		thread_group_x = group_cap;
+	}
+
 	// Zero group counts are a no-op on the GPU, so the indirect path needs no host check.
 	if (!indirect && (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0)) {
 		static std::atomic<uint32_t> log_count {0};
@@ -851,7 +861,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		if (limit_cap > 0) {
 			FillGdsDword(gds, 0, work_limit);
 		}
+		uint32_t sync_cap = 0;
+		const bool sync_capped_dispatch =
+		    !indirect && shader_hash == kUfcHangCsHash && limit_cap > 0 &&
+		    TryParseEnvU32("KYTY_GDS_SYNC_CAP", sync_cap) && sync_cap != 0;
+		const auto dispatch_t0 = std::chrono::steady_clock::now();
 		record_dispatch();
+		if (sync_capped_dispatch) {
+			m_context.GetCommandScheduler().Finish("gds-limit-cap");
+			const double dispatch_ms = std::chrono::duration<double, std::milli>(
+			                               std::chrono::steady_clock::now() - dispatch_t0)
+			                               .count();
+			LOGF("GraphicsRenderDispatchDirect: GDS capped dispatch done hash=0x%016" PRIx64
+			     " items=%u groups=%ux%ux%u ms=%.1f\n",
+			     shader_hash, work_limit, thread_group_x, thread_group_y, thread_group_z,
+			     dispatch_ms);
+		}
 	}
 }
 

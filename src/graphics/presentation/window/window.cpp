@@ -27,6 +27,7 @@
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/renderer/sceneDrawDebug.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -254,6 +255,41 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 			case SDLK_F1:
 				if (!key.repeat) {
 					RenderDocRequestCapture();
+				}
+				break;
+			// Live scene-draw isolation (see sceneDrawDebug.h). The scene colour target carries
+			// only ~10 draws per frame, so stepping one at a time beats a binary search.
+			// CAPTURE FIRST: draw ids are positional within a frame and order is not guaranteed
+			// stable between frames, so the list has to be frozen to mean anything.
+			// NOTE: F7 is taken (mouse-to-joystick, intercepted early in ProcessEvent).
+			case SDLK_F2:
+				if (!key.repeat) {
+					SceneDrawDebug::Capture();
+				}
+				break;
+			case SDLK_F3:
+				if (!key.repeat) {
+					SceneDrawDebug::NextDraw();
+				}
+				break;
+			case SDLK_F4:
+				if (!key.repeat) {
+					SceneDrawDebug::ToggleActive();
+				}
+				break;
+			case SDLK_F5:
+				if (!key.repeat) {
+					SceneDrawDebug::PrevDraw();
+				}
+				break;
+			case SDLK_F6:
+				if (!key.repeat) {
+					SceneDrawDebug::SelectAll();
+				}
+				break;
+			case SDLK_F10:
+				if (!key.repeat) {
+					SceneDrawDebug::ToggleMode();
 				}
 				break;
 			case SDLK_F11:

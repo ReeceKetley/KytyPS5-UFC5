@@ -68,6 +68,11 @@ bool CaptureShaderInputs(uint64_t hash, uint64_t frame) {
 			LOGF("InputCapture: begin frame=%" PRIu64 " after_hash=0x%016" PRIx64 "\n", frame, hash);
 		}
 		if (frame != capture_frame) return false;
+		// An after-hash capture used to dump every shader first seen later in the frame,
+		// which can consume the 512 MiB image budget before the small set under study.
+		// When an explicit hash list is supplied, use the after-hash only as the
+		// same-frame trigger and capture resources for that list.
+		if (!hashes.empty() && !hashes.contains(hash)) return false;
 	}
 	return captured.insert(hash).second;
 }

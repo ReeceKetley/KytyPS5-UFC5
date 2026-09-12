@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/sceneDrawDebug.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -44,9 +45,54 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+struct TrackedDrawTarget {
+	uint32_t image_index      = UINT32_MAX;
+	uint32_t image_generation = 0;
+	uint32_t frame_num        = UINT32_MAX;
+};
+
+std::mutex                                      g_tracked_draw_targets_lock;
+std::unordered_map<uint64_t, TrackedDrawTarget> g_tracked_draw_targets;
+
+bool ShouldTrackDrawTargets() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_TRACK_DRAW_TARGETS");
+		return env != nullptr && env[0] != '\0' && env[0] != '0';
+	}();
+	return enabled;
+}
+
+void TrackDrawTarget(uint64_t address, ImageId image_id, uint32_t frame_num) {
+	if (!ShouldTrackDrawTargets() || !image_id) {
+		return;
+	}
+	std::scoped_lock guard {g_tracked_draw_targets_lock};
+	g_tracked_draw_targets.insert_or_assign(address,
+	                                        TrackedDrawTarget {image_id.index,
+	                                                           image_id.generation, frame_num});
+}
+
+} // namespace
+
+bool GetTrackedDrawTarget(uint64_t address, uint32_t& image_index, uint32_t& image_generation,
+                          uint32_t& frame_num) {
+	std::scoped_lock guard {g_tracked_draw_targets_lock};
+	const auto       it = g_tracked_draw_targets.find(address);
+	if (it == g_tracked_draw_targets.end()) {
+		return false;
+	}
+	image_index      = it->second.image_index;
+	image_generation = it->second.image_generation;
+	frame_num        = it->second.frame_num;
+	return true;
+}
 
 int32_t ResolveVertexOffset(uint32_t index_offset, const ShaderVertexInputInfo& vs_input_info) {
 	if (index_offset != 0 || !vs_input_info.fetch_embedded) {
@@ -132,6 +178,34 @@ static bool ShouldSkipPixelShaderHash(uint64_t hash) {
 		return list;
 	}();
 	return !skipped.empty() && std::find(skipped.begin(), skipped.end(), hash) != skipped.end();
+}
+
+// Diagnostic only. When enabled, bypass depth rejection for the three watched UFC5 pixel
+// shaders on the frozen fight HDR target. This is deliberately narrower than a global depth
+// override: if the target starts changing, depth rejection is causal; if it stays frozen, the
+// remaining candidates are rasterization/clip, shader discard, and ineffective colour output.
+static bool ShouldForceWatchedDepthOff() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_WATCH_FORCE_DEPTH_OFF");
+		return env != nullptr && env[0] != '\0' && env[0] != '0';
+	}();
+	return enabled;
+}
+
+static bool ShouldCensusLargeDrawTargets() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_DRAW_TARGET_CENSUS");
+		return env != nullptr && env[0] != '\0' && env[0] != '0';
+	}();
+	return enabled;
+}
+
+static bool ShouldForceLargeTargetDepthOff() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_LARGE_TARGET_FORCE_DEPTH_OFF");
+		return env != nullptr && env[0] != '\0' && env[0] != '0';
+	}();
+	return enabled;
 }
 
 static float ConvertPolygonOffsetConstantFactor(float guest_factor, const HW::PolyOffset& offset,
@@ -437,6 +511,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
 	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
 	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
@@ -1284,6 +1359,88 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                      state.ps_input_info.stage.program != nullptr
 	                                  ? state.ps_input_info.stage.program->shader_hash
 	                                  : uint64_t {0};
+	if (ShouldTrackDrawTargets()) {
+		const auto frame_num = static_cast<uint32_t>(buffer.GetContext().GetGpu().GetFrameNum());
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			TrackDrawTarget(state.color_info[i].desc.info.data.address,
+			                state.color_info[i].image_id, frame_num);
+		}
+	}
+	const bool large_draw_target = state.color_count != 0 &&
+	    state.color_info[0].Extent().width >= 1280u &&
+	    state.color_info[0].Extent().height >= 720u;
+	if (large_draw_target && ShouldCensusLargeDrawTargets()) {
+		const auto frame_num = static_cast<uint32_t>(buffer.GetContext().GetGpu().GetFrameNum());
+		if ((frame_num % 30u) == 0u) {
+			static std::mutex census_lock;
+			static uint32_t census_frame = UINT32_MAX;
+			static std::unordered_set<uint64_t> census_seen;
+			std::scoped_lock guard {census_lock};
+			if (census_frame != frame_num) {
+				census_frame = frame_num;
+				census_seen.clear();
+			}
+			const auto& color = state.color_info[0];
+			const auto  key = draw_ps_hash ^ std::rotl(color.desc.info.data.address, 17);
+			if (census_seen.size() < 128 && census_seen.insert(key).second) {
+				const auto& depth = state.depth_info;
+				const auto& blend = buffer.GetRegisters().GetBlendControl(color.target_slot);
+				const auto  extent = color.Extent();
+				LOGF("LargeDrawTarget: frame=%u vs=0x%016" PRIx64 " ps=0x%016" PRIx64
+				     " addr=0x%016" PRIx64 " img=%u extent=%ux%u slot=%u"
+				     " depth_img=%u depth_addr=0x%016" PRIx64 " depth_fmt=%d"
+				     " depth_test=%d depth_write=%d depth_op=%d stencil=%d"
+				     " kill=%d color_mask=0x%x out_mode=%u blend=%d src=%u dst=%u comb=%u"
+				     " indices=%u instances=%u force_depth_off=%d\n",
+				     frame_num, draw_vs_hash, draw_ps_hash, color.desc.info.data.address,
+				     color.image_id.index, extent.width, extent.height, color.target_slot,
+				     depth.image_id.index, depth.desc.info.data.address,
+				     static_cast<int>(depth.desc.view_info.format),
+				     depth.depth_test_enable ? 1 : 0, depth.depth_write_enable ? 1 : 0,
+				     static_cast<int>(depth.depth_compare_op),
+				     depth.stencil_test_enable ? 1 : 0,
+				     state.ps_active && state.ps_input_info.ps_pixel_kill_enable ? 1 : 0,
+				     (buffer.GetRegisters().GetRenderTargetMask() >> (color.target_slot * 4u)) & 0xfu,
+				     state.ps_active ? state.ps_input_info.target_output_mode[color.target_slot] : 0u,
+				     blend.enable ? 1 : 0, blend.color_srcblend, blend.color_destblend,
+				     blend.color_comb_fcn, draw.index_count, draw.instance_count,
+				     ShouldForceLargeTargetDepthOff() ? 1 : 0);
+			}
+		}
+		if (ShouldForceLargeTargetDepthOff()) {
+			vk_buffer.setDepthTestEnable(VK_FALSE);
+			vk_buffer.setStencilTestEnable(VK_FALSE);
+		}
+	}
+	const bool watched_fight_target =
+	    draw_ps_hash != 0 && IsWatchedDrawPixelShader(draw_ps_hash) && state.color_count != 0 &&
+	    state.color_info[0].desc.info.data.address == 0x0000001168360000ull;
+	if (watched_fight_target) {
+		const auto frame_num = static_cast<uint32_t>(buffer.GetContext().GetGpu().GetFrameNum());
+		static std::atomic<uint32_t> last_state_frame {UINT32_MAX};
+		if ((frame_num % 30u) == 0u &&
+		    last_state_frame.exchange(frame_num, std::memory_order_relaxed) != frame_num) {
+			const auto& depth = state.depth_info;
+			const auto& blend = buffer.GetRegisters().GetBlendControl(0);
+			LOGF("WatchedDrawState: frame=%u ps=0x%016" PRIx64
+			     " depth_img=%u depth_addr=0x%016" PRIx64 " depth_fmt=%d"
+			     " depth_test=%d depth_write=%d depth_op=%d stencil=%d"
+			     " kill=%d color_mask=0x%08" PRIx32 " out_mode=%u"
+			     " blend=%d src=%u dst=%u comb=%u indices=%u instances=%u force_depth_off=%d\n",
+			     frame_num, draw_ps_hash, depth.image_id.index, depth.desc.info.data.address,
+			     static_cast<int>(depth.desc.view_info.format), depth.depth_test_enable ? 1 : 0,
+			     depth.depth_write_enable ? 1 : 0, static_cast<int>(depth.depth_compare_op),
+			     depth.stencil_test_enable ? 1 : 0,
+			     state.ps_input_info.ps_pixel_kill_enable ? 1 : 0,
+			     buffer.GetRegisters().GetRenderTargetMask(),
+			     state.ps_input_info.target_output_mode[0], blend.enable ? 1 : 0,
+			     blend.color_srcblend, blend.color_destblend, blend.color_comb_fcn,
+			     draw.index_count, draw.instance_count, ShouldForceWatchedDepthOff() ? 1 : 0);
+		}
+		if (ShouldForceWatchedDepthOff()) {
+			vk_buffer.setDepthTestEnable(VK_FALSE);
+		}
+	}
 	// Which colour target do the UFC5 pixel ubershaders actually draw into? Surface dumps show
 	// both dominant in-fight 1600x900 targets GPU-modified but containing EXACTLY zero, while
 	// GpuDraws shows these shaders costing 95-262us/draw - i.e. real per-pixel work. Those two
@@ -1311,9 +1468,49 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			     state.color_count, state.depth_info.image_id ? 1 : 0, targets.c_str());
 		}
 	}
+	// Live scene-draw bisector. See sceneDrawDebug.h: the fight round draws a black shape over
+	// the centre, and this finds which draw does it by binary search driven from host keys,
+	// instead of a rebuild-and-renavigate cycle per step.
+	bool scene_draw_skipped = false;
+	bool scene_draw_hidden  = false;
+	if (state.color_count > 0 && state.color_info[0].image_id &&
+	    state.color_info[0].desc.info.data.address == SceneDrawDebug::Target()) {
+		const auto& color0 = state.color_info[0];
+		const auto  ext    = color0.Extent();
+		SceneDrawDebug::Entry entry;
+		entry.vs_hash        = draw_vs_hash;
+		entry.ps_hash        = draw_ps_hash;
+		entry.index_count    = draw.index_count;
+		entry.instance_count = draw.instance_count;
+		entry.topology       = static_cast<uint32_t>(topology);
+		entry.target_width   = ext.width;
+		entry.target_height  = ext.height;
+		entry.image_id       = color0.image_id.index;
+		entry.depth_test     = state.depth_info.depth_test_enable;
+		entry.depth_write    = state.depth_info.depth_write_enable;
+		const auto id = SceneDrawDebug::NoteDraw(m_context.GetGpu().GetFrameNum(), entry);
+		if (SceneDrawDebug::ShouldSuppress(id)) {
+			// Skip drops the draw entirely, which also removes its depth writes. Hide keeps
+			// depth behaviour and only stops colour. The difference distinguishes "this draw
+			// paints the black" from "this draw's depth hides everything behind it".
+			if (SceneDrawDebug::CurrentMode() == SceneDrawDebug::Mode::Skip) {
+				scene_draw_skipped = true;
+			} else {
+				scene_draw_hidden = true;
+			}
+		}
+	}
+#if !defined(__APPLE__)
+	if (scene_draw_hidden && state.color_count != 0) {
+		// The pipeline already declares eColorWriteEnableEXT as dynamic state (shaders.cpp),
+		// so disabling colour writes needs no pipeline work.
+		vk::Bool32 disable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+		vk_buffer.setColorWriteEnableEXT(state.color_count, disable);
+	}
+#endif
 	GpuTimestamps::Instance().BeginDraw(vk_buffer, draw_vs_hash, draw_ps_hash);
 	// Bracket the skipped draw too, so GpuDraws still reports it - at ~0us instead of ~21000us.
-	if (!ShouldSkipPixelShaderHash(draw_ps_hash)) {
+	if (!ShouldSkipPixelShaderHash(draw_ps_hash) && !scene_draw_skipped) {
 		if (mesh_active) {
 			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 		} else {
@@ -1321,6 +1518,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	GpuTimestamps::Instance().EndDraw(vk_buffer);
+#if !defined(__APPLE__)
+	if (scene_draw_hidden && state.color_count != 0) {
+		// Restore the per-target write mask the next draw expects. Leaving colour writes off
+		// would silently hide every later draw in this render pass and make the bisection lie.
+		const auto& restore_ctx                          = buffer.GetRegisters();
+		vk::Bool32  restore[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			restore[i] = render_target_mask_slot(restore_ctx.GetRenderTargetMask(),
+			                                     state.color_info[i].target_slot) != 0
+			                 ? VK_TRUE
+			                 : VK_FALSE;
+		}
+		vk_buffer.setColorWriteEnableEXT(state.color_count, restore);
+	}
+#endif
 
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

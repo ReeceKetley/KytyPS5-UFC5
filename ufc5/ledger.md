@@ -1,13 +1,26 @@
 # UFC 5 / KytyPS5 ledger
 
-Last updated: 2026-09-11 session 4 — **THE FIGHT HDR TARGET IS FROZEN; IMAGE ALIASING IS RULED OUT.**
-In the actual fight round, the three pixel ubershaders bind `0x1168360000` as cache `ImageId 1356`, and
-the surface dump resolves that same address to the same `ImageId 1356`. Two dumps 224 frames apart are
-byte-identical (`SHA256 17A88E17...`) while `display`/`present` both change and the user can see the live
-blue/cyan edge and HUD. Therefore this is not a stale cache twin and not a frozen presentation path:
-the draws are issued against the right image but stop changing it after the walkout frame. Next split is
-depth rejection vs shader discard/no rasterized fragments vs ineffective colour output/blend. Wave64
-Stage 2 is still not justified by the black round until a dependency on the skipped occlusion CS is proven.
+Last updated: 2026-09-11 session 5 — **THE BLACK ROUND DIRECTLY CONSUMES OUTPUT FROM THE SKIPPED WAVE64 CS.**
+In actual-round frame 1073, CS `0xea0aceac518ec52d` declares `0x1163770000` as read-write buffer 9;
+immediately afterward PS `0x654607b31fe5f6d6` samples that same address as a 1600x900 HDR image. The
+captured input and its downstream output are the same nearly-solid-white image with identical SHA256.
+The round therefore needs the real structured CS output; a constant fill is already disproven.
+Wave64 support (or a faithful replacement for this shader) is again a correctness requirement. A naive
+`lane_count=1` implementation that joins two native subgroups with an LDS atomic-spin rendezvous is now
+ruled out: even a one-`V_READLANE` synthetic shader TDRs on the RTX 3070. Preserve the existing two-half
+lowering unless the replacement avoids cross-subgroup forward-progress dependencies.
+
+**ACTUAL-ROUND ONE-TILE TIMING (2026-09-12):** `KYTY_GDS_LIMIT_CAP=1` did not previously mean one
+workgroup; it still launched all 144. New hash-scoped `KYTY_GDS_GROUP_CAP=1` plus an immediate
+`KYTY_GDS_SYNC_CAP=1` finish isolated the real cost. Fifteen walkout/pre-round calls completed in
+0.8-1.0 ms (first warm call 3.3 ms), but the first actual-round call took **3426.0 ms** and device-lost
+at `debug_op=0` on `0xea0aceac518ec52d`. The user's visible transition and the log agree exactly.
+The same shader has a scene-data-dependent slow path; a single real-round work item exceeds TDR.
+Dispatch count, GDS chunking, and the 143 losing workgroups are not the root fix.
+
+Session 4's `N == M` conclusion is **withdrawn**: N was logged during the walkout, while M was dumped
+in the round after that target retired. The comparison was temporally mismatched and could not decide
+round aliasing or show that round draws still targeted `0x1168360000`. See sessions 4/5 below.
 
 Also this session: **IN-FIGHT 1.0 -> 5.0 FPS.** Two independent wins: the 3 pixel
 ubershaders now structurize on the Legacy path (1.0 -> 2.9), and `BufferCache` no longer garbage-collects
@@ -375,8 +388,9 @@ op0x24 IT_DRAW_INDIRECT         21   <- twenty-one
 The guest CPU issues essentially every draw itself. So "un-stub the occlusion CS and most draws disappear"
 is **an assumption, not a measurement** — it requires the guest's own draw decisions to depend on CS output
 it reads back, and the buffer sizes alone do not show that. The ledger's description of `buffer[9]`/
-`buffer[10]` as "indirect-draw data" is contradicted by 21 indirect draws per window. **Do not start
-multi-day wave64 Stage 2 work on this justification until the dependency is proven.**
+`buffer[10]` as "indirect-draw data" is contradicted by 21 indirect draws per window. **Session 5 later
+proved a different dependency:** buffer 9 is sampled directly as the HDR scene input. That justifies
+wave64 work for correctness, but still does not support an FPS win from reduced draw count.
 
 **THE REAL NUMBER IS ~138 us OF HOST CPU PER DRAW.** That is the anomaly: shadPS4 runs the same engine family
 at 30-58 fps on ONE core with no threaded rasterizer, so its per-draw cost must be single-digit us. Kyty is
@@ -408,7 +422,7 @@ your shell cannot silently change the run), and prints what it set.
 
 | setting | why |
 |---|---|
-| `KYTY_SKIP_CS_HASH=0xea0aceac518ec52d` | **Required to reach a fight at all.** The occlusion CS is wave64 and TDRs on a wave32-only RTX 3070. The round is black with it skipped, but the causal path is not yet proven. |
+| `KYTY_SKIP_CS_HASH=0xea0aceac518ec52d` | **Required to reach a fight at all.** The CS is wave64 and TDRs on a wave32-only RTX 3070. The black round directly samples its skipped buffer-9 output as the first HDR scene input (session 5). |
 | `KYTY_GPU_TIMESTAMPS` unset | Off by default: validation found unreset timestamp queries (UB). `frame_stats.py` uses `FrameProfile` and does not need them. |
 | `KYTY_SRT_LINEAR=1` | Flat SRT evaluator. `getprog` -31%; verified equivalent (0 mismatches / 573k calls). |
 | *(no env var)* | The two big wins are **in the code, always on**: the ubershader structurizer fix, and BufferCache no longer GC'ing against memory it does not own. |
@@ -437,7 +451,98 @@ one frame.
 and `graphics_debug_dump_enabled()` keys off it, so without it every counter is silently
 discarded and the log looks fine but contains no measurements. The script always passes it.
 
-### THE FIGHT HDR TARGET IS FROZEN; ALIASING RULED OUT (2026-09-11 session 4)
+### THE BLACK ROUND IS AN IMAGE ALIAS AT 0x1162c00000 (2026-09-12, session 6)
+
+**Two different cache images live at guest address `0x1162c00000`. The final scene pass writes the
+1600x900 one; the presenter reads the 400x225 one, which is empty.**
+
+Isolated with the live scene-draw stepper (F2 capture / F3 next / F4 toggle, `sceneDrawDebug.*`).
+Only **three** draws write that address, all fullscreen triangles (`idx=3`, no depth test or write),
+sharing one vertex shader:
+
+```
+id=0 vs=0x85ef53ced24014e7 ps=0x487864de9705a169 target=400x225   img=3366
+id=1 vs=0x85ef53ced24014e7 ps=0x5855add5c464dd25 target=400x225   img=3366
+id=2 vs=0x85ef53ced24014e7 ps=0x708f302a5ca890f0 target=1600x900  img=2239   <-- the scene
+VideoOut dump: rt62c00000 extent=400x225 nonzero=0/90000                     <-- what is presented
+```
+Suppressing id=2 replaces the black with raw uninitialised memory, so id=2 is what produces the
+final image; it also costs ~214us/draw, i.e. it is doing real work, not a no-op. Image ids differ
+between captures (images get recreated) but the shape is stable: two extents, one address.
+
+**The upstream chain is HEALTHY - this retires the occlusion-CS theory for the black round:**
+```
+0x1163770000  (CS buffer 9)  1068x600   nonzero 640,445/640,800  = 99.9%
+0x116d300000                 1600x900   nonzero 1,440,000/1,440,000 = 100%
+0x1162c00000  (final)        400x225    nonzero 0/90,000 = 0%
+```
+Session 5 concluded the round "directly consumes output from the skipped wave64 CS" and that wave64
+Stage 2 was therefore a correctness requirement. **The CS's buffer 9 is 99.9% full and the
+intermediate is 100% full** - the data is alive right up to the last step. Whatever wave64 is needed
+for, it is not this.
+
+**Fix direction:** resolving the compositor/scanout source for `0x1162c00000` must pick the image
+that matches the scene extent (or the most recently GPU-written one) rather than whichever twin
+`FindImageFromRange` happens to return. Same family as the documented depth-as-colour and A2R/A2B
+alias bugs.
+
+**Tooling added (uncommitted):** `sceneDrawDebug.{h,cpp}` - lock-free per-draw id assignment, a
+one-frame armed capture (F2 twice), single-draw stepping (F3/F5), suppression toggle (F4), select
+all (F6), and Skip vs Hide (F10; Hide disables colour writes only, via the `eColorWriteEnableEXT`
+dynamic state the pipeline already declares, so depth behaviour is preserved). `KYTY_CENSUS_TARGET`
+picks the address to bisect, `KYTY_DUMP_SURFACES` the addresses to dump. **Capture logs the full
+list to the log file** - relying on the console lost one result to a closed window.
+- **Do not take a lock per draw here.** The first version did, which on a target carrying thousands
+  of draws put a mutex on the GPU worker thread's hot path; ids are now atomic and the mutex is
+  only taken during the single armed frame.
+- F7 is unavailable: it is intercepted early in `ProcessEvent` for mouse-to-joystick.
+
+### SUPERSEDED (see the alias finding above): THE BLACK ROUND DIRECTLY CONSUMES OUTPUT FROM THE SKIPPED WAVE64 CS (2026-09-11 session 5)
+
+Targeted input capture finally connects the black round to compute shader
+`0xea0aceac518ec52d` without relying on a guessed render-target address. In actual-round frame 1073,
+the skipped dispatch declares:
+
+```
+CS buffer[9]:  read-write addr=0x1163770000 stride=4 records=4718592
+CS buffer[10]: read-write addr=0x116de10000 stride=4 records=9437184
+```
+
+Immediately afterward, fullscreen PS `0x654607b31fe5f6d6` binds `0x1163770000` as image 1, a
+1600x900 B10G11R11_UFLOAT input, and writes `0x116d300000`. The captured input and downstream output
+are visually the same nearly-solid-white image and have the **same SHA256**:
+`83C35FE2C2F3B0FD457AA06F2E2BB0F614AC2B6524538DFECC1D9231F1269BA4`.
+The next passes read `0x116d300000`, produce/read `0x1164650000`, and finally produce the black
+1600x900 `0x1162c00000` image under the live HUD.
+
+This restores a concrete justification for wave64 Stage 2: the game directly consumes a large buffer
+that this CS should write, but `KYTY_SKIP_CS_HASH` prevents those writes. This does **not** make the old
+constant-zero experiment a solution; zeroing the two output buffers stayed black and corrupted the HUD.
+The required result is the real structured CS output, not an arbitrary fill value.
+
+**FAILED, REVERTED — `lane_count=1` with an LDS atomic-spin bridge (2026-09-12).** The opt-in implementation
+mapped one GCN lane to one invocation and paired two native wave32 subgroups through per-wave LDS slots.
+It initialized the arrival counter at uniform function entry, published ballot/shuffle data, and tested
+both (a) one elected lane announcing then spinning and (b) all 32 lanes announcing and spinning together.
+`spirv-val` accepted the modules. A split-tagged 64-lane initialization-only GPU test passed exactly, but
+a minimal shader containing one cross-half `V_READLANE_B32` timed out and left its output buffer untouched
+under both rendezvous variants; the fuller lane/LDS test did the same. This is the Vulkan subgroup
+forward-progress hole in practice, not an uninitialized counter. The code and temporary tests were removed.
+Do not retry a spin-wait bridge between subgroups. Viable directions are optimising the existing two-half
+lowering, obtaining a true 64-wide subgroup on capable hardware, or a faithful hash-specific replacement.
+
+The same run also establishes that the 400x225 `0x1162c00000` view is intentionally bound as image 2
+by PS `0x811633d84dc57d64`; generic `FindImageFromRange` selecting it is not by itself an alias bug.
+For any future alias claim, trace the actual consumer binding as `CaptureBinding` does.
+
+### WITHDRAWN: THE FIGHT HDR TARGET IS FROZEN; ALIASING RULED OUT (2026-09-11 session 4)
+
+**Withdrawal:** `WatchedDrawTarget img=1356` was captured during the walkout/faceoff, while the later
+`DumpResolve img=1356` was taken in the actual round after that target's last write. The equality was
+temporally mismatched and therefore could not decide aliasing or prove that round draws still targeted
+`0x1168360000`. A large-target census shows that address retires at the transition; steady-state round
+frames use a different fullscreen chain. Depth and stencil forced off for all large round targets did
+not restore the scene.
 
 The actual fight-round A/B test resolves candidate **(B)**:
 
@@ -1303,7 +1408,7 @@ Goal: stop the wave64-on-wave32 emulation from being ~1000× too slow. Disassemb
 
 - **Occlusion-CS clear-to-zero stub (LANDED, `renderCompute.cpp`):** when `KYTY_SKIP_CS_HASH` matches, instead of dropping the dispatch, clear the CS's read-write images to 0 ("nothing occludes" — 0 is what the real shader IMAGE_STOREs into an empty tile; reverse-Z far plane). Logs `stubbing watched compute shader ... cleared_images=N`.
   - **Result: intro + pre-round corner scenes now RENDER** (octagon, crowd, cage, lighting, cornerman+bucket — full 3D). `display nonzero` 99.8%. No crash. ~1.2-1.7 fps. **This proves the whole engine works** — CFG fix + Stage 1 + depth-alias + PS-input fixes all compounding.
-  - **The actual fight round is still black.** The CS also writes two big read-write buffers — `buffer[9]` `0x1163920000` (4718592×4 = 18 MB), `buffer[10]` `0x1170776e00` (9437184×4 = 36 MB, exactly 2× buffer[9]) — visibility / indirect-draw data the fight round consumes. The stub leaves them stale → fight-scene draws culled → black. Sizes don't reveal the layout; filling blind risks a GPU hang (wrong value in an indirect-args buffer). Corner scene renders because it doesn't consume these.
+  - **The actual fight round is still black.** The CS also writes two big read-write buffers — `buffer[9]` (4718592×4 = 18 MB) and `buffer[10]` (9437184×4 = 36 MB, exactly 2× buffer[9]); their addresses rotate between runs. Session 5 traced buffer 9 directly into the next 1600x900 HDR fullscreen pass, so leaving it stale is causal. It is not merely visibility/indirect data, and filling it with zero is not sufficient.
 - **Stage 2 (TODO): `lane_count = 1`.** 256 GCN threads → 256 invocations (8 subgroups) instead of 128 scalar lane-pairs. Removes the `%X`/`%X+1` op duplication. Only 23 `lane_count` refs to audit (mostly `spirvEmitterProgram.cpp`/`Mesh`/`Module`); the `state.wave_size == 64` cross-lane helpers (`spirvEmitterHelpers.cpp:213`, `spirvEmitterFlow.cpp`) must bridge 2 subgroups via LDS instead of assuming pair-packing.
 - **Stage 3 (TODO): native subgroup arithmetic.** Declare `GroupNonUniformArithmetic`; manual shuffle-tree reductions → `OpGroupNonUniformIAdd`/`FAdd`.
 
@@ -1344,13 +1449,13 @@ Compute shader **`hash=0xea0aceac518ec52d`**, addr `0x11409ec000`, 1612 GCN word
 
 - **Root cause:** RTX 3070 is wave32-only. The shader is wave64. Kyty emulates wave64 as **2 GCN lanes per host invocation** (256 GCN threads → 128 invocations), every ALU op doubled, every ballot/shuffle/readlane done twice + recombined through LDS/barriers, `exec` mask emulated as data. For this ballot-saturated 6-nested-loop shader that is ~1000× too slow — **~0.67 s per 16×16 tile**.
 - Full 144-group dispatch → instant TDR (`vkQueueSubmit` → `ErrorDeviceLost`).
-- **As of 2026-09-09:** with the CFG + RT-depth fixes clearing everything in front of it, the run reaches **frame ~571**, then `KYTY_GDS_LIMIT_CAP=1` — running a *single* tile — **still TDRs** (`debug_op=0` DispatchDirect, `args=144,1,1,65,0x11409ec000`, `original=5700`). One tile + the `Finish()` serialization now exceeds the 2 s TDR window this deep into the scene. Chunking and capping are exhausted.
-- `KYTY_SKIP_CS_HASH=0xea0aceac518ec52d` (full skip) still gets past — used for fast iteration on later blockers. Loses occlusion culling (worse 3D-scene draw count, but correct).
+- **Measured cleanly 2026-09-12:** `KYTY_GDS_LIMIT_CAP=1` alone still dispatches all 144 workgroups, so the old “one tile” attribution was incomplete. With new `KYTY_GDS_GROUP_CAP=1` and `KYTY_GDS_SYNC_CAP=1`, fifteen pre-round/walkout one-item calls complete in **0.8-1.0 ms** (first warm call 3.3 ms). At the user's actual-round transition the next one-item call takes **3426.0 ms** and device-lost at `debug_op=0` DispatchDirect (`0xea0aceac518ec52d`). The shader's real-round data selects a radically more expensive path, and that one work item exceeds TDR. Chunking/group-count changes cannot fix it.
+- `KYTY_SKIP_CS_HASH=0xea0aceac518ec52d` (full skip) still gets past — used for fast iteration on later blockers. It is not visually correct: the round directly samples the skipped buffer-9 output as its HDR scene source.
 - Dumps: `D:\PS5\shader-dumps\CS_ea0aceac518ec52d.{bin,rdna2,cfg.txt,ir.txt,spv}`
 
 **This is now the sole hard blocker. The remaining work is the wave64→wave32 lowering rework (Option A) — see "Next steps" #1.**
 
-**Render state with the CS skipped (2026-09-09):** `KYTY_SKIP_CS_HASH` gets past the TDR and into a match (HUD/health-bars/banner composite fine — presentation path verified good), but the **3D scene is black + a garbage RGB band** — the GPU-driven scene submits ~5000 draws that render nothing because the visibility/HZB data the skipped CS produces is missing. Confirmed render bug not presentation: `present` in-match ~3.7% non-zero, scene RT `0x1162c00000` collapses to 400×225 empty. Getting a correct scene needs the CS actually working (Option A). A heavier auto-navigated scene (`draws=8443`) in this broken state hit `ErrorDeviceLost` (debug_op=3) once — not cleanly attributed (Stage 1 change + different scene); the reverted A/B build was clean where it reached but didn't get to the same scene.
+**Render state with the CS skipped (corrected 2026-09-11):** `KYTY_SKIP_CS_HASH` gets past the TDR and into a match (HUD/health-bars/banner composite fine — presentation path verified good), but the **3D scene is black + a garbage RGB band**. The old `0x1162c00000` 400x225 dump was not proof; it is an intentionally consumed quarter-res view. The direct proof is frame 1073: skipped CS read-write buffer 9 at `0x1163770000` is immediately sampled as the 1600x900 HDR input to PS `0x654607b31fe5f6d6`, and its stale-white contents propagate byte-identically into the next stage. Getting a correct scene needs the CS actually working (Option A) or a faithful replacement. A heavier auto-navigated scene (`draws=8443`) in this broken state hit `ErrorDeviceLost` (debug_op=3) once — not cleanly attributed (Stage 1 change + different scene); the reverted A/B build was clean where it reached but didn't get to the same scene.
 
 ### 2. Pixel `input_num=0` (worked around; real bug open)
 
@@ -1393,9 +1498,9 @@ Menus ~20–60 fps. In-match / 3D scene ~**1 fps** with **8k–10k draws** after
 
 ## Next steps
 
-0. **Fight round still black — the occlusion CS's two big buffers.** Either (a) figure out `buffer[9]` (`0x1163920000`, 18 MB) / `buffer[10]` (`0x1170776e00`, 36 MB) layout — trace the consumer shader that reads them, or RenderDoc a real PS5 frame — and extend the `renderCompute.cpp` stub to fill them with a real "all visible" value, or (b) get the real CS running (step 2 / hand-written replacement). Intro + corner scenes already render, so everything else is sound.
+0. **Fight round still black — run the wave64 CS or replace it faithfully.** The consumer is now traced: dynamic buffer 9 (18 MB; `0x1163770000` in frame 1073) is reinterpreted as the 1600x900 HDR scene input. Constant-zero buffer filling already stayed black and corrupted the HUD, so do not retry arbitrary fills. Implement Wave64 Stage 2 (step 2) or substitute a shader-specific algorithm that produces the real buffer/image outputs.
 1. **Skin corruption** (issue 4b) — the `fmt 98↔122` reinterpret-view fix is landed but **did not change the visuals**. Not a sample-site encoding bug. Next: chase the 4 revised hypotheses in issue 4b (wrong/stale source image → tiling → descriptor decode → stubbed-CS garbage). Start by tracing what writes `0x1156990000`.
-2. **Wave64 → wave32 lowering rework (Option A).** Stage 1 landed (−26% OpSelect, measured). Next: **Stage 1b** — at structurize time mark the structured-`if`-body entry exec as identity so the `s_and_saveexec`/`s_mov exec,<saved>` restores fold too (catches most of the remaining 1309 selects); **Stage 2** — `lane_count = 1` (kill the ~2× lane-pair scalar duplication on everything, incl. the 279 `OpGroupNonUniform`). Target model: map **1 GCN wave64 → a 64-invocation workgroup = 2 native subgroups of 32**.
+2. **Wave64 → wave32 lowering rework (Option A).** Stage 1 landed (−26% OpSelect, measured). Next: **Stage 1b** — at structurize time mark the structured-`if`-body entry exec as identity so the `s_and_saveexec`/`s_mov exec,<saved>` restores fold too (catches most of the remaining 1309 selects). The proposed `lane_count = 1` / two-subgroup LDS bridge is **ruled out on this RTX 3070**: a minimal one-readlane test TDRs despite valid SPIR-V and correctly initialized counters. Keep the two-half model unless a design avoids cross-subgroup waiting.
    - Per-lane ALU: stop the 2×-per-invocation packing → 1 GCN thread = 1 SPIR-V invocation (kills the doubling on most of the shader).
    - Cross-lane ops: one `combine(subgroup0, subgroup1)` per wave through a single LDS slot + one barrier, computed once per loop edge — not twice per use. `readlane`→`subgroupShuffle`/LDS; `readfirstlane`→`subgroupBroadcastFirst`+LDS hop; `ballot`→two `subgroupBallot`+LDS halves; wave reduce→`subgroupAdd`/etc.
    - **Declare `GroupNonUniformArithmetic`** (currently not declared — reductions are hand-rolled 6-step shuffle trees ×2).
@@ -1414,6 +1519,8 @@ $env:KYTY_SHADER_DUMP_DIR    = 'D:\PS5\shader-dumps'
 $env:KYTY_DUMP_SHADER_HASH   = '0x…,0x…'              # dump .spv/.rdna2/.cfg.txt/.ir.txt for a hash (comma list)
 $env:KYTY_SHADER_CFG_STRATEGY= 'auto'                 # legacy | dispatch | auto (default). auto now falls back to dispatch on invalid legacy output.
 $env:KYTY_GDS_LIMIT_CAP      = '1'                    # cap hang-CS work items (no longer prevents the TDR as of frame ~571)
+$env:KYTY_GDS_GROUP_CAP      = '1'                    # diagnostic: cap the hash's actual X workgroup count (normally 144)
+$env:KYTY_GDS_SYNC_CAP       = '1'                    # diagnostic: Finish + exact wall time after each capped hash dispatch
 $env:KYTY_GDS_CHUNK          = '4'
 ```
 
