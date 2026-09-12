@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/dispatchInspector.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -784,6 +785,20 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		RebindBuffers(bindings);
 		RebindImages(bindings);
+		if (DispatchInspectorEnabled()) {
+			InspectorOperation operation;
+			operation.kind             = InspectorOperationKind::Dispatch;
+			operation.groups[0]        = thread_group_x;
+			operation.groups[1]        = thread_group_y;
+			operation.groups[2]        = thread_group_z;
+			operation.local[0]         = input_info.threads_num[0];
+			operation.local[1]         = input_info.threads_num[1];
+			operation.local[2]         = input_info.threads_num[2];
+			operation.indirect_address = indirect_args_addr;
+			operation.stages.push_back(
+			    CaptureInspectorStage(bindings, m_context.GetTextureCache()));
+			RecordInspectorOperation(m_context.GetGpu().GetFrameNum(), std::move(operation));
+		}
 		auto              vk_buffer        = buffer.Handle();
 		PreparedBindings* descriptor_stage = &bindings;
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,

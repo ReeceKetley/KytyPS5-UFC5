@@ -8,6 +8,7 @@
 #include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/dispatchInspector.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 
@@ -161,6 +162,7 @@ void RefreshTracedResources() {
 	// Same idea for the shader probe, which additionally forces a re-translation of the shaders it
 	// applies to - so what is measured can be changed without restarting and re-navigating.
 	ShaderRecompiler::ReloadProbeConfig();
+	RefreshDispatchInspector();
 }
 
 bool TraceResourceAddress(uint64_t address, uint64_t size) {

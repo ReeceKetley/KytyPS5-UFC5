@@ -1,6 +1,13 @@
 # UFC 5 / KytyPS5 ledger
 
-Last updated: 2026-09-12 session 8 — **BLOCK 4 DOES EXECUTE. SESSION 7c IS WITHDRAWN, AND SO IS
+Last updated: 2026-09-12 session 9 — **THE P0 GPU DISPATCH/DRAW INSPECTOR IS BUILT AND MENU-VALIDATED.**
+It records every real draw/dispatch in the current frame after resource resolution, numbers repeated
+dispatches of one shader, and shows guest addresses, texture-cache image ids, extents, actual Vulkan
+view formats and access flags. It is default-off behind `KYTY_DEBUG_PANEL=1`; F10 toggles it. Panel-on
+runs add host draws and diagnostic capture overhead and are **never comparable to the 5 fps baseline.**
+See "session 9" below.
+
+Previously: 2026-09-12 session 8 — **BLOCK 4 DOES EXECUTE. SESSION 7c IS WITHDRAWN, AND SO IS
 EVERY REGISTER VALUE EVER READ BY THE PROBE.** `CS 0xe17349e0d437757b` is dispatched **twice per
 frame** with different ping-pong images, and the capture only ever recorded the *first* binding of
 the hash — so the probe written by one pass was read back out of the other pass's image. With that
@@ -735,6 +742,60 @@ the tool can now read any register at any point, so this no longer costs one nav
 session were `could not reserve 13824 MB for guest direct memory`, not crashes, because the previous
 instance had not released its commit yet (and one `clang-cl` OOM from the same shortage). Check
 commit headroom before blaming the build.
+
+### SESSION 9 (2026-09-12) — P0 DISPATCH/DRAW INSPECTOR BUILT AND VALIDATED AT THE MENU
+
+**What landed.** `KYTY_DEBUG_PANEL=1` enables an opt-in recorder and opens an ImGui GPU inspector;
+F10 toggles panel visibility and is consumed by the host, never sent to the guest. With the env var
+unset the renderer takes only a cached false branch: it allocates no capture state, does not create
+the ImGui Vulkan backend, and does not add presentation draws. The panel reuses `SystemOverlay`'s
+existing ImGui context, dynamic-rendering path and `imgui_impl_vulkan` backend.
+
+For every real Vulkan draw and dispatch in the current frame the shared recorder captures:
+- operation order and draw/dispatch type;
+- all active shader stages and full 64-bit shader hashes;
+- dispatch groups/local size (or indirect argument address), draw index/instance counts;
+- every resolved buffer and image binding with guest address/size and read/write/atomic flags;
+- texture-cache `image_id.generation`, extent, and **the format of the actual returned VkImageView**;
+- colour and depth attachments with the same address/id/extent/format/access information.
+
+Repeated dispatches are numbered `pass=N/total` per shader hash within one frame. The UI has live,
+hold-current and step-one-frame modes, shader-hash filtering, draw/dispatch filters, a clipped
+operation table, and a separate resolved-resource table. A loud banner says that panel-on
+measurements are not performance-comparable.
+
+**The file/env interface remains authoritative.** The panel only observes resolved renderer state;
+it does not replace `PROBE`, `CAPTURE_HASHES`, `TRACE_ADDRS`, `DUMP_INPUTS`, or their environment
+seeds. For headless use, create `D:/PS5/dumps/DUMP_INSPECTOR`; its optional contents are a shader
+hash. The trigger is consumed and the exact panel snapshot is written to
+`D:/PS5/dumps/dispatch-inspector-f<N>.txt`. This parser tolerates a UTF-8 BOM.
+
+**Menu proof, no fight navigation.** With filter `48b8d705615cffba`, frame 459 contained 202 total
+operations and showed that this supposedly simple menu CS actually ran **eight times**. Its passes
+had identical `groups=134x75x1 local=8x8x1` but different buffer addresses and four distinct output
+images, for example:
+```
+pass 1/8  buffer=0x1115b9c9d0  image=0x1166ec0000  image_id=142.1  1068x600 actual_vk=122
+pass 2/8  buffer=0x1115b9b9c0  image=0x1167190000  image_id=140.2  1068x600 actual_vk=122
+pass 3/8  buffer=0x11158c5fb0  image=0x1163920000  image_id=51.3   1068x600 actual_vk=122
+pass 4/8  buffer=0x11158c5fa0  image=0x1163bf0000  image_id=30.4   1068x600 actual_vk=122
+```
+That is the exact defect class P0 was intended to reveal. A busier validation-menu frame contained
+8,357 operations and exposed the initial 8,192 runaway guard; the guard was raised to 32,768
+operations / 524,288 resources. The rebuilt binary then captured frame 475 with 101 operations,
+four filtered occurrences, and **zero dropped operations/resources**.
+
+**Validation:** release build succeeded with `ninja -j 4`; `shader_cfg_tests: all tests passed`.
+The panel ran at the menu for 187 seconds under `--shader-validation true`: 193 `FrameProfile`
+windows and 703 shader compiles, **0 device losses, 0 Vulkan VUID/validation errors, and 0 shader/CFG
+compile failures**. The existing `CFG dispatcher fallback` for PS `0x496ccab77f7f9ba4` is a successful
+fallback for an indirect `S_SETPC_B64` jump table, not a failed compilation.
+
+The first two validation relaunches failed before Vulkan initialization with the already-known
+`could not reserve 13824 MB for guest direct memory`. The previous process's commit released later;
+the same binary then started normally. At diagnosis the machine had 18.9/31.9 GB physical RAM used
+but 31.8/46.6 GB committed; Firefox's 28 processes accounted for 8.1 GB private commit. Do not call
+this startup failure an emulator crash.
 
 ### SUPERSEDED (session 8 refutes this by direct markers): BLOCK 4 OF THE UPSCALER NEVER EXECUTES
 

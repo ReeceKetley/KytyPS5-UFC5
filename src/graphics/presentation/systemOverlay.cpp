@@ -2,8 +2,10 @@
 
 #include "SDL.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/dispatchInspector.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include "libs/controller.h"
@@ -14,8 +16,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -23,6 +28,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -103,7 +109,7 @@ bool HostQueueExternalInput(uint64_t generation, ExternalInput input) {
 
 } // namespace Ime
 
-enum class OverlayKind : uint8_t { None, Ime, Error };
+enum class OverlayKind : uint8_t { None, Ime, Error, Debug };
 
 struct OverlaySession {
 	OverlayKind kind       = OverlayKind::None;
@@ -136,6 +142,8 @@ constexpr size_t INPUT_QUEUE_CAPACITY = 128;
 enum class InputKind : uint8_t {
 	Button,
 	Axis,
+	Key,
+	Character,
 	MousePosition,
 	MouseButton,
 	MouseWheel,
@@ -176,6 +184,12 @@ bool                         g_input_multiline            = false;
 bool                         g_input_lifecycle_active     = false;
 bool                         g_controller_captured        = false;
 OverlaySession               g_session;
+std::atomic<bool>            g_debug_visible {DispatchInspectorEnabled()};
+std::atomic<uint64_t>        g_debug_revision {DispatchInspectorEnabled() ? 1u : 0u};
+
+constexpr OverlaySession DebugSession() {
+	return {OverlayKind::Debug, 1};
+}
 
 void ClearInputEvents() {
 	std::scoped_lock lock(g_input_mutex);
@@ -404,6 +418,34 @@ ImGuiKey ControllerButtonToKey(int button) {
 	}
 }
 
+ImGuiKey KeyboardToKey(SDL_Keycode key) {
+	switch (key) {
+		case SDLK_TAB: return ImGuiKey_Tab;
+		case SDLK_LEFT: return ImGuiKey_LeftArrow;
+		case SDLK_RIGHT: return ImGuiKey_RightArrow;
+		case SDLK_UP: return ImGuiKey_UpArrow;
+		case SDLK_DOWN: return ImGuiKey_DownArrow;
+		case SDLK_PAGEUP: return ImGuiKey_PageUp;
+		case SDLK_PAGEDOWN: return ImGuiKey_PageDown;
+		case SDLK_HOME: return ImGuiKey_Home;
+		case SDLK_END: return ImGuiKey_End;
+		case SDLK_INSERT: return ImGuiKey_Insert;
+		case SDLK_DELETE: return ImGuiKey_Delete;
+		case SDLK_BACKSPACE: return ImGuiKey_Backspace;
+		case SDLK_SPACE: return ImGuiKey_Space;
+		case SDLK_RETURN:
+		case SDLK_KP_ENTER: return ImGuiKey_Enter;
+		case SDLK_ESCAPE: return ImGuiKey_Escape;
+		case SDLK_a: return ImGuiKey_A;
+		case SDLK_c: return ImGuiKey_C;
+		case SDLK_v: return ImGuiKey_V;
+		case SDLK_x: return ImGuiKey_X;
+		case SDLK_y: return ImGuiKey_Y;
+		case SDLK_z: return ImGuiKey_Z;
+		default: return ImGuiKey_None;
+	}
+}
+
 PFN_vkVoidFunction LoadVulkanFunction(const char* name, void* user_data) {
 	auto& graphics = *static_cast<GraphicContext*>(user_data);
 	return graphics.instance.getProcAddr(name);
@@ -427,6 +469,10 @@ void InitializeSystemOverlayInput() {
 	DialogIme::SetVisibilityCallback(OnDialogVisibilityChanged);
 	ErrorDialog::SetVisibilityCallback(RefreshVisibility);
 	RefreshVisibility();
+	if (DispatchInspectorEnabled()) {
+		LOGF("DispatchInspector: enabled; F10 toggles panel, visible measurements are not "
+		     "performance-comparable\n");
+	}
 }
 
 void ShutdownSystemOverlayInput() {
@@ -462,12 +508,24 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
 	const auto error  = ErrorDialog::GetVisualState();
-	return {core.active || dialog.active || error.active,
-	        core.revision + dialog.revision + error.revision};
+	return {core.active || dialog.active || error.active ||
+	            g_debug_visible.load(std::memory_order_acquire),
+	        core.revision + dialog.revision + error.revision +
+	            g_debug_revision.load(std::memory_order_acquire)};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	RetryVisibilityWakeup();
+	if (DispatchInspectorEnabled() && (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) &&
+	    event.key.keysym.sym == SDLK_F10) {
+		if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
+			g_debug_visible.store(!g_debug_visible.load(std::memory_order_acquire),
+			                      std::memory_order_release);
+			g_debug_revision.fetch_add(1, std::memory_order_acq_rel);
+			ClearInputEvents();
+		}
+		return true;
+	}
 	if (event.type == g_visibility_event.load(std::memory_order_acquire)) {
 		VisibilityUpdate update {};
 		{
@@ -498,6 +556,42 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 			QueueInput({InputKind::ResetController, g_input_session, 0, 0.0f, 0.0f});
 		}
 		return false;
+	}
+	if (!g_input_active && g_debug_visible.load(std::memory_order_acquire)) {
+		const auto session = DebugSession();
+		switch (event.type) {
+			case SDL_KEYDOWN:
+			case SDL_KEYUP: {
+				const auto key = KeyboardToKey(event.key.keysym.sym);
+				if (key != ImGuiKey_None) {
+					QueueInput({InputKind::Key, session, static_cast<int>(key),
+					            event.type == SDL_KEYDOWN ? 1.0f : 0.0f, 0.0f});
+				}
+				if (event.type == SDL_KEYDOWN && event.key.repeat == 0 &&
+				    (event.key.keysym.mod & (KMOD_CTRL | KMOD_ALT | KMOD_GUI)) == 0 &&
+				    event.key.keysym.sym >= 32 && event.key.keysym.sym < 127) {
+					QueueInput(
+					    {InputKind::Character, session, event.key.keysym.sym, 0.0f, 0.0f});
+				}
+				return true;
+			}
+			case SDL_MOUSEMOTION:
+				QueueInput({InputKind::MousePosition, session, 0,
+				            static_cast<float>(event.motion.x), static_cast<float>(event.motion.y)});
+				return true;
+			case SDL_MOUSEBUTTONDOWN:
+			case SDL_MOUSEBUTTONUP:
+				QueueInput({InputKind::MousePosition, session, 0,
+				            static_cast<float>(event.button.x), static_cast<float>(event.button.y)});
+				QueueInput({InputKind::MouseButton, session, event.button.button,
+				            event.type == SDL_MOUSEBUTTONDOWN ? 1.0f : 0.0f, 0.0f});
+				return true;
+			case SDL_MOUSEWHEEL:
+				QueueInput({InputKind::MouseWheel, session, 0, static_cast<float>(event.wheel.x),
+				            static_cast<float>(event.wheel.y)});
+				return true;
+			default: return false;
+		}
 	}
 	if (!g_input_active) {
 		return false;
@@ -712,6 +806,12 @@ struct SystemOverlay::Impl {
 					}
 					break;
 				}
+				case InputKind::Key:
+					io.AddKeyEvent(static_cast<ImGuiKey>(event.id), event.x != 0.0f);
+					break;
+				case InputKind::Character:
+					io.AddInputCharacter(static_cast<unsigned int>(event.id));
+					break;
 				case InputKind::MousePosition: io.AddMousePosEvent(event.x, event.y); break;
 				case InputKind::MouseButton: {
 					int button = -1;
@@ -942,17 +1042,234 @@ struct SystemOverlay::Impl {
 		}
 	}
 
+	void DrawDebugPanel(vk::Extent2D frame_extent) {
+		InspectorFrame newest;
+		if (GetDispatchInspectorFrame(&newest)) {
+			const bool take = inspector_live || inspector_frame.operations.empty() ||
+			                  (inspector_waiting_frame != 0 &&
+			                   newest.frame > inspector_waiting_frame);
+			if (take) {
+				const bool changed = newest.frame != inspector_frame.frame;
+				inspector_frame = std::move(newest);
+				if (changed) {
+					selected_operation = UINT32_MAX;
+				}
+				if (inspector_waiting_frame != 0 &&
+				    inspector_frame.frame > inspector_waiting_frame) {
+					inspector_waiting_frame = 0;
+				}
+			}
+		}
+
+		const ImVec2 display {static_cast<float>(frame_extent.width),
+		                      static_cast<float>(frame_extent.height)};
+		ImGui::SetNextWindowPos({16.0f, 16.0f}, ImGuiCond_FirstUseEver);
+		ImGui::SetNextWindowSize({std::min(display.x - 32.0f, 1120.0f),
+		                          std::min(display.y - 32.0f, 760.0f)},
+		                         ImGuiCond_FirstUseEver);
+		if (!ImGui::Begin("Kyty GPU Dispatch / Draw Inspector")) {
+			ImGui::End();
+			return;
+		}
+		ImGui::TextColored({1.0f, 0.72f, 0.2f, 1.0f},
+		                   "DIAGNOSTIC OVERLAY ACTIVE - do not compare performance to the 5 fps baseline");
+		ImGui::Separator();
+
+		if (ImGui::Checkbox("Live", &inspector_live) && inspector_live) {
+			inspector_waiting_frame = 0;
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Hold current")) {
+			inspector_live          = false;
+			inspector_waiting_frame = 0;
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Step one frame")) {
+			inspector_live          = false;
+			inspector_waiting_frame = inspector_frame.frame;
+		}
+		ImGui::SameLine();
+		ImGui::Text("frame=%" PRIu64 "  operations=%zu%s", inspector_frame.frame,
+		            inspector_frame.operations.size(),
+		            inspector_waiting_frame != 0 ? "  (waiting for next frame)" : "");
+		if (inspector_frame.dropped_operations != 0 || inspector_frame.dropped_resources != 0) {
+			ImGui::TextColored({1.0f, 0.35f, 0.25f, 1.0f},
+			                   "capture capped: dropped operations=%u resources=%u",
+			                   inspector_frame.dropped_operations, inspector_frame.dropped_resources);
+		}
+
+		ImGui::SetNextItemWidth(230.0f);
+		ImGui::InputTextWithHint("##ShaderFilter", "shader hash filter", inspector_filter.data(),
+		                         inspector_filter.size());
+		ImGui::SameLine();
+		ImGui::Checkbox("Dispatches", &inspector_show_dispatches);
+		ImGui::SameLine();
+		ImGui::Checkbox("Draws", &inspector_show_draws);
+
+		const char* filter = inspector_filter.data();
+		while (filter[0] == '0' && (filter[1] == 'x' || filter[1] == 'X')) {
+			filter += 2;
+		}
+		std::vector<uint32_t> visible;
+		visible.reserve(inspector_frame.operations.size());
+		for (uint32_t index = 0; index < inspector_frame.operations.size(); ++index) {
+			const auto& operation = inspector_frame.operations[index];
+			if ((operation.kind == InspectorOperationKind::Draw && !inspector_show_draws) ||
+			    (operation.kind == InspectorOperationKind::Dispatch &&
+			     !inspector_show_dispatches)) {
+				continue;
+			}
+			bool matches = filter[0] == '\0';
+			for (const auto& stage: operation.stages) {
+				char hash[17] {};
+				std::snprintf(hash, sizeof(hash), "%016" PRIx64, stage.shader_hash);
+				matches |= std::strstr(hash, filter) != nullptr;
+			}
+			if (matches) {
+				visible.push_back(index);
+			}
+		}
+
+		constexpr ImGuiTableFlags list_flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+		                                             ImGuiTableFlags_Resizable |
+		                                             ImGuiTableFlags_ScrollY |
+		                                             ImGuiTableFlags_SizingFixedFit;
+		if (ImGui::BeginTable("##Operations", 5, list_flags, {0.0f, 300.0f})) {
+			ImGui::TableSetupScrollFreeze(0, 1);
+			ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 48.0f);
+			ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 112.0f);
+			ImGui::TableSetupColumn("Shader", ImGuiTableColumnFlags_WidthStretch);
+			ImGui::TableSetupColumn("Work", ImGuiTableColumnFlags_WidthStretch);
+			ImGui::TableSetupColumn("Resources", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+			ImGui::TableHeadersRow();
+			ImGuiListClipper clipper;
+			clipper.Begin(static_cast<int>(visible.size()));
+			while (clipper.Step()) {
+				for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+					const uint32_t index     = visible[static_cast<size_t>(row)];
+					const auto&    operation = inspector_frame.operations[index];
+					ImGui::TableNextRow();
+					ImGui::TableSetColumnIndex(0);
+					char id[32] {};
+					std::snprintf(id, sizeof(id), "%u##operation%u", index, index);
+					if (ImGui::Selectable(id, selected_operation == index,
+					                      ImGuiSelectableFlags_SpanAllColumns)) {
+						selected_operation = index;
+					}
+					ImGui::TableSetColumnIndex(1);
+					if (operation.kind == InspectorOperationKind::Dispatch) {
+						ImGui::Text("DISPATCH %u/%u", operation.occurrence + 1,
+						            operation.occurrence_count);
+					} else {
+						ImGui::TextUnformatted("DRAW");
+					}
+					ImGui::TableSetColumnIndex(2);
+					for (size_t stage_index = 0; stage_index < operation.stages.size(); ++stage_index) {
+						const auto& stage = operation.stages[stage_index];
+						if (stage_index != 0) ImGui::SameLine();
+						ImGui::Text("%s 0x%016" PRIx64, InspectorStageName(stage.stage),
+						            stage.shader_hash);
+					}
+					ImGui::TableSetColumnIndex(3);
+					if (operation.kind == InspectorOperationKind::Dispatch) {
+						ImGui::Text("%ux%ux%u / %ux%ux%u%s", operation.groups[0],
+						            operation.groups[1], operation.groups[2], operation.local[0],
+						            operation.local[1], operation.local[2],
+						            operation.indirect_address != 0 ? " indirect" : "");
+					} else {
+						ImGui::Text("indices=%u instances=%u", operation.index_count,
+						            operation.instance_count);
+					}
+					ImGui::TableSetColumnIndex(4);
+					size_t resources = operation.attachments.size();
+					for (const auto& stage: operation.stages) resources += stage.resources.size();
+					ImGui::Text("%zu", resources);
+				}
+			}
+			ImGui::EndTable();
+		}
+
+		if (selected_operation < inspector_frame.operations.size()) {
+			const auto& selected = inspector_frame.operations[selected_operation];
+			ImGui::SeparatorText("Resolved resources");
+			constexpr ImGuiTableFlags resource_flags =
+			    ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
+			    ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit;
+			if (ImGui::BeginTable("##Resources", 8, resource_flags, {0.0f, 0.0f})) {
+				ImGui::TableSetupScrollFreeze(0, 1);
+				ImGui::TableSetupColumn("Stage");
+				ImGui::TableSetupColumn("Resource");
+				ImGui::TableSetupColumn("Guest address");
+				ImGui::TableSetupColumn("image_id");
+				ImGui::TableSetupColumn("Extent");
+				ImGui::TableSetupColumn("actual_vk");
+				ImGui::TableSetupColumn("Access");
+				ImGui::TableSetupColumn("Bytes");
+				ImGui::TableHeadersRow();
+				auto draw_resource = [](const char* stage_name, const InspectorResource& resource) {
+					ImGui::TableNextRow();
+					ImGui::TableNextColumn();
+					ImGui::TextUnformatted(stage_name);
+					ImGui::TableNextColumn();
+					ImGui::Text("%s[%u]", InspectorResourceName(resource.kind), resource.index);
+					ImGui::TableNextColumn();
+					ImGui::Text("0x%016" PRIx64, resource.address);
+					ImGui::TableNextColumn();
+					if (resource.image_id != 0) {
+						ImGui::Text("%u.%u", resource.image_id, resource.image_generation);
+					} else {
+						ImGui::TextUnformatted("-");
+					}
+					ImGui::TableNextColumn();
+					if (resource.width != 0) {
+						ImGui::Text("%ux%ux%u", resource.width, resource.height, resource.depth);
+					} else {
+						ImGui::TextUnformatted("-");
+					}
+					ImGui::TableNextColumn();
+					if (resource.actual_vk >= 0) {
+						const auto format = static_cast<vk::Format>(resource.actual_vk);
+						ImGui::Text("%d %s", resource.actual_vk, vk::to_string(format).c_str());
+					} else {
+						ImGui::TextUnformatted("-");
+					}
+					ImGui::TableNextColumn();
+					ImGui::Text("%s%s%s", resource.read ? "R" : "-",
+					            resource.written ? "W" : "-", resource.atomic ? "A" : "-");
+					ImGui::TableNextColumn();
+					ImGui::Text("%" PRIu64, resource.size);
+				};
+				for (const auto& stage: selected.stages) {
+					for (const auto& resource: stage.resources) {
+						draw_resource(InspectorStageName(stage.stage), resource);
+					}
+				}
+				for (const auto& resource: selected.attachments) {
+					draw_resource("RT", resource);
+				}
+				ImGui::EndTable();
+			}
+		} else {
+			ImGui::TextDisabled("Select an operation to inspect every resolved binding.");
+			ImGui::TextDisabled("Headless snapshot: create D:/PS5/dumps/DUMP_INSPECTOR (optional hash contents).");
+		}
+		ImGui::End();
+	}
+
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
 		OverlaySnapshot snapshot;
-		if (!GetOverlaySnapshot(&snapshot)) {
+		const bool      system_visible = GetOverlaySnapshot(&snapshot);
+		const bool      debug_visible  = g_debug_visible.load(std::memory_order_acquire);
+		if (!system_visible && !debug_visible) {
 			return false;
 		}
-		const auto prepared_session = snapshot.session;
+		const auto prepared_session = system_visible ? snapshot.session : DebugSession();
 		EnsureVulkan(format, image_count);
-		if (session != snapshot.session) {
-			session       = snapshot.session;
+		if (session != prepared_session) {
+			session       = prepared_session;
 			focus_pending = true;
-			shift         = (snapshot.ime.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
+			shift         = !system_visible ||
+			                (snapshot.ime.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
 			symbol_mode   = false;
 			panel_offset  = {};
 			right_stick   = {};
@@ -961,7 +1278,7 @@ struct SystemOverlay::Impl {
 			io.ClearInputKeys();
 			io.ClearInputMouse();
 		}
-		DrainInput(snapshot.session);
+		DrainInput(prepared_session);
 
 		auto& io       = ImGui::GetIO();
 		io.DisplaySize = {static_cast<float>(frame_extent.width),
@@ -974,14 +1291,16 @@ struct SystemOverlay::Impl {
 		last_frame     = now;
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
-		if (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session) {
-			ImGui::EndFrame();
-			return false;
+		if (debug_visible) {
+			DrawDebugPanel(frame_extent);
 		}
-		if (snapshot.session.kind == OverlayKind::Error) {
-			DrawError(snapshot.error, frame_extent);
-		} else {
-			DrawIme(snapshot.ime, frame_extent);
+		OverlaySnapshot current;
+		if (system_visible && GetOverlaySnapshot(&current) && current.session == prepared_session) {
+			if (current.session.kind == OverlayKind::Error) {
+				DrawError(current.error, frame_extent);
+			} else {
+				DrawIme(current.ime, frame_extent);
+			}
 		}
 		ImGui::Render();
 		extent = frame_extent;
@@ -1032,6 +1351,13 @@ struct SystemOverlay::Impl {
 	OverlaySession                        session;
 	vk::Extent2D                          extent {};
 	std::chrono::steady_clock::time_point last_frame;
+	InspectorFrame                        inspector_frame;
+	std::array<char, 32>                  inspector_filter {};
+	uint64_t                              inspector_waiting_frame = 0;
+	uint32_t                              selected_operation = UINT32_MAX;
+	bool                                  inspector_live = true;
+	bool                                  inspector_show_dispatches = true;
+	bool                                  inspector_show_draws = true;
 };
 
 SystemOverlay::SystemOverlay(GraphicContext& graphics): m_impl(std::make_unique<Impl>(graphics)) {}

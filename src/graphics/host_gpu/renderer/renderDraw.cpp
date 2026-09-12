@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/dispatchInspector.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/gpuTimestamps.h"
@@ -1361,6 +1362,56 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                      state.ps_input_info.stage.program != nullptr
 	                                  ? state.ps_input_info.stage.program->shader_hash
 	                                  : uint64_t {0};
+	if (DispatchInspectorEnabled()) {
+		InspectorOperation operation;
+		operation.kind           = InspectorOperationKind::Draw;
+		operation.index_count    = draw.index_count;
+		operation.instance_count = draw.instance_count;
+		auto& cache = m_context.GetTextureCache();
+		operation.stages.push_back(CaptureInspectorStage(bindings.vertex, cache));
+		if (bindings.pixel) {
+			operation.stages.push_back(CaptureInspectorStage(*bindings.pixel, cache));
+		}
+		operation.attachments.reserve(state.color_count + (state.depth_info.image_id ? 1u : 0u));
+		const auto target_mask = buffer.GetRegisters().GetRenderTargetMask();
+		for (uint32_t index = 0; index < state.color_count; ++index) {
+			const auto& color  = state.color_info[index];
+			const auto  extent = color.Extent();
+			operation.attachments.push_back({
+			    .kind = InspectorResourceKind::ColorTarget,
+			    .index = color.target_slot,
+			    .address = color.desc.info.data.address,
+			    .size = color.desc.info.data.size,
+			    .image_id = color.image_id.index,
+			    .image_generation = color.image_id.generation,
+			    .width = extent.width,
+			    .height = extent.height,
+			    .depth = 1,
+			    .actual_vk = static_cast<int32_t>(color.desc.view_info.format),
+			    .read = true,
+			    .written = render_target_mask_slot(target_mask, color.target_slot) != 0,
+			});
+		}
+		const auto& depth = state.depth_info;
+		if (depth.image_id) {
+			operation.attachments.push_back({
+			    .kind = InspectorResourceKind::DepthTarget,
+			    .index = 0,
+			    .address = depth.desc.info.data.address,
+			    .size = depth.desc.info.data.size,
+			    .image_id = depth.image_id.index,
+			    .image_generation = depth.image_id.generation,
+			    .width = depth.desc.info.extent.width,
+			    .height = depth.desc.info.extent.height,
+			    .depth = depth.desc.info.extent.depth,
+			    .actual_vk = static_cast<int32_t>(depth.desc.view_info.format),
+			    .read = depth.depth_test_enable || depth.stencil_test_enable,
+			    .written = depth.depth_write_enable ||
+			               static_cast<bool>(depth.AttachmentWriteAspects()),
+			});
+		}
+		RecordInspectorOperation(m_context.GetGpu().GetFrameNum(), std::move(operation));
+	}
 	if (ShouldTrackDrawTargets()) {
 		const auto frame_num = static_cast<uint32_t>(buffer.GetContext().GetGpu().GetFrameNum());
 		for (uint32_t i = 0; i < state.color_count; i++) {
