@@ -46,6 +46,15 @@ public:
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
+	// Diagnostic: every image registered at exactly `address`, not just the one the scoring in
+	// FindImageFromRange happens to pick. UFC 5 binds one address as several resources in a
+	// single frame (a LUT, a raw buffer, a 1600x900 scene, a 400x225 target), and a dump that
+	// takes only the winner silently measures a different resource than the one under study.
+	[[nodiscard]] std::vector<ImageId> FindAllImagesAtAddress(uint64_t address, uint64_t size);
+	// Diagnostic: zero every colour image registered at `address`. Used to test whether a
+	// self-feeding temporal buffer recovers once its poisoned history is discarded, which
+	// separates "NaN generated every frame" from "NaN injected once and then persisting".
+	uint32_t ClearImagesAtAddress(CommandBuffer& command, uint64_t address, uint64_t size);
 	[[nodiscard]] ImageId       FindLastPresentableColor();
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);

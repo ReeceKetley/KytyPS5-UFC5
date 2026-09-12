@@ -1618,6 +1618,47 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	return selected;
 }
 
+std::vector<ImageId> TextureCache::FindAllImagesAtAddress(uint64_t address, uint64_t size) {
+	std::vector<ImageId> matches;
+	if (!GuestRange {address, size}.Valid()) {
+		return matches;
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto owner = m_slot_images.try_get(id);
+		if (owner == nullptr || owner->info.data.address != address) {
+			continue;
+		}
+		matches.push_back(id);
+	}
+	return matches;
+}
+
+uint32_t TextureCache::ClearImagesAtAddress(CommandBuffer& command, uint64_t address,
+                                            uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return 0;
+	}
+	std::scoped_lock lock {m_lock};
+	uint32_t         cleared = 0;
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto owner = m_slot_images.try_get(id);
+		if (owner == nullptr || owner->info.data.address != address || owner->info.IsDepth() ||
+		    owner->backing.image == nullptr) {
+			continue;
+		}
+		vk::ImageSubresourceRange range {};
+		range.aspectMask     = vk::ImageAspectFlagBits::eColor;
+		range.baseMipLevel   = 0;
+		range.levelCount     = owner->backing.mip_levels;
+		range.baseArrayLayer = 0;
+		range.layerCount     = owner->backing.layers;
+		ClearImage(command, id, range, vk::ClearValue {});
+		++cleared;
+	}
+	return cleared;
+}
+
 void TextureCache::NotePresentableColor(const Image& image) {
 	if (image.info.IsDepth() || image.usage.depth_target || image.usage.video_out ||
 	    !image.usage.render_target || image.backing.image == nullptr) {

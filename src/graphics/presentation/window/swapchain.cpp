@@ -400,8 +400,50 @@ void DumpGpuImage(CommandBuffer& command, RenderContext& renderer, Image& image,
 	    });
 }
 
+// One-shot image clear, triggered by writing comma-separated hex addresses into
+// D:/PS5/dumps/CLEAR_IMAGES. The file is consumed, so the clear happens on exactly one frame and
+// the effect can be watched decaying (or not) over the following frames. Default inert: the file
+// does not exist unless someone creates it.
+void ClearImagesOnRequest(CommandBuffer& command, RenderContext& renderer, TextureCache& cache) {
+	static const char* kPath = "D:/PS5/dumps/CLEAR_IMAGES";
+	std::error_code    ec;
+	if (!std::filesystem::exists(kPath, ec)) {
+		return;
+	}
+	std::string text;
+	{
+		std::ifstream file {kPath};
+		std::getline(file, text, '\0');
+	}
+	std::filesystem::remove(kPath, ec);
+	for (const char* cursor = text.c_str(); *cursor != '\0';) {
+		while (*cursor == ',' || *cursor == ' ' || *cursor == '\n' || *cursor == '\r') {
+			++cursor;
+		}
+		if (*cursor == '\0') {
+			break;
+		}
+		if (cursor[0] == '0' && (cursor[1] == 'x' || cursor[1] == 'X')) {
+			cursor += 2;
+		}
+		char*      end     = nullptr;
+		const auto address = std::strtoull(cursor, &end, 16);
+		if (end == cursor) {
+			break;
+		}
+		cursor             = end;
+		const auto cleared = cache.ClearImagesAtAddress(command, address, 0x0000000002000000ull);
+		LOGF("ClearImages: addr=0x%016" PRIx64 " cleared=%u frame=%d\n", address, cleared,
+		     renderer.GetGpu().GetFrameNum());
+	}
+}
+
 void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCache& cache,
                      Image& scanout, Image& presented, uint64_t scanout_address) {
+	// Once per frame, and before the dump check: the trace watch list must stay live even on
+	// frames that are not dumping.
+	RefreshTracedResources();
+	ClearImagesOnRequest(command, renderer, cache);
 	const bool dump = ShouldDumpGpuImage(renderer.GetGpu().GetFrameNum());
 	if (!dump) {
 		return;
@@ -448,7 +490,26 @@ void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCac
 		}
 		return list;
 	}();
+	// Dump EVERY image registered at the address, not only the one FindImageFromRange scores
+	// highest. At 0x1162c00000 the game keeps a 1600x900 scene and a 400x225 target alive at
+	// once; they tie on score, so the winner is iteration order, and dumping just the winner
+	// reported "the scene is empty" for days while measuring the 400x225 twin. The extent is
+	// in the filename so two dumps of one address can never be mistaken for each other.
 	for (const auto address: kSurfaces) {
+		const auto all = cache.FindAllImagesAtAddress(address, 0x0000000002000000ull);
+		for (const auto each: all) {
+			const auto& img = cache.GetImage(each);
+			char        all_tag[64];
+			std::snprintf(all_tag, sizeof(all_tag), "rt%08x-%ux%u-i%u", static_cast<uint32_t>(address),
+			              img.backing.extent.width, img.backing.extent.height, each.index);
+			LOGF("DumpAlias: %s addr=0x%016" PRIx64 " img=%u:%u extent=%ux%u fmt=%d "
+			     "render_target=%d gpu_modified=%d frame=%d count=%zu\n",
+			     all_tag, address, each.index, each.generation, img.backing.extent.width,
+			     img.backing.extent.height, static_cast<int>(img.backing.format),
+			     img.usage.render_target ? 1 : 0, img.IsGpuModified() ? 1 : 0,
+			     renderer.GetGpu().GetFrameNum(), all.size());
+			DumpGpuImage(command, renderer, cache.GetImage(each), all_tag, address, true);
+		}
 		auto id = cache.FindImageFromRange(address, 0x0000000002000000ull, false);
 		if (!id) {
 			continue;

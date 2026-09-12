@@ -622,11 +622,13 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
 		if (TraceResourceAddress(target.desc.info.data.address, target.desc.info.data.size)) {
 			TraceResourceBinding(m_context.GetGpu().GetFrameNum(),
-			    fmt::format("color_target={} ps_hash=0x{:016x} addr=0x{:x} bytes={} "
-			                "format={} mip={} layer={}+{}",
+			    fmt::format("color_target={} ps_hash=0x{:016x} image_id={}.{} addr=0x{:x} bytes={} "
+			                "format={} extent={}x{} mip={} layer={}+{}",
 			                i, pixel ? pixel->program->shader_hash : uint64_t {0},
+			                target.image_id.index, target.image_id.generation,
 			                target.desc.info.data.address, target.desc.info.data.size,
 			                static_cast<int>(target.desc.view_info.format),
+			                target.desc.info.extent.width, target.desc.info.extent.height,
 			                target.desc.view_info.base_level, target.desc.view_info.base_layer,
 			                target.desc.view_info.layer_count));
 		}

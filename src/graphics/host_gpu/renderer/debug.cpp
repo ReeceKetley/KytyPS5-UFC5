@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fmt/format.h>
+#include <fstream>
 #include <mutex>
 #include <unordered_set>
 
@@ -27,21 +28,7 @@ bool CaptureShaderInputs(uint64_t hash, uint64_t frame) {
 		const char* value = std::getenv("KYTY_CAPTURE_AFTER_HASH");
 		return value == nullptr ? 0ull : std::strtoull(value, nullptr, 16);
 	}();
-	static const auto hashes = [] {
-		std::unordered_set<uint64_t> result;
-		const char* cursor = std::getenv("KYTY_CAPTURE_INPUTS_HASH");
-		while (cursor != nullptr && *cursor != '\0') {
-			while (*cursor == ',' || *cursor == ' ') ++cursor;
-			if (*cursor == '\0') break;
-			char* end = nullptr;
-			const auto value = std::strtoull(cursor, &end, 16);
-			if (end == cursor || (*end != '\0' && *end != ',' && *end != ' ')) break;
-			result.insert(value);
-			cursor = end;
-		}
-		return result;
-	}();
-	if (after_hash == 0 && !hashes.contains(hash)) return false;
+	if (after_hash == 0 && !IsCapturedShaderHash(hash)) return false;
 	static const auto first_frame = [] {
 		const char* value = std::getenv("KYTY_CAPTURE_INPUTS_FRAME");
 		return value == nullptr ? 0ull : std::strtoull(value, nullptr, 10);
@@ -72,29 +59,105 @@ bool CaptureShaderInputs(uint64_t hash, uint64_t frame) {
 		// which can consume the 512 MiB image budget before the small set under study.
 		// When an explicit hash list is supplied, use the after-hash only as the
 		// same-frame trigger and capture resources for that list.
-		if (!hashes.empty() && !hashes.contains(hash)) return false;
+		if (AnyCapturedShaderHash() && !IsCapturedShaderHash(hash)) return false;
 	}
 	return captured.insert(hash).second;
 }
 
+// The watch list is read on every image and buffer binding - tens of thousands of calls per
+// frame - so it is a lock-free fixed array, not a vector behind a mutex. Refreshes happen once
+// per frame at most and a torn read would only mis-trace one binding of one frame.
+namespace {
+constexpr size_t              kTraceMax = 32;
+std::atomic<uint64_t>         g_traced[kTraceMax];
+std::atomic<uint32_t>         g_traced_count {0};
+
+void ParseTraceList(const char* cursor) {
+	uint32_t count = 0;
+	while (cursor != nullptr && *cursor != '\0' && count < kTraceMax) {
+		while (*cursor == ',' || *cursor == ' ' || *cursor == '\n' || *cursor == '\r') ++cursor;
+		if (*cursor == '\0') break;
+		if (cursor[0] == '0' && (cursor[1] == 'x' || cursor[1] == 'X')) cursor += 2;
+		char*      end   = nullptr;
+		const auto value = std::strtoull(cursor, &end, 16);
+		if (end == cursor) break;
+		g_traced[count++].store(value, std::memory_order_relaxed);
+		cursor = end;
+	}
+	g_traced_count.store(count, std::memory_order_release);
+}
+
+std::atomic<uint64_t> g_captured[kTraceMax];
+std::atomic<uint32_t> g_captured_count {0};
+
+void ParseHashList(const char* cursor) {
+	uint32_t count = 0;
+	while (cursor != nullptr && *cursor != '\0' && count < kTraceMax) {
+		while (*cursor == ',' || *cursor == ' ' || *cursor == '\n' || *cursor == '\r') ++cursor;
+		if (*cursor == '\0') break;
+		if (cursor[0] == '0' && (cursor[1] == 'x' || cursor[1] == 'X')) cursor += 2;
+		char*      end   = nullptr;
+		const auto value = std::strtoull(cursor, &end, 16);
+		if (end == cursor) break;
+		g_captured[count++].store(value, std::memory_order_relaxed);
+		cursor = end;
+	}
+	g_captured_count.store(count, std::memory_order_release);
+}
+
+// Seed from the environment at static-init so frame 0 is already traced.
+const bool g_trace_seeded = [] {
+	ParseTraceList(std::getenv("KYTY_TRACE_RESOURCES"));
+	ParseHashList(std::getenv("KYTY_CAPTURE_INPUTS_HASH"));
+	return true;
+}();
+
+// Re-read `path` into `parse` when its mtime changes. Returns true if it reloaded.
+bool ReloadIfChanged(const char* path, std::filesystem::file_time_type& last,
+                     void (*parse)(const char*), std::string& text) {
+	std::error_code ec;
+	if (!std::filesystem::exists(path, ec)) return false;
+	const auto stamp = std::filesystem::last_write_time(path, ec);
+	if (ec || stamp == last) return false;
+	last = stamp;
+	std::ifstream file {path};
+	std::getline(file, text, '\0');
+	parse(text.c_str());
+	return true;
+}
+} // namespace
+
+bool IsCapturedShaderHash(uint64_t hash) {
+	const auto count = g_captured_count.load(std::memory_order_acquire);
+	for (uint32_t i = 0; i < count; ++i) {
+		if (g_captured[i].load(std::memory_order_relaxed) == hash) return true;
+	}
+	return false;
+}
+
+bool AnyCapturedShaderHash() { return g_captured_count.load(std::memory_order_acquire) != 0; }
+
+void RefreshTracedResources() {
+	static std::filesystem::file_time_type addr_stamp {};
+	static std::filesystem::file_time_type hash_stamp {};
+	std::string                            text;
+	if (ReloadIfChanged("D:/PS5/dumps/TRACE_ADDRS", addr_stamp, &ParseTraceList, text)) {
+		LOGF("TraceAddrs: reloaded %u address(es): %s\n",
+		     g_traced_count.load(std::memory_order_acquire), text.c_str());
+	}
+	if (ReloadIfChanged("D:/PS5/dumps/CAPTURE_HASHES", hash_stamp, &ParseHashList, text)) {
+		LOGF("CaptureHashes: reloaded %u hash(es): %s\n",
+		     g_captured_count.load(std::memory_order_acquire), text.c_str());
+	}
+}
+
 bool TraceResourceAddress(uint64_t address, uint64_t size) {
-	static const auto watched = [] {
-		std::vector<uint64_t> addresses;
-		const char* cursor = std::getenv("KYTY_TRACE_RESOURCES");
-		while (cursor != nullptr && *cursor != '\0') {
-			while (*cursor == ',' || *cursor == ' ') ++cursor;
-			if (*cursor == '\0') break;
-			char* end = nullptr;
-			const auto value = std::strtoull(cursor, &end, 16);
-			if (end == cursor || (*end != '\0' && *end != ',' && *end != ' ')) break;
-			addresses.push_back(value);
-			cursor = end;
-		}
-		return addresses;
-	}();
-	return std::any_of(watched.begin(), watched.end(), [=](uint64_t point) {
-		return point >= address && point - address < size;
-	});
+	const auto count = g_traced_count.load(std::memory_order_acquire);
+	for (uint32_t i = 0; i < count; ++i) {
+		const auto point = g_traced[i].load(std::memory_order_relaxed);
+		if (point >= address && point - address < size) return true;
+	}
+	return false;
 }
 
 void TraceResourceBinding(uint64_t frame, const std::string& binding) {
@@ -102,7 +165,14 @@ void TraceResourceBinding(uint64_t frame, const std::string& binding) {
 	static std::unordered_set<std::string> seen;
 	std::scoped_lock guard {lock};
 	// Bound diagnostic memory and output even when a watched range is frequently reused.
-	if (seen.size() < 4096 && seen.insert(binding).second) {
+	// The key excludes the frame, so each distinct binding logs once with its FIRST sighting.
+	// Image ids churn as the cache recreates images, so a run long enough to reach a fight
+	// produces thousands of distinct lines; at 4096 the budget was spent in the menus and
+	// the round - the only part under study - logged nothing.
+	// Image ids churn every frame, so the key never collapses and the budget is really
+	// "how many traced frames fit". One address costs ~15 lines/frame; two cost ~30, and a
+	// run long enough to reach a round is ~2000 frames.
+	if (seen.size() < 200000 && seen.insert(binding).second) {
 		LOGF("ResourceTrace: frame=%" PRIu64 " %s\n", frame, binding.c_str());
 	}
 }

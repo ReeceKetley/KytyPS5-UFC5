@@ -1033,11 +1033,16 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			// Report the view actually returned by the cache, not just the guest request.
 			const auto actual = std::find_if(image.views.begin(), image.views.end(),
 			    [&](const auto& view) { return view.view == binding.image_view; });
-			const auto message = fmt::format("stage={} hash=0x{:016x} image={} addr=0x{:x} bytes={} "
+			// image_id is the texture-cache slot actually resolved for this binding. Two
+			// consumers of one guest address can legally receive different slots (the address
+			// is recycled across resources), so the slot is what decides an alias claim.
+			const auto message = fmt::format("stage={} hash=0x{:016x} image={} image_id={}.{} "
+			                "addr=0x{:x} bytes={} "
 			                "read={} write={} numeric={} guest_format={} requested_vk={} "
 			                "backing_vk={} actual_vk={} extent={}x{} mip={}+{} layer={}+{} "
 			                "backing_addr=0x{:x} backing_levels={} backing_layers={}",
 			                static_cast<uint32_t>(program.stage), program.shader_hash, i,
+			                binding.image_id.index, binding.image_id.generation,
 			                binding.desc.info.data.address, binding.desc.info.data.size,
 			                resource.read, resource.written, static_cast<uint32_t>(resource.numeric_class),
 			                static_cast<uint32_t>(binding.desc.info.guest_format),

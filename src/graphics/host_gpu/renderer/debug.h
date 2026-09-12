@@ -36,6 +36,15 @@ bool                     graphics_debug_dump_enabled();
 // guest addresses; log the first occurrence of each distinct binding only.
 bool                     TraceResourceAddress(uint64_t address, uint64_t size);
 void                     TraceResourceBinding(uint64_t frame, const std::string& binding);
+// Re-read the watch list from D:/PS5/dumps/TRACE_ADDRS when that file changes, so a new
+// address can be watched without restarting - a restart costs a full manual re-navigation
+// into a fight, which is the dominant cost of every measurement in this investigation.
+// Call once per frame; it only touches the filesystem when the trigger file is present.
+void                     RefreshTracedResources();
+// Shader hashes selected for full input capture. Reloadable at runtime from
+// D:/PS5/dumps/CAPTURE_HASHES, seeded from KYTY_CAPTURE_INPUTS_HASH.
+bool                     IsCapturedShaderHash(uint64_t hash);
+bool                     AnyCapturedShaderHash();
 // Capture the first binding of each selected hash at/after KYTY_CAPTURE_INPUTS_FRAME.
 bool                     CaptureShaderInputs(uint64_t hash, uint64_t frame);
 void                     DumpShaderInput(CommandBuffer& command, RenderContext& renderer,
