@@ -842,6 +842,47 @@ Tooling: `scratchpad/nanmap.py`, `nanmap2.py`, `nanmap3.py`, `series.py`. **Deco
 `.view(np.float16)`, never `.astype`** — astype converts the integer value and silently produces a
 clean-looking, entirely wrong result (cost one iteration here).
 
+**6. RETRACTED, SAME SESSION: "the NaN spreads from a seed." IT DOES NOT. ch0/ch1/ch2 ARE DEGENERATE
+IN EVERY CAPTURE EVER TAKEN, INCLUDING THE MENU.**
+
+Point 5 read the non-NaN edge band as healthy pixels that had escaped the corruption. **They are not
+healthy — they are saturated.** Checking content instead of just NaN-ness:
+```
+f5341 p0  ("0.0000% NaN", read as CLEAN)
+  ch0  100.00% zeros        distinct 1   value 0
+  ch1    0.00% zeros        distinct 1   value -65504
+  ch2    0.00% zeros        distinct 1   value +65504
+  ch3                       distinct 997  0.27759 .. 1.2461     HEALTHY
+```
+Those are **the same three constants** as the "non-NaN remainder" in the corrupt frames. Every
+capture behaves this way. `f55` (menu) p0 is all-zeros in all four channels — an unwritten buffer —
+and p1 is ch0=0, ch1=-7.6294e-06, ch2=1.5259e-05 (one distinct value each), ch3 966 distinct and
+healthy. Same degeneracy, smaller magnitudes.
+
+**In no capture, at any frame, has ch0, ch1 or ch2 ever carried per-pixel information. Only ch3
+ever has.**
+
+CONSEQUENCES, and they are large:
+- **There is no transition to find.** The history was never clean, so "capture across the walk-in and
+  find the frame where it turns" cannot work. The walk-in capture plan built this session
+  (`tools/capture_walkin.ps1`) is **not** the priority any more.
+- **"The injection only had to corrupt one pixel once" is withdrawn.** Nothing is spreading. The
+  three channels are wrong for every pixel from the first dispatch.
+- **The whole framing of the NaN as a temporal accumulation failure is suspect.** NaN vs saturated
+  looks like two failure states of the same broken computation, not cause and effect.
+- **This should reproduce in a SINGLE dispatch with synthetic clean inputs**, which makes the offline
+  replay through `tests/ShaderRecompilerComputeTests.cpp` (raw RDNA2 code + real GPU readback) the
+  decisive next experiment. **It needs no navigation at all.**
+
+What the constants say, given the store is `v0=v1*v36`, `v1=v1*v29`, `v2=v1*v30`, `v3` untouched:
+ch0 pinned to 0 wants `v36 == 0`; ch1 to -65504 and ch2 to +65504 want `v1*v29` and `v1*v30` to
+saturate opposite ways. That is consistent with the old session-7c observation of uniform
+`v11=0, v12=v13=0.49976, v17=0, v31=0` across 100% of pixels — which was withdrawn as a claim about
+block 4 executing, but the **uniformity** in it was never the part that was wrong.
+
+The survivor geometry in point 5 is a real measurement and stands; only the interpretation hung on it
+is withdrawn.
+
 ### SESSION 8 (2026-09-12) — BLOCK 4 **DOES** EXECUTE. 7c WITHDRAWN. THE PROBE WAS READING TWO PASSES AT ONCE.
 
 **THE MEASUREMENT DEFECT, AND IT INVALIDATES EVERY PROBE NUMBER IN SESSION 7.**
