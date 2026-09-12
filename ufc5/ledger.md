@@ -1,6 +1,12 @@
 # UFC 5 / KytyPS5 ledger
 
-Last updated: 2026-09-11 session 5 — **THE BLACK ROUND DIRECTLY CONSUMES OUTPUT FROM THE SKIPPED WAVE64 CS.**
+Last updated: 2026-09-12 session 7 — **THE BLACK ROUND IS NaN IN THE TEMPORAL UPSCALER'S HISTORY
+BUFFER. BOTH IMAGE-ALIAS THEORIES ARE DEAD, BY MEASUREMENT.** The game renders the fight at
+1068x600 and temporally upscales to 1600x900. Every *fresh* input to that upscale pass is clean;
+its own history buffer is 37-41% NaN and feeds itself. See "session 7" below — read it before
+touching the texture cache, which this session rules out as the cause.
+
+Previously: 2026-09-11 session 5 — **THE BLACK ROUND DIRECTLY CONSUMES OUTPUT FROM THE SKIPPED WAVE64 CS.**
 In actual-round frame 1073, CS `0xea0aceac518ec52d` declares `0x1163770000` as read-write buffer 9;
 immediately afterward PS `0x654607b31fe5f6d6` samples that same address as a 1600x900 HDR image. The
 captured input and its downstream output are the same nearly-solid-white image with identical SHA256.
@@ -451,7 +457,126 @@ one frame.
 and `graphics_debug_dump_enabled()` keys off it, so without it every counter is silently
 discarded and the log looks fine but contains no measurements. The script always passes it.
 
-### THE BLACK ROUND IS AN IMAGE ALIAS AT 0x1162c00000 (2026-09-12, session 6)
+### SESSION 7 (2026-09-12) — THE BLACK ROUND IS NaN IN THE TEMPORAL UPSCALER HISTORY
+
+**Both alias theories are refuted by direct per-frame measurement. Do not write descriptor-exact
+cache resolution for this bug; it would fix nothing.**
+
+Method for both: `ResourceTrace` now logs the resolved cache `image_id` (`descriptors.cpp` for
+shader bindings, `renderDraw.cpp` for colour targets). Compare, per frame, the id the producer
+wrote against the id the consumer read. Image ids are recreated most frames, so a match is a fresh
+agreement each frame, not one sticky coincidence.
+
+```
+0x1162c00000  composite CS read id  vs  1600x900 scene target id : IDENTICAL in 240/240 in-round frames
+0x1163770000  CS write id           vs  PS read id (1600x900)    : IDENTICAL in 400/400 in-round frames
+0x1162c00000  400x225 twin          vs  1600x900 twin            : never share an id (0/239)
+```
+The twins are real and `FindImageFromRange`'s score does tie — but nothing resolves wrongly.
+Session 6's "the fix is descriptor-exact resolution" is withdrawn.
+
+**Why session 6 read it as empty: the dump had the same defect as the old hardcoded address list.**
+`DumpUfcSurfaces` called `FindImageFromRange` once and dumped the single winner, which in-round is
+the 400x225 twin. The 1600x900 image the composite actually reads had never been dumped. It now
+dumps **every** image at an address, extent in the filename (`rt62c00000-1600x900-i2547.bmp`), via
+`TextureCache::FindAllImagesAtAddress`. **A diagnostic that resolves an address the same ambiguous
+way as the code under study cannot detect the ambiguity.** That is twice this exact trap.
+
+**THE ACTUAL PIPELINE.** The game renders at **1068x600** and temporally upscales to 1600x900
+(1.5x). The complete, correct, per-frame-changing fight scene lives at `0x1163770000` as a
+**1068x600 R8G8B8A8_SRGB** image — that is the native render, not a side artifact.
+
+```
+CS 0xe17349e0d437757b   temporal upscale, ping-pong 0x12c0800000 <-> 0x12c1800000 (R16G16B16A16_SFLOAT)
+CS 0x3c6058d66788f544   -> 0x1163770000 @1600x900 B10G11R11      50.6% NaN
+PS 0x654607b31fe5f6d6   -> 0x116d300000 @1600x900                50.6% NaN (identical counts: passthrough)
+PS 0x811633d84dc57d64   -> 0x1164650000 @1600x900
+PS 0x708f302a5ca890f0   -> 0x1162c00000 @1600x900                54-67% NaN in, ~0.9% nonzero out
+CS 0x3fcdc0204856be9a   -> 0x111a800000 scanout                  HUD only
+```
+
+**THE ORIGIN: the upscaler's own history.** Every fresh input is clean; only the history is NaN:
+```
+0x11af8b0000  vk=37  R8G8B8A8_UNORM        0.00%
+0x1161fb0000  vk=37  R8G8B8A8_UNORM        0.00%
+0x115f6d0000  vk=122 B10G11R11_UFLOAT      0.00%
+0x12c0000000  vk=122 B10G11R11_UFLOAT      0.00%
+0x11ae800000  vk=91  R16G16B16A16_UNORM    0.00%  (integer - cannot be NaN)
+0x12c1800000  vk=97  R16G16B16A16_SFLOAT   36.93% -> 40.83%   <- its own history
+```
+`0x1162c00000`'s 1600x900 image is genuinely black (0.06-0.88% nonzero). The tonemap is not
+broken; it is faithfully tonemapping NaN. **The prime suspect is now arithmetic inside
+`CS 0xe17349e0d437757b` generating NaN (rcp/sqrt/0*inf, or an uninitialised read from our
+recompiler), which then spreads through the sampling kernel into its own history.**
+
+**MY OWN ERROR, RECORDED SO IT IS NOT REDISCOVERED.** I first called `0x11ae800000` the NaN source:
+channels 1 and 2 are uniformly `0x7FFF` in all 640,800 pixels. That is only NaN if the buffer is
+float16. It is `vk=91` **R16G16B16A16_UNORM**, where `0x7FFF` = 32767/65535 = 0.5 — the correct
+"zero motion" value for a biased motion-vector buffer. **Read `actual_vk` from `CaptureBinding`
+before decoding any raw dump; never infer a format from bytes-per-pixel.** `.bin` captures are raw
+(`DumpGpuImage(..., raw=true)`) and `.bmp` companions are converted and clamped, so an HDR buffer
+whose values all exceed 1.0 looks like solid white in the `.bmp` and says nothing about its
+contents. `0x116d300000`'s "binary 0/255 histogram" was that artifact, not evidence.
+
+**SETTLED BY EXPERIMENT: `CS 0xe17349e0d437757b` GENERATES THE NaN FROM CLEAN INPUTS.**
+A one-shot zeroing of the ping-pong pair (`ClearImagesAtAddress`, file-triggered, below) gives:
+```
+frame 1047   clear fired on both history buffers
+frame 1048   history NaN =  0.00%     clear fully effective
+frame 1050   history NaN = 74.34%     fully back within TWO frames
+frame 1053   history NaN = 74.74%
+```
+The user sees exactly one clean frame — "it flashed and the screen went blue then went back to
+black". With **every fresh input at 0.00% NaN** and the history verified at 0.00%, the pass still
+produces ~74% NaN two frames later. Nothing is propagating in; the arithmetic itself produces NaN.
+**This is a shader translation bug in our recompiler, not a cache, alias, or data-flow problem.**
+Poisoning-once is refuted: clearing does not fix it even briefly beyond one frame.
+
+Note the ping-pong addresses are **allocated per run** (`0x12c0800000`/`0x12c1800000` one run,
+`0x12c4000000`/`0x12c3000000` the next). Do not hardcode them; read them from the pass's
+`CaptureBinding` list each run (the read is `image=3`, the write `image=12`).
+
+**NEXT: find the NaN-producing operation in `CS 0xe17349e0d437757b`.** The NaN fraction (~74%) is
+large and stable, so it is a common path, not a rare edge case. The shader is already dumped:
+`D:\PS5\shader-dumps\CS_e17349e0d437757b.{rdna2,ir.txt,spv,cfg.txt}` (dump more with
+`KYTY_DUMP_SHADER_HASH`). Opcode mix, ~1500 instructions:
+```
+150 V_MUL_F32   94 V_MAC_F32   77 V_MAD_F32   50 V_MAD_MIXLO_F16   44 V_MAD_MIXHI_F16
+37 V_ADD_F32   26 V_SUB_F32   25 V_MIN_F32   23 V_MAX_F32   18 V_RCP_F32
+15 V_MIN3_F32  14 V_MAX3_F32   8 V_CVT_PKRTZ_F16_F32   6 V_PK_MAX_F16
+```
+
+**Already checked and NOT the bug — do not re-audit these:**
+- `V_MAD_MIXLO/HI_F16` source selection. `ReadMixF32` (`Translate.cpp`) implements the ISA rule
+  correctly: `op_sel_hi[i]=1` -> fp16 (half chosen by `op_sel[i]`), `op_sel_hi[i]=0` -> fp32.
+- MAD_MIX with **inline-constant** sources, which is what this shader uses almost everywhere
+  (`1.000000.opsel(lo=0,hi=1)`). It looks like the `op_sel_hi=1` path would bit-extract the low
+  half of `0x3F800000` and yield 0.0, but `ReadF16LaneAsF32` special-cases
+  `FloatInlineConstant` (Translate.cpp:488) and round-trips the fp32 value through f16, so `1.0`
+  stays `1.0`. `packed` is false on this path, so the `use_zero` branch does not apply.
+- Half-preservation on the destination. `Write16Bits` sets `sdwa_dst_unused=2` (preserve), and
+  `DecodeVop3p` sets `dst.sdwa_sel` 4 for MIXLO / 5 for MIXHI.
+
+The 18 `V_RCP_F32` remain the most likely NaN origin (a reciprocal of 0 gives Inf, and `Inf-Inf`
+or `0*Inf` downstream gives NaN). **Suggested approach: bisect empirically rather than by reading.**
+The clear-trigger makes this cheap - clear the history, then A/B a candidate change and watch
+whether the NaN fraction returns within two frames.
+
+**Tooling added this session — all opt-in, default inert, and it removes the restart tax.**
+A restart costs a full manual re-navigation into a fight, which was the dominant cost of every
+measurement here. Both watch lists are now reloadable at runtime, refreshed once per frame from
+`DumpUfcSurfaces` (before its dump check, so it stays live on non-dump frames):
+- `D:/PS5/dumps/TRACE_ADDRS` — watched addresses, seeded from `KYTY_TRACE_RESOURCES`
+- `D:/PS5/dumps/CAPTURE_HASHES` — shader hashes for full input capture, seeded from `KYTY_CAPTURE_INPUTS_HASH`
+- `D:/PS5/dumps/DUMP_NOW` / `DUMP_INPUTS` — existing file triggers; dumps can be taken without the user pressing anything
+Both lists are lock-free fixed arrays, not a vector behind a mutex: `TraceResourceAddress` runs on
+every binding of every draw. `CaptureShaderInputs` is called per draw, so its hash check must not
+copy a set.
+- The `ResourceTrace` dedupe key excludes the frame, so each distinct binding logs once with its
+  first sighting. Ids churn per frame, so the key never collapses and the budget is really "how
+  many traced frames fit" — it was 4096 and was fully spent in the menus before the round; now 200k.
+
+### SUPERSEDED (session 7 refutes the conclusion, by per-frame id comparison): THE BLACK ROUND IS AN IMAGE ALIAS AT 0x1162c00000 (2026-09-12, session 6)
 
 **Two different cache images live at guest address `0x1162c00000`. The final scene pass writes the
 1600x900 one; the presenter reads the 400x225 one, which is empty.**
