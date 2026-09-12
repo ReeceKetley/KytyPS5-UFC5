@@ -1,9 +1,8 @@
 #include "common/assert.h"
+#include "graphics/shader/recompiler/frontend/translate/ProbeConfig.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <algorithm>
-#include <cstdlib>
-#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -30,87 +29,19 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 // written" rather than "undefined", and destinations should be scratch registers above everything
 // the shader allocates (the register file is IR::NumVectorRegs deep). Read them back with
 // KYTY_PROBE_VGPR at the store. Scoped by KYTY_PROBE_HASH like the rest of the probe.
-namespace {
-
-constexpr int kProbeMarker = -1;  // write 1.0
-constexpr int kProbeExecLo = -2;  // write the EXEC mask word
-constexpr int kProbeExecZ  = -3;  // write 1.0 when the EXEC mask word is zero, else 0.0
-
-struct ProbeTap {
-	uint32_t pc;
-	int      src;  // >= 0: copy that register. Otherwise one of the kProbe* kinds.
-	uint32_t dst;
-	bool     masked;  // honour EXEC (MARKX) instead of writing unconditionally
-};
-
-std::vector<ProbeTap> ParseProbeTaps() {
-	std::vector<ProbeTap> taps;
-	// `kind` >= 0 reads a register named in the middle field; the kProbe* kinds take <pc>:<dst>.
-	const auto parse = [&taps](const char* cursor, int kind, bool masked) {
-		while (cursor != nullptr && *cursor != '\0') {
-			while (*cursor == ',' || *cursor == ' ') {
-				++cursor;
-			}
-			char*      end = nullptr;
-			const auto pc  = std::strtoul(cursor, &end, 16);
-			if (end == cursor || *end != ':') {
-				break;
-			}
-			cursor   = end + 1;
-			long src = kind;
-			if (kind >= 0) {
-				src = std::strtol(cursor, &end, 10);
-				if (end == cursor || *end != ':' || src < 0 || src >= IR::NumVectorRegs) {
-					break;
-				}
-				cursor = end + 1;
-			}
-			const auto dst = std::strtoul(cursor, &end, 10);
-			if (end == cursor || dst >= IR::NumVectorRegs) {
-				break;
-			}
-			cursor = end;
-			taps.push_back({static_cast<uint32_t>(pc), static_cast<int>(src),
-			                static_cast<uint32_t>(dst), masked});
-		}
-	};
-	parse(std::getenv("KYTY_PROBE_TAP"), 0, false);
-	parse(std::getenv("KYTY_PROBE_MARK"), kProbeMarker, false);
-	parse(std::getenv("KYTY_PROBE_MARKX"), kProbeMarker, true);
-	parse(std::getenv("KYTY_PROBE_EXECLO"), kProbeExecLo, false);
-	parse(std::getenv("KYTY_PROBE_EXECZ"), kProbeExecZ, false);
-	return taps;
-}
-
-const std::vector<ProbeTap>& ProbeTaps() {
-	static const std::vector<ProbeTap> taps = ParseProbeTaps();
-	return taps;
-}
-
-uint64_t ProbeHash() {
-	static const uint64_t hash = [] {
-		const char* env = std::getenv("KYTY_PROBE_HASH");
-		return env == nullptr ? 0ull : std::strtoull(env, nullptr, 16);
-	}();
-	return hash;
-}
-
-} // namespace
+//
+// The configuration is a live snapshot (see ProbeConfig.h): it can be re-aimed mid-run by writing
+// D:/PS5/dumps/PROBE, without restarting and without re-navigating the game. `probe` is taken once
+// per Translator, so one translation always sees one consistent configuration.
 
 uint32_t ProbeScratchVectorLimit(uint64_t shader_hash) {
-	if (ProbeHash() != 0 && ProbeHash() != shader_hash) {
-		return 0;
-	}
-	uint32_t limit = 0;
-	for (const auto& tap: ProbeTaps()) {
-		limit = std::max(limit, tap.dst + 1u);
-	}
-	return limit;
+	const auto config = GetProbeConfig();
+	return config->AppliesTo(shader_hash) ? config->ScratchVectorLimit() : 0u;
 }
 
 void Translator::EmitProbeTaps(uint32_t pc) {
-	const auto& taps = ProbeTaps();
-	if (taps.empty() || (ProbeHash() != 0 && ProbeHash() != current_shader_hash)) {
+	const auto& taps = probe->taps;
+	if (taps.empty() || !probe->AppliesTo(current_shader_hash)) {
 		return;
 	}
 	const auto write = [this](uint32_t dst, IR::U32 value, bool masked) {
@@ -129,14 +60,16 @@ void Translator::EmitProbeTaps(uint32_t pc) {
 			continue;
 		}
 		IR::U32 value {IR::Value(0x3f800000u)};  // 1.0f
-		switch (tap.src) {
-			case kProbeMarker: break;
-			case kProbeExecLo: value = ir.GetExecLo(); break;
-			case kProbeExecZ:
+		switch (tap.kind) {
+			case ProbeTap::Kind::Marker: break;
+			case ProbeTap::Kind::ExecLo: value = ir.GetExecLo(); break;
+			case ProbeTap::Kind::ExecZ:
 				value = ir.Select(MaskIsZero(false), IR::U32(IR::Value(0x3f800000u)),
 				                  IR::U32(IR::Value(0u)));
 				break;
-			default: value = ir.GetVectorReg(static_cast<IR::VectorReg>(tap.src)); break;
+			case ProbeTap::Kind::Copy:
+				value = ir.GetVectorReg(static_cast<IR::VectorReg>(tap.src));
+				break;
 		}
 		write(tap.dst, value, tap.masked);
 	}

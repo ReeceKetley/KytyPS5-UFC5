@@ -1,9 +1,11 @@
 #pragma once
 
+#include "graphics/shader/recompiler/frontend/translate/ProbeConfig.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 
 #include <array>
+#include <memory>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -271,6 +273,9 @@ private:
 	uint32_t        current_vector_limit = 1;
 	uint64_t        current_shader_hash  = 0;
 	uint32_t        current_wave_size    = 64;
+	// Diagnostic probe, taken once so one translation sees one configuration even if the live
+	// config is re-aimed mid-run. Never null; inert unless configured.
+	std::shared_ptr<const ProbeConfig> probe = GetProbeConfig();
 };
 
 // Diagnostic only (KYTY_PROBE_MARK/MARKX/TAP), default OFF. The probe writes into scratch vector

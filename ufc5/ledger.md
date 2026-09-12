@@ -702,6 +702,30 @@ with `KYTY_PROBE_VGPR` at the store as before.
   scratch writes are dead-code-eliminated when nothing reads them, so word counts do not move —
   that test proves the build is sound, not that a tap fired; the in-run control marker does that).
 
+**THE PROBE IS NOW LIVE-RECONFIGURABLE — a re-aim costs a file write, not a restart.**
+`D:/PS5/dumps/PROBE` (override with `KYTY_PROBE_FILE`) is re-read whenever it changes, next to the
+existing `TRACE_ADDRS`/`CAPTURE_HASHES` reloads. It is seeded from the `KYTY_PROBE_*` environment at
+startup, **replaces** the configuration wholesale when present, and reverts to the environment when
+deleted. `D:/PS5/dumps/PROBE.example` documents the keys (`hash`, `pc`, `vgpr`, `mark`, `markx`,
+`tap`, `execlo`, `execz`).
+- **Why it re-translates instead of serving the cached shader:** changing the probe bumps
+  `ShaderRecompiler::ProbeConfigGeneration()`, which is part of `ProgramKey` in `pipelineCache.cpp`.
+  The old entry is deliberately **not** erased — `CompiledShaderInfo` pointers handed out earlier
+  stay valid, and pipelines are keyed by shader id which is never reused, so the stale permutation
+  simply stops being looked up. A re-aim leaks one shader module and one pipeline; that is the right
+  trade for saving a navigation.
+- **Measured at the menu, no fight needed:** writing the file logs
+  `ProbeConfig: reloaded generation=N ...` and the targeted shader's `ShaderCompile: CS` count goes
+  up by one on the next dispatch. Three re-aims plus a delete, 381 shader compiles, **0 device
+  losses, 0 validation errors, 0 CFG failures.**
+- **Trap found by that test, and it would have been silent:** Windows PowerShell's
+  `Set-Content -Encoding utf8` writes a **BOM**, so a file starting with `hash=` parsed as the key
+  `<BOM>hash` and the whole configuration came back empty — while still bumping the generation and
+  re-translating, so it looked like it had worked. The BOM is now stripped and unrecognised keys are
+  counted and logged. **A probe that reports `taps=0` is telling you it parsed nothing.**
+- The config is taken as a snapshot once per `Translator`, so one translation always sees one
+  consistent configuration even if the file changes mid-compile.
+
 **NEXT, and it is a clean slate: every value reading in session 7 needs redoing per-pass.** The
 region runs, so the defect is in what it computes. Re-probe `v29,v30,v31` and the block-4 outputs
 with `KYTY_CAPTURE_OCCURRENCES=2`, then bisect the arithmetic with `KYTY_PROBE_TAP` at chosen pcs —

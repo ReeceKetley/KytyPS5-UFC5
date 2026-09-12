@@ -225,6 +225,13 @@ struct PipelineCache::ProgramCache {
 		uint64_t              hash            = 0;
 		uint32_t              user_data_count = 0;
 		uint32_t              code_size       = 0;
+		// Diagnostic shader probe (ShaderRecompiler::ProbeConfigGeneration), 0 unless one is
+		// configured. Re-aiming the probe changes the emitted SPIR-V, so it has to change the key
+		// or an already translated shader would be served from the cache with the old probe still
+		// baked in. Keying it rather than erasing the old entry is deliberate: entries stay put, so
+		// the CompiledShaderInfo pointers handed out earlier remain valid, and the stale
+		// permutation simply stops being looked up.
+		uint32_t              probe_generation = 0;
 		std::vector<uint32_t> static_state;
 
 		bool operator==(const ProgramKey&) const = default;
@@ -255,6 +262,7 @@ struct PipelineCache::ProgramCache {
 			}
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
+			PipelineKeyHash::Mix(hash, key.probe_generation);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
 			// Bucket same-shape static variants by source. ProgramKey equality performs the one
 			// exact state comparison needed on a stable hit without hashing up to 429 words first.
@@ -352,6 +360,7 @@ struct PipelineCache::ProgramCache {
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+		lookup_key.probe_generation = ShaderRecompiler::ProbeConfigGeneration();
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
 		const auto                                   prof_t1 = Common::Timer::QueryPerformanceCounter();

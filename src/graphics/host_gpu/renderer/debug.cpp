@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 
 #include <algorithm>
 #include <array>
@@ -157,6 +158,9 @@ void RefreshTracedResources() {
 		LOGF("CaptureHashes: reloaded %u hash(es): %s\n",
 		     g_captured_count.load(std::memory_order_acquire), text.c_str());
 	}
+	// Same idea for the shader probe, which additionally forces a re-translation of the shaders it
+	// applies to - so what is measured can be changed without restarting and re-navigating.
+	ShaderRecompiler::ReloadProbeConfig();
 }
 
 bool TraceResourceAddress(uint64_t address, uint64_t size) {

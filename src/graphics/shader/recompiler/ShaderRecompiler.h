@@ -38,6 +38,15 @@ struct CompileResult {
 	IR::Program            program;
 };
 
+// Diagnostic shader probe (KYTY_PROBE_*), default inert. `ReloadProbeConfig` re-reads
+// D:/PS5/dumps/PROBE when it changes and is meant to be called once per frame; changing the probe
+// bumps `ProbeConfigGeneration`, which belongs in the shader cache's program key so an already
+// translated shader is re-translated with the new probe instead of being served from the cache.
+// This is what makes a probe re-aim cost a file write rather than a restart and a manual
+// re-navigation into the game. See frontend/translate/ProbeConfig.h.
+void                   ReloadProbeConfig();
+[[nodiscard]] uint32_t ProbeConfigGeneration();
+
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);
 [[nodiscard]] CompileResult CompileProgram(TranslateResult translated,

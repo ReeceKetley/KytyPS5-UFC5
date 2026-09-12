@@ -698,51 +698,26 @@ IR::Value Translator::SanitizeStoredNaN(IR::Value data) {
 // its value as a float, so a predicate register (e.g. the V_CMPX source) can be compared per pixel
 // against where the output is corrupt.
 IR::Value Translator::ProbeStoredVgpr(IR::Value data, uint32_t pc) {
-	// KYTY_PROBE_PC selects WHICH store to hijack, by instruction pc. A shader with more than one
-	// IMAGE_STORE otherwise has every store replaced, and the captured buffer may not be the one
-	// being read back - which is exactly how the first probe run produced two different values for
-	// the same register.
-	static const uint32_t probe_pc = [] {
-		const char* env = std::getenv("KYTY_PROBE_PC");
-		return env == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(env, nullptr, 16));
-	}();
-	if (probe_pc != 0 && probe_pc != pc) {
+	// `pc` (KYTY_PROBE_PC / `pc=` in the probe file) selects WHICH store to hijack. A shader with
+	// more than one IMAGE_STORE otherwise has every store replaced, and the captured buffer may not
+	// be the one being read back - which is exactly how the first probe run produced two different
+	// values for the same register.
+	if (probe->store_pc != 0 && probe->store_pc != pc) {
 		return data;
 	}
-	// Up to four comma-separated registers, one per stored channel, so a single navigation into a
-	// fight reads four registers instead of one. Fewer than four leaves the rest at -1 (untouched).
-	static const std::array<int, 4> probes = [] {
-		std::array<int, 4> list {-1, -1, -1, -1};
-		const char*        cursor = std::getenv("KYTY_PROBE_VGPR");
-		for (uint32_t index = 0; cursor != nullptr && *cursor != '\0' && index < 4u; index++) {
-			while (*cursor == ',' || *cursor == ' ') {
-				++cursor;
-			}
-			char* end = nullptr;
-			const auto value = std::strtol(cursor, &end, 10);
-			if (end == cursor) {
-				break;
-			}
-			list[index] = static_cast<int>(value);
-			cursor       = end;
-		}
-		return list;
-	}();
-	const int probe = probes[0];
-	// Scope to one shader (KYTY_PROBE_HASH). Without it, probing a low register number replaces
-	// every image store in the game - including the menus - and navigating to a fight becomes
-	// impossible. Also refuse a register the shader does not allocate.
-	static const uint64_t probe_hash = [] {
-		const char* env = std::getenv("KYTY_PROBE_HASH");
-		return env == nullptr ? 0ull : std::strtoull(env, nullptr, 16);
-	}();
-	if (probe < 0 || static_cast<uint32_t>(probe) >= current_vector_limit ||
-	    (probe_hash != 0 && probe_hash != current_shader_hash)) {
+	// Up to four registers, one per stored channel, so a single navigation into a fight reads four
+	// registers instead of one. Fewer than four leaves the rest untouched.
+	// Scoping to one shader hash matters: without it, probing a low register number replaces every
+	// image store in the game - including the menus - and navigating to a fight becomes impossible.
+	// Also refuse a register the shader does not allocate.
+	const int first = probe->vgpr[0];
+	if (first < 0 || static_cast<uint32_t>(first) >= current_vector_limit ||
+	    !probe->AppliesTo(current_shader_hash)) {
 		return data;
 	}
 	std::array<IR::Value, 4> components {};
 	for (uint32_t index = 0; index < 4u; index++) {
-		const int reg = probes[index];
+		const int reg = probe->vgpr[index];
 		components[index] =
 		    (reg >= 0 && static_cast<uint32_t>(reg) < current_vector_limit)
 		        ? IR::Value(ir.GetVectorReg(static_cast<IR::VectorReg>(reg)))
