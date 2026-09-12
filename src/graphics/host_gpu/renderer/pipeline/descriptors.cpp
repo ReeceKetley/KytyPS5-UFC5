@@ -969,7 +969,10 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
-	const bool capture_inputs = CaptureShaderInputs(program.shader_hash, m_context.GetGpu().GetFrameNum());
+	// >= 0 is the occurrence of this hash within the captured frame; a shader dispatched twice in
+	// one frame is two different passes and must not be conflated.
+	const int  capture_pass    = CaptureShaderInputs(program.shader_hash, m_context.GetGpu().GetFrameNum());
+	const bool capture_inputs  = capture_pass >= 0;
 	static const bool capture_buffers = std::getenv("KYTY_CAPTURE_INPUT_BUFFERS") != nullptr;
 	if (capture_inputs && capture_buffers) {
 		for (uint32_t i = 0; i < prepared.buffers.size(); ++i) {
@@ -981,7 +984,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			const auto adjustment = (prepared.shader_data[dword] >> ((i % 4u) * 8u)) & 0xffu;
 			DumpShaderBufferInput(m_context.GetCommandScheduler().Current(), m_context,
 			    buffer.buffer, buffer.offset + adjustment, source.size,
-			    fmt::format("input-{:016x}-b{}-{:x}", program.shader_hash, i, source.address));
+			    fmt::format("input-{:016x}-p{}-b{}-{:x}", program.shader_hash, capture_pass, i,
+			                source.address));
 			LOGF("CaptureBuffer: frame=%" PRIu64 " hash=0x%016" PRIx64
 			     " buffer=%u addr=0x%" PRIx64 " bytes=%" PRIu64 " adjustment=%u\n",
 			     static_cast<uint64_t>(m_context.GetGpu().GetFrameNum()), program.shader_hash,
@@ -1027,7 +1031,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		if (capture_inputs && resource.read && binding.desc.view_info.base_level == 0 &&
 		    binding.desc.view_info.base_layer == 0 && image.backing.layers == 1) {
 			DumpShaderInput(m_context.GetCommandScheduler().Current(), m_context, image,
-			    fmt::format("input-{:016x}-i{}-{:x}", program.shader_hash, i, image.info.data.address));
+			    fmt::format("input-{:016x}-p{}-i{}-{:x}", program.shader_hash, capture_pass, i,
+			                image.info.data.address));
 		}
 		if (capture_inputs || TraceResourceAddress(binding.desc.info.data.address, binding.desc.info.data.size)) {
 			// Report the view actually returned by the cache, not just the guest request.
@@ -1053,8 +1058,9 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			                binding.desc.view_info.base_layer, binding.desc.view_info.layer_count,
 			                image.info.data.address, image.backing.mip_levels, image.backing.layers);
 			if (capture_inputs) {
-				LOGF("CaptureBinding: frame=%" PRIu64 " %s\n",
-				     static_cast<uint64_t>(m_context.GetGpu().GetFrameNum()), message.c_str());
+				LOGF("CaptureBinding: frame=%" PRIu64 " pass=%d %s\n",
+				     static_cast<uint64_t>(m_context.GetGpu().GetFrameNum()), capture_pass,
+				     message.c_str());
 			} else {
 				TraceResourceBinding(m_context.GetGpu().GetFrameNum(), message);
 			}

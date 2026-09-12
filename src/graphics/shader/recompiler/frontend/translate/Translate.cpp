@@ -1008,6 +1008,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			IncludeInstructionVectorRegisters(instruction, vector_limit);
 		}
 	}
+	// Diagnostic only (KYTY_PROBE_MARK/MARKX/TAP), default OFF: the probe writes into scratch
+	// registers this shader never allocates, so the limit has to reach them.
+	vector_limit = std::min(IR::NumVectorRegs,
+	                        std::max(vector_limit, ProbeScratchVectorLimit(options.shader_hash)));
 
 	result.block_storage.reserve(cfg.blocks.size() + 1u);
 	result.blocks.reserve(cfg.blocks.size() + 1u);

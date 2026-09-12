@@ -46,7 +46,13 @@ void                     RefreshTracedResources();
 bool                     IsCapturedShaderHash(uint64_t hash);
 bool                     AnyCapturedShaderHash();
 // Capture the first binding of each selected hash at/after KYTY_CAPTURE_INPUTS_FRAME.
-bool                     CaptureShaderInputs(uint64_t hash, uint64_t frame);
+// Returns the dispatch/draw occurrence to capture (0 for the first binding of the hash after the
+// trigger, 1 for the second, ...) or -1 to capture nothing. A shader bound more than once in a
+// frame used to have only its FIRST binding captured, so a probe written by one dispatch could be
+// read back out of the other's image - which made two runs of the same probe disagree. The
+// occurrence goes in the dump filename so the passes stay separable.
+// KYTY_CAPTURE_OCCURRENCES (default 1) is how many to take.
+int                      CaptureShaderInputs(uint64_t hash, uint64_t frame);
 void                     DumpShaderInput(CommandBuffer& command, RenderContext& renderer,
                                          Image& image, const std::string& tag);
 void                     DumpShaderBufferInput(CommandBuffer& command, RenderContext& renderer,

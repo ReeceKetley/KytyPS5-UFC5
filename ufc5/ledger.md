@@ -1,6 +1,14 @@
 # UFC 5 / KytyPS5 ledger
 
-Last updated: 2026-09-12 session 7 — **THE BLACK ROUND IS NaN IN THE TEMPORAL UPSCALER'S HISTORY
+Last updated: 2026-09-12 session 8 — **BLOCK 4 DOES EXECUTE. SESSION 7c IS WITHDRAWN, AND SO IS
+EVERY REGISTER VALUE EVER READ BY THE PROBE.** `CS 0xe17349e0d437757b` is dispatched **twice per
+frame** with different ping-pong images, and the capture only ever recorded the *first* binding of
+the hash — so the probe written by one pass was read back out of the other pass's image. With that
+fixed, direct markers show blocks 3, 4 and 5 executing for **100% of waves in both passes across
+three frames**. The black round is a **value** bug inside a region that runs, not a skipped region.
+See "session 8" below before using any probe number from session 7.
+
+Previously: 2026-09-12 session 7 — **THE BLACK ROUND IS NaN IN THE TEMPORAL UPSCALER'S HISTORY
 BUFFER. BOTH IMAGE-ALIAS THEORIES ARE DEAD, BY MEASUREMENT.** The game renders the fight at
 1068x600 and temporally upscales to 1600x900. Every *fresh* input to that upscale pass is clean;
 its own history buffer is 37-41% NaN and feeds itself. See "session 7" below — read it before
@@ -603,7 +611,108 @@ read; and **block 6 rewrites v29/v30 at `0x166c`/`0x1674` before the store**, so
 reads post-accumulate values, not the block-5 values. Fix: let the probe select a store index, and
 probe only registers block 6 does not overwrite.
 
-### SESSION 7c — BLOCK 4 OF THE UPSCALER NEVER EXECUTES
+### SESSION 8 (2026-09-12) — BLOCK 4 **DOES** EXECUTE. 7c WITHDRAWN. THE PROBE WAS READING TWO PASSES AT ONCE.
+
+**THE MEASUREMENT DEFECT, AND IT INVALIDATES EVERY PROBE NUMBER IN SESSION 7.**
+`CS 0xe17349e0d437757b` is dispatched **twice per frame**, and the two dispatches bind **different**
+ping-pong images (one capture: `p0` history `0x12a3800000`, `p1` history `0x12a1800000`; identical
+`groups=200x113x1 local=8x8x1`, so they are indistinguishable in the dispatch log). Both are real
+game passes, not an emulator replay — the bindings differ. `CaptureShaderInputs` recorded only the
+**first** binding of a hash per trigger (`captured.insert(hash).second`), so the probe values written
+by one pass were read back out of the other pass's image. **The same probe at the same pc gave
+`MARKX@0x113c` = 99.87% ones in one run and 0% in the next.** That is the contradiction that exposed
+it; it also explains session 7's `v87` reading "0..4 in one run and 0..1.53e-5 in the next".
+- **FIX: `KYTY_CAPTURE_OCCURRENCES=<n>` (default 1, i.e. old behaviour).** The pass index is now in
+  the dump filename (`input-<hash>-p<N>-i<M>-<addr>-f<frame>.bin`) and in `CaptureBinding: pass=N`.
+  **Set it to 2 for this shader or the reading is meaningless.**
+- With it on, three consecutive frames in one run agree to within a couple of percent. Cross-run
+  agreement is still not guaranteed — `v87` is genuinely scene-dependent (47-56% zero in one run,
+  0.13% zero in another), so **correlate channels inside one image; never compare across runs.**
+
+**THE RESULT (both passes, 3 frames, 1,440,000 pixels each, no exceptions):**
+```
+waves entering blocks 3-5 (EXECZ@0x113c == 0) : 100.00% of pixels
+block 3 entry marker (raw, at 0x1140) set     : 100.00%
+block 4 entry marker (raw, at 0x148c) set     : 100.00%
+block 6 entry marker (control, at 0x15d4)     : 100.00%
+```
+**Blocks 3, 4 and 5 execute, exactly where the branch condition says they should.** Control flow
+through the `V_CMPX` region is correct. Also measured: `EXECZ@0x190` (the history-validity test that
+guards block 1) is **0 on 100%** of pixels, so block 1 runs too.
+
+**WHY 7c WAS WRONG — the inference had a hole, not the measurement.** 7c probed `v11,v12,v13,v17`
+at the store, found them uniform, and concluded block 4 never ran. But **all four are also written
+in block 3** (`v11`@`0x13b0`, `v12`@`0x1414`, `v13`@`0x1460`, `v17`@`0x1368`), so "block 4 skipped"
+predicts block 3's per-pixel values there, not constants — the reading never fit either hypothesis.
+And the positive control was no control: **`v63` is written in block 2 at `0x1108` and `v74` at
+`0xfd4`**, so their per-pixel variance never proved block 3 runs either. The uniform triple has a
+plain identity: `0x00000ccc IMAGE_LOAD v11, v10, s44 ; dmask=0x7` writes `v11,v12,v13`, and
+`(0, 0.49976, 0.49976)` is `(0, 0.5, 0.5)` — the zero-motion motion-vector value — with 0.5 rounded
+toward zero in f16 (`0x37FF`). Those were block-2 values, read out of the wrong pass's image.
+- **Withdrawn: "block 4 never executes", "block 3 does run (v63 has 1065 distinct values)", and the
+  `S_AND_SAVEEXEC_B32 -> EXEC -> structurizer` lead that followed from them.** The EXECZ fix in
+  `b238b33` is still a genuine ISA conformance fix and is kept; it changed nothing here (re-probed:
+  `v11,v12,v13,v17` bit-identical before and after).
+- **Rule this cost us twice now: a register that is written in more than one block cannot tell you
+  which block ran.** Use a marker written only at the pc under test, and a control marker in a block
+  known to execute.
+
+**THE EXECZ LOWERING IS CORRECT, from the emitted IR (not from reading the translator):**
+```
+%3995 = FPOrdLessThan32 0f, %3698        ; v87 > 0, per lane      (uses=163)
+%3996 = Ballot %3995
+%3997 = CompositeExtractU32x4 %3996, 0   ; the EXEC mask WORD
+%4001 = IEqual32 %3997, 0                ; the branch condition
+```
+`%3698` is the `V_MIN3_F32 v87, v56, v73, v61` at `0xce4`. This is the ISA-correct wave-wide test.
+Note `v61` enters block 2 as `Phi [0x00000000, $1], [%3085, $2]` — a hard zero if block 1 is
+skipped — so *if* the history-validity branch ever did mis-fire, `v87` would go to 0 and the region
+would be skipped for free. It does not mis-fire (measured above), but that is the chain to re-check
+if this ever changes.
+
+**Also settled, and it narrows the search:** the shader's **other** store (`0x16c4`, dmask=0x7, into
+the `B10G11R11` ping-pong) is **healthy** — 1,220 distinct values, **0% NaN, 0% Inf**, and its
+channels match the ISA reading exactly (`v0 = 2*s36 + v9 >= 2`, `v2 = min(1.0, v3) <= 1`). Block 6's
+arithmetic works. The corruption is confined to the `v29/v30/v31` path.
+
+**NEW TOOLING — an arbitrary-pc probe, which is what closes the "cannot tell whether a block ran"
+gap the last session recorded.** All opt-in, default inert, scoped by `KYTY_PROBE_HASH`:
+```
+KYTY_PROBE_MARK=<pc>:<dst>[,...]        at <pc>, v<dst> = 1.0 for every invocation that reaches it,
+                                        ignoring EXEC          -> "was this block executed"
+KYTY_PROBE_MARKX=<pc>:<dst>[,...]       same, but only for lanes whose EXEC bit is set
+                                        -> "was this lane active here"
+KYTY_PROBE_TAP=<pc>:<src>:<dst>[,...]   at <pc>, v<dst> = v<src>, ignoring EXEC
+KYTY_PROBE_EXECLO=<pc>:<dst>[,...]      at <pc>, store the wave-wide EXEC mask WORD
+KYTY_PROBE_EXECZ=<pc>:<dst>[,...]       at <pc>, store MaskIsZero(exec) as 1.0/0.0 - the exact
+                                        condition an S_CBRANCH_EXECZ branches on
+```
+`<pc>` hex, registers decimal. Destinations should be scratch registers **above everything the
+shader allocates** (v88+ here; the file is 256 deep and `vector_limit` is raised to cover them).
+Every destination is zeroed at pc 0, so 0 means "never written", not "undefined". Read them back
+with `KYTY_PROBE_VGPR` at the store as before.
+- **EXEC has two representations and they are separate state**: the per-lane bit (`GetExec()`, what
+  `MARKX` measures, what predicates VGPR writes in `WriteOperand`) and the mask word (`GetExecLo()`,
+  what `MaskIsZero` and therefore every EXECZ branch tests). Probe the one your question is about.
+- **A marker written inside the region under test still has to survive the merge to be read at the
+  store.** That is why the run that settled this measured the branch condition *and* the markers in
+  one image and cross-tabulated them per pixel: markers set on exactly the pixels whose wave entered
+  is proof of execution; markers clear where the wave entered would have been proof of a lost merge.
+- Validated offline first: `shader_cfg_tests` green with the probes set and unset (and note the
+  scratch writes are dead-code-eliminated when nothing reads them, so word counts do not move —
+  that test proves the build is sound, not that a tap fired; the in-run control marker does that).
+
+**NEXT, and it is a clean slate: every value reading in session 7 needs redoing per-pass.** The
+region runs, so the defect is in what it computes. Re-probe `v29,v30,v31` and the block-4 outputs
+with `KYTY_CAPTURE_OCCURRENCES=2`, then bisect the arithmetic with `KYTY_PROBE_TAP` at chosen pcs —
+the tool can now read any register at any point, so this no longer costs one navigation per guess.
+
+**Housekeeping:** the emulator reserves **13,824 MB of commit up front**; two startup failures this
+session were `could not reserve 13824 MB for guest direct memory`, not crashes, because the previous
+instance had not released its commit yet (and one `clang-cl` OOM from the same shortage). Check
+commit headroom before blaming the build.
+
+### SUPERSEDED (session 8 refutes this by direct markers): BLOCK 4 OF THE UPSCALER NEVER EXECUTES
 
 **MEASURED, and this is the strongest result of the session.** Nine registers have their last
 write in the whole shader inside block 4 (`0x148c-0x15b0`): `v18 v13 v14 v15 v16 v17 v12 v11 v31`.
@@ -649,6 +758,8 @@ SPIR-V), so the test was valid.
 EXECZ fix in place. If they now vary, block 4 runs and the black round has a further cause
 downstream. If they are still uniform, the branch is not what is suppressing block 4 and the
 `S_AND_SAVEEXEC_B32` -> EXEC -> structurizer path is where to look.
+**ANSWERED IN SESSION 8: they are bit-identical after the fix, and the whole inference was wrong —
+both branches of that "if" were false. Block 4 executes. See session 8.**
 
 **Audited and correct, on top of the eight above - do not re-read:** `S_OR_B32`/`S_AND_B32` via
 `SimpleInteger` -> `WriteOperand` (updates both the mask word and the per-lane bit),
@@ -661,7 +772,10 @@ KYTY_PROBE_VGPR=33,87,29,30   up to four registers, one per stored channel
 KYTY_PROBE_HASH=<hash>        REQUIRED for low register numbers, or every image store in the
                               game is replaced and the menus cannot be navigated
 KYTY_PROBE_PC=16fc            which store to hijack, by pc - this shader has two
+KYTY_CAPTURE_OCCURRENCES=2    MANDATORY for this shader (session 8) - it is dispatched twice per
+                              frame and without this the readback mixes the two passes
 ```
+**Session 8 adds arbitrary-pc probes (`KYTY_PROBE_MARK/MARKX/TAP/EXECLO/EXECZ`) - see session 8.**
 Read the result out of the upscaler's history via `CAPTURE_HASHES` + `DUMP_INPUTS`, decoding
 `input-<hash>-i3-<addr>-f<N>.bin` as `<f2` (it is `vk=97`, R16G16B16A16_SFLOAT).
 - **Shader dumps live in `D:\PS5\shader-dumps\hang_cs\`, not the root** - the root copies were

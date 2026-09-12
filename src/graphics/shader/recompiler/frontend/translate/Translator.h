@@ -86,6 +86,8 @@ private:
 	IR::Value     SanitizeStoredNaN(IR::Value data);
 	// Diagnostic only (KYTY_PROBE_VGPR), default OFF. See Memory.cpp.
 	IR::Value     ProbeStoredVgpr(IR::Value data, uint32_t pc);
+	// Diagnostic only (KYTY_PROBE_MARK/MARKX/TAP), default OFF. See Dispatch.cpp.
+	void          EmitProbeTaps(uint32_t pc);
 	void          WriteImageComponents(const Decoder::Operand& dst, IR::Value value,
 	                                   const IR::MemoryInfo& memory, uint32_t component_limit);
 	BufferAddress ReadBufferAddress(const Decoder::Instruction& inst, uint32_t source_offset);
@@ -270,5 +272,10 @@ private:
 	uint64_t        current_shader_hash  = 0;
 	uint32_t        current_wave_size    = 64;
 };
+
+// Diagnostic only (KYTY_PROBE_MARK/MARKX/TAP), default OFF. The probe writes into scratch vector
+// registers the shader itself never allocates, so the translation-wide vector limit has to cover
+// them. Returns 0 when no probe is configured for this shader. See Dispatch.cpp.
+uint32_t ProbeScratchVectorLimit(uint64_t shader_hash);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

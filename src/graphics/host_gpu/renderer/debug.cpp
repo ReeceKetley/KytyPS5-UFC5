@@ -19,23 +19,30 @@
 #include <fmt/format.h>
 #include <fstream>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics {
 
-bool CaptureShaderInputs(uint64_t hash, uint64_t frame) {
+int CaptureShaderInputs(uint64_t hash, uint64_t frame) {
 	static const uint64_t after_hash = [] {
 		const char* value = std::getenv("KYTY_CAPTURE_AFTER_HASH");
 		return value == nullptr ? 0ull : std::strtoull(value, nullptr, 16);
 	}();
-	if (after_hash == 0 && !IsCapturedShaderHash(hash)) return false;
+	if (after_hash == 0 && !IsCapturedShaderHash(hash)) return -1;
 	static const auto first_frame = [] {
 		const char* value = std::getenv("KYTY_CAPTURE_INPUTS_FRAME");
 		return value == nullptr ? 0ull : std::strtoull(value, nullptr, 10);
 	}();
-	if (frame < first_frame) return false;
+	if (frame < first_frame) return -1;
+	// How many bindings of the same hash to capture in one trigger. One is the historical
+	// behaviour; raise it when a shader is dispatched more than once per frame.
+	static const uint32_t occurrences = [] {
+		const char* value = std::getenv("KYTY_CAPTURE_OCCURRENCES");
+		return value == nullptr ? 1u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
 	static std::mutex lock;
-	static std::unordered_set<uint64_t> captured;
+	static std::unordered_map<uint64_t, uint32_t> captured;
 	static uint64_t checked_frame = UINT64_MAX;
 	static uint64_t capture_frame = UINT64_MAX;
 	static bool armed = false;
@@ -54,14 +61,15 @@ bool CaptureShaderInputs(uint64_t hash, uint64_t frame) {
 			armed = false;
 			LOGF("InputCapture: begin frame=%" PRIu64 " after_hash=0x%016" PRIx64 "\n", frame, hash);
 		}
-		if (frame != capture_frame) return false;
+		if (frame != capture_frame) return -1;
 		// An after-hash capture used to dump every shader first seen later in the frame,
 		// which can consume the 512 MiB image budget before the small set under study.
 		// When an explicit hash list is supplied, use the after-hash only as the
 		// same-frame trigger and capture resources for that list.
-		if (AnyCapturedShaderHash() && !IsCapturedShaderHash(hash)) return false;
+		if (AnyCapturedShaderHash() && !IsCapturedShaderHash(hash)) return -1;
 	}
-	return captured.insert(hash).second;
+	const auto seen = captured[hash]++;
+	return seen < occurrences ? static_cast<int>(seen) : -1;
 }
 
 // The watch list is read on every image and buffer binding - tens of thousands of calls per
