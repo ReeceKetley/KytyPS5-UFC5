@@ -536,7 +536,60 @@ Note the ping-pong addresses are **allocated per run** (`0x12c0800000`/`0x12c180
 `0x12c4000000`/`0x12c3000000` the next). Do not hardcode them; read them from the pass's
 `CaptureBinding` list each run (the read is `image=3`, the write `image=12`).
 
-**NEXT: find the NaN-producing operation in `CS 0xe17349e0d437757b`.** The NaN fraction (~74%) is
+### SESSION 7b — NaN IS A SYMPTOM. THE CORRUPTION TRACKS THE EXEC-PREDICATED REGION.
+
+**`KYTY_NAN_SANITIZE=1` (new, default OFF, `Memory.cpp` `SanitizeStoredNaN`) replaces float NaN
+with 0 in every stored image component. It is a symptom-hider, not a fix**, and it exists to answer
+one question. With it on, the round **renders**:
+```
+                     before sanitize      after sanitize
+scanout 0x111a800000   ~9% nonzero (HUD)   53.30% nonzero
+scene   0x1162c00000  0.06-0.88%           87.28% nonzero
+upscaler history       37-74% NaN          0.00% NaN AND 0.00% Inf
+```
+The arena, crowd and cage are all visibly there - but posterized to two extremes (black / saturated
+cyan). So NaN was never the defect; the arithmetic is wrong and NaN was its loudest product.
+Removing NaN does not restore correct values, and no Inf remains either.
+
+**THE SHARPEST CLUE SO FAR - the corruption tracks EXEC predication, channel by channel.**
+The fp16x4 history after sanitizing:
+```
+ch0  min=-3.805e4  max=1.638e4  96.6% zero     GARBAGE
+ch1  min=-6.55e4   max=1.638e4  69.8% zero     GARBAGE   (negative colour, 7.42% pinned at f16 max)
+ch2  min=-3.782e4  max=6.55e4   69.8% zero     GARBAGE
+ch3  min=0.1981    max=5.07     mean=3.67      SANE
+```
+Tracing the final `IMAGE_STORE v0, v47, s12 (dmask=0xf)` in block 6 back to the last write before
+that block:
+```
+v29 0x15c8  block 5  (inside the V_CMPX-predicated region)  -> ch0   GARBAGE
+v36 0x15cc  block 5  (inside the V_CMPX-predicated region)  -> ch1   GARBAGE
+v30 0x15d0  block 5  (inside the V_CMPX-predicated region)  -> ch2   GARBAGE
+v32 0x0928  block 2  (always executes)                      -> ch3   CORRECT
+v33 0x112c  block 2  (always executes)                      -> ch3   CORRECT
+```
+**Every corrupt channel comes from the predicated region; the one correct channel does not.** The
+region is entered by `0x1138 V_CMPX_LT_F32 exec_lo, 0, v87` + `S_CBRANCH_EXECZ`, narrowed at
+`0x1484 S_AND_SAVEEXEC_B32 vcc_hi, vcc_lo`, and restored at `0x15b0 S_MOV_B32 exec_lo, vcc_hi`.
+`vcc_hi` is not rewritten between the save and the restore, so the guest idiom is sound.
+
+**AUDITED AND CORRECT - do not re-read these.** Eight candidates, all faithful to the ISA:
+`V_MAD_MIX` source selection (`ReadMixF32`), MAD_MIX inline constants (`Translate.cpp:488`),
+MAD_MIX destination half-preservation (`sdwa_dst_unused=2`), `V_CNDMASK_B32` polarity
+(`Select(cond, src1, src0)`), `S_SAVEEXEC` save-before-update ordering (`Control.cpp:25`),
+`WriteCompareResult` ANDing V_CMPX with incoming EXEC, `WriteRawU32` to `ExecLo` rebuilding the
+lane predicate via `ThreadBit`, and the structurizer (clean acyclic CFG, 7 blocks, no loops, no
+failure; zero `OpUndef`, no private variables, so no uninitialised reads).
+
+**NEXT: bisect inside the shader, do not keep auditing opcodes.** Reading one implementation at a
+time has now cost eight correct answers. Add a debug path that stores a chosen VGPR at a chosen PC
+into a scratch image, then walk backwards from `v29/v30/v36` through blocks 3-5 to the first value
+that diverges from a plausible range. The suspects it should confirm or kill, in order: the
+unguarded `0x1630 V_RCP_F32 v2, v5` where `v5 = v33 + v87` (a 0/0 there gives NaN and a near-zero
+denominator gives the ±65504 magnitudes), and whether blocks 3-5 apply their results to the right
+lanes at all.
+
+### SESSION 7a: find the NaN-producing operation in `CS 0xe17349e0d437757b`. The NaN fraction (~74%) is
 large and stable, so it is a common path, not a rare edge case. The shader is already dumped:
 `D:\PS5\shader-dumps\CS_e17349e0d437757b.{rdna2,ir.txt,spv,cfg.txt}` (dump more with
 `KYTY_DUMP_SHADER_HASH`). Opcode mix, ~1500 instructions:

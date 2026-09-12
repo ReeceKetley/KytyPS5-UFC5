@@ -81,6 +81,8 @@ private:
 	IR::Value       GetSamplerResource(const IR::MemoryInfo& memory);
 	IR::Value     MakeImageAddress(const Decoder::Instruction& inst, const Decoder::Operand& base);
 	IR::Value     ConstructU32x4(const Decoder::Operand& base, uint32_t count);
+	// Diagnostic only (KYTY_NAN_SANITIZE), default OFF. See Memory.cpp.
+	IR::Value     SanitizeStoredNaN(IR::Value data);
 	void          WriteImageComponents(const Decoder::Operand& dst, IR::Value value,
 	                                   const IR::MemoryInfo& memory, uint32_t component_limit);
 	BufferAddress ReadBufferAddress(const Decoder::Instruction& inst, uint32_t source_offset);

@@ -669,11 +669,34 @@ bool Translator::IMAGE_LOAD(const Decoder::Instruction& inst) {
 	return true;
 }
 
+// Diagnostic only (KYTY_NAN_SANITIZE=1, default OFF): replace float NaN with 0 in every stored
+// component. This does NOT fix a NaN-producing shader - it hides the symptom. It exists to answer
+// one question: if the NaN is removed at the point of storage and the frame then renders
+// correctly, the rest of the pass computes the right thing and NaN is the whole defect.
+// NaN test on the raw f32 bits: (bits & 0x7fffffff) > 0x7f800000.
+IR::Value Translator::SanitizeStoredNaN(IR::Value data) {
+	static const bool enabled = std::getenv("KYTY_NAN_SANITIZE") != nullptr;
+	if (!enabled) {
+		return data;
+	}
+	std::array<IR::Value, 4> components {};
+	for (uint32_t index = 0; index < 4u; index++) {
+		const auto bits =
+		    IR::U32(ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {data, IR::Value(index)}));
+		const auto magnitude = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x7fffffffu)));
+		const auto is_nan    = ir.UGreaterThan(magnitude, IR::U32(IR::Value(0x7f800000u)));
+		components[index]    = ir.Select(is_nan, IR::U32(IR::Value(0u)), bits);
+	}
+	return ir.Emit(IR::ValueOpcode::CompositeConstructU32x4,
+	               {components[0], components[1], components[2], components[3]});
+}
+
 bool Translator::IMAGE_STORE(const Decoder::Instruction& inst) {
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 1));
-	const auto data     = ConstructU32x4(MemorySourceAt(inst, 0), memory.data_dwords);
+	const auto data =
+	    SanitizeStoredNaN(ConstructU32x4(MemorySourceAt(inst, 0), memory.data_dwords));
 	ir.Emit(IR::ValueOpcode::ImageWrite, {resource, address, data, ir.GetExec()},
 	        AddMemoryInfo(memory, inst.pc));
 	return true;
