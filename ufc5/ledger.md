@@ -581,6 +581,28 @@ MAD_MIX destination half-preservation (`sdwa_dst_unused=2`), `V_CNDMASK_B32` pol
 lane predicate via `ThreadBit`, and the structurizer (clean acyclic CFG, 7 blocks, no loops, no
 failure; zero `OpUndef`, no private variables, so no uninitialised reads).
 
+**THE UNGUARDED RECIPROCAL IS INNOCENT (probe measurement, 2026-09-12).** `KYTY_PROBE_VGPR`
+(below) read the live registers at the store:
+```
+v33  min=0.47217  max=1.249  mean=0.745  ==0: 0.00%  NaN: 0.00%
+v87  ==0 on 70.42% of pixels, never negative
+v33+v87 == 0 : 0.00%      v33+v87 < 1e-3 : 0.00%
+```
+`v5 = v33 + v87 >= 0.472`, so `0x1630 V_RCP_F32 v2, v5 <= 2.12`. It cannot produce Inf, so the
+`Inf * 0 = NaN` route through `0x164c V_MUL_F32 v2, v2, v33` is **dead**. This was the leading
+hypothesis. The bound rests only on v33's own minimum and v87 being non-negative, so it holds
+regardless of the probe-scale doubt below.
+
+**PROBE CAVEATS - the tool is not yet trustworthy beyond v33.** Do not build on these readings:
+- `v87` measured 0..4 in one run and 0..1.53e-5 in the next, same register and shader. One is wrong.
+- `v29`/`v30` came back near-constant across the whole image, impossible for per-pixel data that
+  measures +/-65504 in the same buffer.
+Two known causes, both fixable: **the shader has two `IMAGE_STORE`s** (`0x16c4` dmask=0x7 and
+`0x16fc` dmask=0xf) and the probe hijacks *both*, so the captured buffer may not be the one being
+read; and **block 6 rewrites v29/v30 at `0x166c`/`0x1674` before the store**, so probing them there
+reads post-accumulate values, not the block-5 values. Fix: let the probe select a store index, and
+probe only registers block 6 does not overwrite.
+
 **NEXT: bisect inside the shader, do not keep auditing opcodes.** Reading one implementation at a
 time has now cost eight correct answers. Add a debug path that stores a chosen VGPR at a chosen PC
 into a scratch image, then walk backwards from `v29/v30/v36` through blocks 3-5 to the first value

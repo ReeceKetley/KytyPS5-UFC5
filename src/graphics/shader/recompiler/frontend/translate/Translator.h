@@ -9,9 +9,10 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 class Translator {
 public:
-	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit, uint32_t wave_size)
+	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit, uint32_t wave_size,
+	           uint64_t shader_hash = 0)
 	    : program(program), ir(block), current_vector_limit(vector_limit),
-	      current_wave_size(wave_size) {}
+	      current_wave_size(wave_size), current_shader_hash(shader_hash) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
@@ -83,6 +84,8 @@ private:
 	IR::Value     ConstructU32x4(const Decoder::Operand& base, uint32_t count);
 	// Diagnostic only (KYTY_NAN_SANITIZE), default OFF. See Memory.cpp.
 	IR::Value     SanitizeStoredNaN(IR::Value data);
+	// Diagnostic only (KYTY_PROBE_VGPR), default OFF. See Memory.cpp.
+	IR::Value     ProbeStoredVgpr(IR::Value data);
 	void          WriteImageComponents(const Decoder::Operand& dst, IR::Value value,
 	                                   const IR::MemoryInfo& memory, uint32_t component_limit);
 	BufferAddress ReadBufferAddress(const Decoder::Instruction& inst, uint32_t source_offset);
@@ -264,6 +267,7 @@ private:
 	Decoder::Opcode current_opcode       = Decoder::Opcode::UNKNOWN;
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
+	uint64_t        current_shader_hash  = 0;
 	uint32_t        current_wave_size    = 64;
 };
 

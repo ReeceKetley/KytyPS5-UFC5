@@ -691,12 +691,62 @@ IR::Value Translator::SanitizeStoredNaN(IR::Value data) {
 	               {components[0], components[1], components[2], components[3]});
 }
 
+// Diagnostic only (KYTY_PROBE_VGPR=<decimal>, default OFF): replace the stored components with the
+// live value of one VGPR, so an intermediate register can be read out through the existing image
+// dump path instead of guessing at it. Reading recompiler source one opcode at a time cost eight
+// correct answers; this reads the actual values. Channel 0 carries the probed register, channel 1
+// its value as a float, so a predicate register (e.g. the V_CMPX source) can be compared per pixel
+// against where the output is corrupt.
+IR::Value Translator::ProbeStoredVgpr(IR::Value data) {
+	// Up to four comma-separated registers, one per stored channel, so a single navigation into a
+	// fight reads four registers instead of one. Fewer than four leaves the rest at -1 (untouched).
+	static const std::array<int, 4> probes = [] {
+		std::array<int, 4> list {-1, -1, -1, -1};
+		const char*        cursor = std::getenv("KYTY_PROBE_VGPR");
+		for (uint32_t index = 0; cursor != nullptr && *cursor != '\0' && index < 4u; index++) {
+			while (*cursor == ',' || *cursor == ' ') {
+				++cursor;
+			}
+			char* end = nullptr;
+			const auto value = std::strtol(cursor, &end, 10);
+			if (end == cursor) {
+				break;
+			}
+			list[index] = static_cast<int>(value);
+			cursor       = end;
+		}
+		return list;
+	}();
+	const int probe = probes[0];
+	// Scope to one shader (KYTY_PROBE_HASH). Without it, probing a low register number replaces
+	// every image store in the game - including the menus - and navigating to a fight becomes
+	// impossible. Also refuse a register the shader does not allocate.
+	static const uint64_t probe_hash = [] {
+		const char* env = std::getenv("KYTY_PROBE_HASH");
+		return env == nullptr ? 0ull : std::strtoull(env, nullptr, 16);
+	}();
+	if (probe < 0 || static_cast<uint32_t>(probe) >= current_vector_limit ||
+	    (probe_hash != 0 && probe_hash != current_shader_hash)) {
+		return data;
+	}
+	std::array<IR::Value, 4> components {};
+	for (uint32_t index = 0; index < 4u; index++) {
+		const int reg = probes[index];
+		components[index] =
+		    (reg >= 0 && static_cast<uint32_t>(reg) < current_vector_limit)
+		        ? IR::Value(ir.GetVectorReg(static_cast<IR::VectorReg>(reg)))
+		        : IR::Value(ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {data, IR::Value(index)}));
+	}
+	return ir.Emit(IR::ValueOpcode::CompositeConstructU32x4,
+	               {components[0], components[1], components[2], components[3]});
+}
+
 bool Translator::IMAGE_STORE(const Decoder::Instruction& inst) {
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 1));
-	const auto data =
-	    SanitizeStoredNaN(ConstructU32x4(MemorySourceAt(inst, 0), memory.data_dwords));
+	const auto data     = ProbeStoredVgpr(
+        SanitizeStoredNaN(ConstructU32x4(MemorySourceAt(inst, 0), memory.data_dwords)));
 	ir.Emit(IR::ValueOpcode::ImageWrite, {resource, address, data, ir.GetExec()},
 	        AddMemoryInfo(memory, inst.pc));
 	return true;
