@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/dispatchInspector.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -26,6 +27,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -186,6 +188,14 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 	submission.commands          = draw_commands;
 	submission.constant_commands = constant_commands;
 	submission.reset_processor   = m_graphics_done;
+	if (DispatchInspectorEnabled()) {
+		const auto callsite = PeekInspectorSubmitCallsite();
+		submission.submit_rip           = callsite.guest_rip;
+		submission.submit_module_base   = callsite.module_base;
+		submission.submit_module_offset = callsite.module_offset;
+		std::memcpy(submission.submit_module_name, callsite.module_name,
+		            sizeof(submission.submit_module_name));
+	}
 	m_graphics_done              = false;
 	Enqueue(std::move(submission));
 }
@@ -201,6 +211,14 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 	submission.type     = SubmissionType::Compute;
 	submission.queue_id = 1 + compute_queue;
 	submission.commands = commands;
+	if (DispatchInspectorEnabled()) {
+		const auto callsite = PeekInspectorSubmitCallsite();
+		submission.submit_rip           = callsite.guest_rip;
+		submission.submit_module_base   = callsite.module_base;
+		submission.submit_module_offset = callsite.module_offset;
+		std::memcpy(submission.submit_module_name, callsite.module_name,
+		            sizeof(submission.submit_module_name));
+	}
 	Enqueue(std::move(submission));
 }
 
@@ -639,6 +657,16 @@ bool GuestGpu::Process(Submission& submission) {
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
 		cp.SetFlip({});
+	}
+	if (DispatchInspectorEnabled()) {
+		InspectorCallsite callsite;
+		callsite.guest_rip     = submission.submit_rip;
+		callsite.module_base   = submission.submit_module_base;
+		callsite.module_offset = submission.submit_module_offset;
+		std::memcpy(callsite.module_name, submission.submit_module_name,
+		            sizeof(callsite.module_name));
+		SetInspectorRecordingContext(callsite, cp.GetSubmitId(),
+		                             static_cast<uint64_t>(GetFrameNum()));
 	}
 
 	cp.BufferInit();

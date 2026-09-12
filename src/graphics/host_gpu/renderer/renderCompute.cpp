@@ -785,6 +785,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		RebindBuffers(bindings);
 		RebindImages(bindings);
+		InspectorOperation inspector_operation;
+		bool               inspector_capture = false;
+		bool               inspector_cap_in  = false;
+		bool               inspector_cap_out = false;
+		uint32_t           inspector_op_index = 0;
+		uint64_t           inspector_frame    = 0;
 		if (DispatchInspectorEnabled()) {
 			InspectorOperation operation;
 			operation.kind             = InspectorOperationKind::Dispatch;
@@ -795,9 +801,20 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			operation.local[1]         = input_info.threads_num[1];
 			operation.local[2]         = input_info.threads_num[2];
 			operation.indirect_address = indirect_args_addr;
+			operation.submit_id        = submit_id;
+			operation.submission_tick  = m_context.GetCommandScheduler().CurrentTick();
 			operation.stages.push_back(
 			    CaptureInspectorStage(bindings, m_context.GetTextureCache()));
-			RecordInspectorOperation(m_context.GetGpu().GetFrameNum(), std::move(operation));
+			inspector_frame    = m_context.GetGpu().GetFrameNum();
+			inspector_op_index = PeekInspectorOperationIndex(inspector_frame);
+			inspector_capture  = InspectorShouldCapture(operation, inspector_op_index,
+			                                            &inspector_cap_in, &inspector_cap_out);
+			if (inspector_capture && inspector_cap_in) {
+				CaptureInspectorResources(buffer, m_context, operation, inspector_op_index,
+				                          inspector_frame, true, false);
+			}
+			inspector_operation = operation;
+			RecordInspectorOperation(inspector_frame, std::move(operation));
 		}
 		auto              vk_buffer        = buffer.Handle();
 		PreparedBindings* descriptor_stage = &bindings;
@@ -833,6 +850,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 		}
 		GpuTimestamps::Instance().EndDispatch(vk_buffer);
+		if (inspector_capture && inspector_cap_out) {
+			CaptureInspectorResources(buffer, m_context, inspector_operation, inspector_op_index,
+			                          inspector_frame, false, true);
+		}
+		if (inspector_capture) {
+			InspectorCompleteCapture();
+		}
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader, writes_memory);
 		ResetBindings();
 	};

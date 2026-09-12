@@ -63,6 +63,10 @@ private:
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
+		uint64_t                  submit_rip        = 0;
+		uint64_t                  submit_module_base = 0;
+		uint64_t                  submit_module_offset = 0;
+		char                      submit_module_name[80] {};
 	};
 
 	void              Enqueue(Submission submission);

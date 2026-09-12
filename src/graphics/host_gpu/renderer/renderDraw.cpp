@@ -1362,22 +1362,31 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                      state.ps_input_info.stage.program != nullptr
 	                                  ? state.ps_input_info.stage.program->shader_hash
 	                                  : uint64_t {0};
+	InspectorOperation inspector_operation;
+	bool               inspector_capture = false;
+	bool               inspector_cap_in  = false;
+	bool               inspector_cap_out = false;
+	uint32_t           inspector_op_index = 0;
+	uint64_t           inspector_frame    = 0;
 	if (DispatchInspectorEnabled()) {
 		InspectorOperation operation;
-		operation.kind           = InspectorOperationKind::Draw;
-		operation.index_count    = draw.index_count;
-		operation.instance_count = draw.instance_count;
+		operation.kind             = InspectorOperationKind::Draw;
+		operation.index_count      = draw.index_count;
+		operation.instance_count   = draw.instance_count;
+		operation.submit_id        = submit_id;
+		operation.submission_tick  = m_context.GetCommandScheduler().CurrentTick();
 		auto& cache = m_context.GetTextureCache();
 		operation.stages.push_back(CaptureInspectorStage(bindings.vertex, cache));
 		if (bindings.pixel) {
 			operation.stages.push_back(CaptureInspectorStage(*bindings.pixel, cache));
 		}
 		operation.attachments.reserve(state.color_count + (state.depth_info.image_id ? 1u : 0u));
-		const auto target_mask = buffer.GetRegisters().GetRenderTargetMask();
+		const auto& registers  = buffer.GetRegisters();
+		const auto  target_mask = registers.GetRenderTargetMask();
 		for (uint32_t index = 0; index < state.color_count; ++index) {
 			const auto& color  = state.color_info[index];
 			const auto  extent = color.Extent();
-			operation.attachments.push_back({
+			InspectorResource attachment {
 			    .kind = InspectorResourceKind::ColorTarget,
 			    .index = color.target_slot,
 			    .address = color.desc.info.data.address,
@@ -1387,14 +1396,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			    .width = extent.width,
 			    .height = extent.height,
 			    .depth = 1,
+			    .guest_format = static_cast<int32_t>(color.desc.info.guest_format),
 			    .actual_vk = static_cast<int32_t>(color.desc.view_info.format),
 			    .read = true,
 			    .written = render_target_mask_slot(target_mask, color.target_slot) != 0,
-			});
+			};
+			FillInspectorImageResource(attachment, cache);
+			operation.attachments.push_back(attachment);
 		}
 		const auto& depth = state.depth_info;
 		if (depth.image_id) {
-			operation.attachments.push_back({
+			InspectorResource attachment {
 			    .kind = InspectorResourceKind::DepthTarget,
 			    .index = 0,
 			    .address = depth.desc.info.data.address,
@@ -1404,13 +1416,40 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			    .width = depth.desc.info.extent.width,
 			    .height = depth.desc.info.extent.height,
 			    .depth = depth.desc.info.extent.depth,
+			    .guest_format = static_cast<int32_t>(depth.desc.info.guest_format),
 			    .actual_vk = static_cast<int32_t>(depth.desc.view_info.format),
 			    .read = depth.depth_test_enable || depth.stencil_test_enable,
 			    .written = depth.depth_write_enable ||
 			               static_cast<bool>(depth.AttachmentWriteAspects()),
-			});
+			};
+			FillInspectorImageResource(attachment, cache);
+			operation.attachments.push_back(attachment);
 		}
-		RecordInspectorOperation(m_context.GetGpu().GetFrameNum(), std::move(operation));
+		const auto& vp  = registers.GetScreenViewport();
+		const auto& vp0 = vp.viewports[0];
+		operation.viewport[0] = vp0.xoffset - vp0.xscale;
+		operation.viewport[1] = vp0.yoffset - vp0.yscale;
+		operation.viewport[2] = vp0.xscale * 2.0f;
+		operation.viewport[3] = vp0.yscale * 2.0f;
+		if (state.color_count != 0) {
+			const auto sc = calc_final_scissor(vp, registers.GetScanModeControl(),
+			                                   state.color_info[0].Extent(), 0);
+			operation.scissor[0] = sc.left;
+			operation.scissor[1] = sc.top;
+			operation.scissor[2] = sc.right;
+			operation.scissor[3] = sc.bottom;
+			operation.has_viewport = true;
+		}
+		inspector_frame    = m_context.GetGpu().GetFrameNum();
+		inspector_op_index = PeekInspectorOperationIndex(inspector_frame);
+		inspector_capture  = InspectorShouldCapture(operation, inspector_op_index,
+		                                            &inspector_cap_in, &inspector_cap_out);
+		if (inspector_capture && inspector_cap_in) {
+			CaptureInspectorResources(buffer, m_context, operation, inspector_op_index,
+			                          inspector_frame, true, false);
+		}
+		inspector_operation = operation;
+		RecordInspectorOperation(inspector_frame, std::move(operation));
 	}
 	if (ShouldTrackDrawTargets()) {
 		const auto frame_num = static_cast<uint32_t>(buffer.GetContext().GetGpu().GetFrameNum());
@@ -1571,6 +1610,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	GpuTimestamps::Instance().EndDraw(vk_buffer);
+	if (inspector_capture && inspector_cap_out) {
+		CaptureInspectorResources(buffer, m_context, inspector_operation, inspector_op_index,
+		                          inspector_frame, false, true);
+	}
+	if (inspector_capture) {
+		InspectorCompleteCapture();
+	}
 #if !defined(__APPLE__)
 	if (scene_draw_hidden && state.color_count != 0) {
 		// Restore the per-target write mask the next draw expects. Leaving colour writes off
@@ -1866,6 +1912,37 @@ bool RenderExecutor::ResolveColorTargets(uint64_t submit_id, CommandBuffer& buff
 	auto& destination = cache.GetImage(dst.image_id);
 	destination.Resolve(source, {src.guest_mip_level, 1, src.guest_array_layer, 1},
 	                    {dst.guest_mip_level, 1, dst.guest_array_layer, 1});
+	if (DispatchInspectorEnabled()) {
+		InspectorOperation operation;
+		operation.kind            = InspectorOperationKind::Resolve;
+		operation.submit_id       = submit_id;
+		operation.submission_tick = m_context.GetCommandScheduler().CurrentTick();
+		auto fill = [](const RenderColorInfo& color, bool read, bool written) {
+			InspectorResource resource;
+			resource.kind             = InspectorResourceKind::ColorTarget;
+			resource.index            = color.target_slot;
+			resource.address          = color.desc.info.data.address;
+			resource.size             = color.desc.info.data.size;
+			resource.image_id         = color.image_id.index;
+			resource.image_generation = color.image_id.generation;
+			resource.width            = color.Extent().width;
+			resource.height           = color.Extent().height;
+			resource.depth            = 1;
+			resource.guest_format     = static_cast<int32_t>(color.desc.info.guest_format);
+			resource.actual_vk        = static_cast<int32_t>(color.desc.view_info.format);
+			resource.read             = read;
+			resource.written          = written;
+			return resource;
+		};
+		auto& cache = m_context.GetTextureCache();
+		auto  source_res = fill(src, true, false);
+		auto  dest_res   = fill(dst, false, true);
+		FillInspectorImageResource(source_res, cache);
+		FillInspectorImageResource(dest_res, cache);
+		operation.attachments.push_back(source_res);
+		operation.attachments.push_back(dest_res);
+		RecordInspectorOperation(m_context.GetGpu().GetFrameNum(), std::move(operation));
+	}
 	return true;
 }
 

@@ -1,6 +1,13 @@
 # UFC 5 / KytyPS5 ledger
 
-Last updated: 2026-09-12 session 9 — **THE GPU INSPECTOR NOW DUMPS AND TRACES BLACK-RENDER DATA.**
+Last updated: 2026-09-12 session 10 — **THE INSPECTOR CAN TRACE ONE GUEST RESOURCE THROUGH A FRAME.**
+Hold a frame, filter `0x1163770000` (or any overlapping range), walk previous-writer / next-reader /
+next-writer, inspect inputs vs outputs, and arm a before+after dump of that exact operation. Alias
+warnings open an evidence-only inspector. CPU submit RIP is recorded from `AgcDriverSubmit*` return
+addresses (one RIP per command-buffer submit, not a per-draw stack walk). This does not fix UFC 5.
+Panel-on runs remain **never comparable to the 5 fps baseline.** See "session 10" below.
+
+Previously: 2026-09-12 session 9 — **THE GPU INSPECTOR NOW DUMPS AND TRACES BLACK-RENDER DATA.**
 It records every real draw/dispatch in the current frame after resource resolution, numbers repeated
 dispatches of one shader, and shows guest addresses, texture-cache image ids, extents, actual Vulkan
 view formats and access flags. It is default-off behind `KYTY_DEBUG_PANEL=1`; F10 toggles it. Panel-on
@@ -826,6 +833,87 @@ generation 1 and forced the target CS to compile as shader id 183, then deletion
 A validation-enabled panel run accumulated 82 `FrameProfile` windows with zero VUID/validation
 errors, device losses, or compile failures. Temporary `PROBE`, `CAPTURE_HASHES`, and `DUMP_INPUTS`
 control files were removed after testing.
+
+### SESSION 10 (2026-09-12) — RESOURCE/ALIAS TRACING DEBUGGER ON THE EXISTING INSPECTOR
+
+**Success criterion (not a UFC 5 fix):** deterministically identify the GPU operation at which a
+known-good PS5 image becomes incorrect, with shader hash, alias/resource identities, and preferably
+the Frostbite CPU submission callsite.
+
+**Implementation plan (from the code, not a redesign).** The session-9 inspector already recorded
+draws/dispatches after resource resolution (`CaptureInspectorStage` / `RecordInspectorOperation`)
+and showed an O(n) resource timeline plus an exact-address alias warning. Dump/capture already
+existed as `DumpGpuImage` / `DumpShaderInput` (command-buffer copy + deferred host write, no
+`Finish`). Image identity already lived in `TextureCache` (`image_id.generation`, guest range,
+guest format, `tick_accessed_last`, cpu-dirty / gpu-modified / buffer-modified). CPU RIP is
+available cheaply at the SYSV ABI submit wrappers (`AgcDriverSubmit*`), not at each PM4 draw —
+guest execution is on another thread from the GPU worker. The overlay was extended in place.
+
+#### Files touched
+- `src/graphics/host_gpu/renderer/dispatchInspector.{h,cpp}` — resource metadata, per-frame
+  index, address match classification, capture arming, JSON dump fields, callsite helpers
+- `src/graphics/presentation/systemOverlay.cpp` — guest-address filter, alias inspector, I/O
+  tables, navigation, timeline-from-index, before/after arming, operation details
+- `src/graphics/host_gpu/renderer/renderDraw.cpp` / `renderCompute.cpp` — viewport/scissor,
+  submit id/tick, input/output capture around the real draw/dispatch, resolve recording
+- `src/graphics/host_gpu/renderer/cache/textureCache.cpp` — compact COPY operations
+- `src/graphics/guest_gpu/graphicsRun.{h,cpp}` — submit RIP copied onto the queued submission
+- `src/libs/agc.cpp` — `_ReturnAddress()` at ABI submit entry (not inside `submit_dcb`)
+- `src/graphics/host_gpu/renderer/debug.h`, `presentation/window/swapchain.cpp` —
+  `DumpInspectorGpuImage` / `DumpInspectorGpuBuffer` reuse the existing copy path
+
+#### Data structures added
+- `InspectorCallsite` — guest RIP, module name/base/offset
+- Extra `InspectorResource` identity: buffer id, guest format, Vk handle, last-access tick,
+  coherency flags Kyty already tracks (`gpu_modified` / `cpu_dirty` / `buffer_modified`). No
+  invented stale/current bit.
+- `InspectorOperationKind::{Copy,Resolve}` plus submit id, tick, viewport/scissor
+- `InspectorFrameIndex` built once per held/copied frame: uses, `uses_by_image`, `ops_by_shader`,
+  1 MiB guest-page buckets, alias groups (union-find on overlapping image ranges with more than
+  one `image_id.generation`)
+- `InspectorCaptureArm` — user-armed, one-shot, matches kind + shader hashes + occurrence
+  (index is a hint for Step)
+
+#### Capture synchronization
+User-armed only. Inputs copy before the draw/dispatch; outputs copy after. Reuses
+`DumpGpuImage`: inserts a GPU copy into the **current** command buffer, restores image layout,
+writes `.bin`/`.bmp`/`.json` later via `DeferPriorityOperation`. **Does not call `Finish`/host
+wait.** Output capture **ends the current Vulkan render pass** (same as existing input dumps).
+Names look like
+`frame-<n>_op-<i>_CS-<hash>_input-slot1_addr-<guest>_img-<id>.bin` plus a JSON sidecar
+(frame, op, hashes, dimensions, addresses, image ids, formats, extents, ticks, alias id,
+access, and a capture_sync note). Compare uses XXH3-64 of captured bytes, labelled as `xxh3`.
+
+#### CPU callsite — what is actually available
+Cheap and reliable: `NoteInspectorSubmitCallsite(_ReturnAddress())` in each `AgcDriverSubmit*`
+ABI function, copied onto `GuestGpu::Submission`, applied on the GPU worker as TLS for every
+draw/dispatch in that command buffer. Display:
+`Engine.Render.Core2.PlatformPs5.prx + 0x18A72F0` when `RuntimeLinker::FindProgramByAddr`
+resolves the RIP; otherwise `guest_rip=... (unresolved module)`. This is the **submit**
+callsite, not a per-draw Ghidra stack. Per-draw walking was not added.
+
+#### Known limitations
+- Live path still copies the in-progress frame under the inspector mutex (pre-existing). Index
+  rebuilds when the operation count changes; UI queries are O(uses of the filter), not
+  O(ops × resources × ops).
+- Thumbnails are not silent GPU readbacks. Preview shows `xxh3` after an explicit Capture;
+  otherwise a Capture button arms the next use.
+- Copy recording can add cache-internal copies to the ~5k operation list. Copies checkbox
+  can hide them. Resolve color-targets are recorded as `RESOLVE/COPY`.
+- Coherency labels are Kyty's existing flags, not an authoritative stale/current oracle.
+- Fight-frame validation of `0x1163770000` / `0x116d300000` / `0x1164650000` / `0x1162c00000`
+  was **not** run in this session (no in-fight navigation). The release `kyty_emulator` link
+  succeeded after these changes.
+
+#### Overlay overhead
+Unmeasured. Keep the banner: do not compare panel-on fps to the 5 fps baseline.
+
+#### Validation workflow (for the next fight hold)
+1. Hold a fight frame.
+2. Filter guest address `0x1163770000` — list should shrink to overlapping uses only.
+3. Select a use, inspect INPUTS/OUTPUTS, `< Previous Writer` / `> Next Reader` / `>> Next Writer`.
+4. Arm Capture Before + After, Step one frame, confirm dumps+JSON for that op.
+5. Repeat for `0x116d300000`, `0x1164650000`, `0x1162c00000`.
 
 ### SUPERSEDED (session 8 refutes this by direct markers): BLOCK 4 OF THE UPSCALER NEVER EXECUTES
 

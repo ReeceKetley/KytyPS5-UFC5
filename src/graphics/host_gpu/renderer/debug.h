@@ -58,6 +58,14 @@ void                     DumpShaderInput(CommandBuffer& command, RenderContext& 
 void                     DumpShaderBufferInput(CommandBuffer& command, RenderContext& renderer,
                                                vk::Buffer buffer, uint64_t offset, uint64_t size,
                                                const std::string& tag);
+struct InspectorCaptureRecord;
+void                     DumpInspectorGpuImage(CommandBuffer& command, RenderContext& renderer,
+                                               Image& image, const InspectorCaptureRecord& record,
+                                               std::string metadata_json);
+void                     DumpInspectorGpuBuffer(CommandBuffer& command, RenderContext& renderer,
+                                                vk::Buffer buffer, uint64_t offset, uint64_t size,
+                                                const InspectorCaptureRecord& record,
+                                                std::string metadata_json);
 void                     uc_print(const char* func, const HW::UserConfig& uc);
 void                     uc_check(const HW::UserConfig& uc);
 void                     sh_print(const char* func, const HW::Shader& uc);

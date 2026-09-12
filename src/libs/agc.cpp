@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/renderer/dispatchInspector.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -32,6 +33,10 @@
 #include <cstring>
 #include <mutex>
 #include <vector>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 #ifdef min
 #undef min
@@ -4199,6 +4204,14 @@ struct TessellationDriverState {
 
 static TessellationDriverState g_tessellation_driver_state {};
 
+#if defined(_MSC_VER)
+#define KYTY_NOTE_SUBMIT_CALLSITE() \
+	NoteInspectorSubmitCallsite(reinterpret_cast<uint64_t>(_ReturnAddress()))
+#else
+#define KYTY_NOTE_SUBMIT_CALLSITE() \
+	NoteInspectorSubmitCallsite(reinterpret_cast<uint64_t>(__builtin_return_address(0)))
+#endif
+
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
@@ -4207,6 +4220,7 @@ static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 
 int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
 	PRINT_NAME();
+	KYTY_NOTE_SUBMIT_CALLSITE();
 
 	EXIT_NOT_IMPLEMENTED(packet == nullptr);
 
@@ -4223,6 +4237,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
 int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
                                            const uint32_t* dcb_sizes_in_dwords, uint32_t count) {
 	PRINT_NAME();
+	KYTY_NOTE_SUBMIT_CALLSITE();
 
 	AgcTrace("\t count = %" PRIu32 "\n", count);
 
@@ -4284,6 +4299,7 @@ static void submit_command_buffer(uint32_t queue, uint32_t* commands, uint32_t s
 
 int KYTY_SYSV_ABI AgcDriverSubmitCommandBuffer(void* queue_context, const Packet* packet) {
 	PRINT_NAME();
+	KYTY_NOTE_SUBMIT_CALLSITE();
 
 	AgcTrace("\t queue_context = 0x%016" PRIx64 "\n"
 	     "\t packet        = 0x%016" PRIx64 "\n",
@@ -4309,6 +4325,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiCommandBuffers(void*            queue_cont
                                                      const uint32_t*  sizes_in_dwords,
                                                      uint32_t         count) {
 	PRINT_NAME();
+	KYTY_NOTE_SUBMIT_CALLSITE();
 
 	AgcTrace("\t queue_context = 0x%016" PRIx64 "\n"
 	     "\t count         = %" PRIu32 "\n",
@@ -4330,6 +4347,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiCommandBuffers(void*            queue_cont
 
 int KYTY_SYSV_ABI AgcDriverSubmitAcb(uint32_t queue, const Packet* packet) {
 	PRINT_NAME();
+	KYTY_NOTE_SUBMIT_CALLSITE();
 
 	AgcTrace("\t queue  = 0x%08" PRIx32 "\n"
 	     "\t packet = 0x%016" PRIx64 "\n",
@@ -4350,6 +4368,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitAcb(uint32_t queue, const Packet* packet) {
 int KYTY_SYSV_ABI AgcDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const* acbs,
                                            const uint32_t* sizes_in_dwords, uint32_t count) {
 	PRINT_NAME();
+	KYTY_NOTE_SUBMIT_CALLSITE();
 
 	AgcTrace("\t queue = 0x%08" PRIx32 "\n"
 	     "\t count = %" PRIu32 "\n",

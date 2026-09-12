@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/dispatchInspector.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -797,6 +798,38 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		destination.MarkGpuModified();
 	}
 	destination.ClearBufferModified();
+	if (DispatchInspectorEnabled()) {
+		InspectorOperation operation;
+		operation.kind            = InspectorOperationKind::Copy;
+		operation.submit_id       = GetInspectorRecordingSubmitId();
+		operation.submission_tick = m_scheduler.CurrentTick();
+		auto fill = [](ImageId id, Image& image, bool read, bool written) {
+			InspectorResource resource;
+			resource.kind             = InspectorResourceKind::Image;
+			resource.address          = image.info.data.address;
+			resource.size             = image.info.data.size;
+			resource.image_id         = id.index;
+			resource.image_generation = id.generation;
+			resource.width            = image.info.extent.width;
+			resource.height           = image.info.extent.height;
+			resource.depth            = image.info.extent.depth;
+			resource.guest_format     = static_cast<int32_t>(image.info.guest_format);
+			resource.actual_vk        = static_cast<int32_t>(image.backing.format);
+			resource.vk_handle        = static_cast<uint64_t>(
+                reinterpret_cast<uintptr_t>(static_cast<VkImage>(image.backing.image)));
+			resource.last_access_tick = image.tick_accessed_last;
+			resource.read             = read;
+			resource.written          = written;
+			resource.gpu_modified     = image.IsGpuModified();
+			resource.cpu_dirty        = image.IsCpuDirty();
+			resource.buffer_modified  = image.IsBufferModified();
+			resource.has_coherency    = true;
+			return resource;
+		};
+		operation.attachments.push_back(fill(source_id, source, true, false));
+		operation.attachments.push_back(fill(destination_id, destination, false, true));
+		RecordInspectorOperation(GetInspectorRecordingFrame(), std::move(operation));
+	}
 }
 
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,

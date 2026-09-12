@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/dispatchInspector.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
@@ -27,12 +28,16 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fmt/format.h>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
+#include <xxhash.h>
 #include <vulkan/vk_platform.h>
 
 // IWYU pragma: no_include <intrin.h>
@@ -312,7 +317,9 @@ void ConvertPackedToBgra(vk::Format format, uint32_t width, uint32_t height,
 }
 
 void DumpGpuImage(CommandBuffer& command, RenderContext& renderer, Image& image, const char* tag,
-                  uint64_t address, bool dump, bool raw = false) {
+                  uint64_t address, bool dump, bool raw = false,
+                  const std::string* exact_stem = nullptr,
+                  std::function<void(uint64_t, uint64_t)> on_complete = {}) {
 	if (!dump || command.IsInvalid() || image.backing.image == nullptr || !image.IsGpuModified()) {
 		return;
 	}
@@ -372,9 +379,10 @@ void DumpGpuImage(CommandBuffer& command, RenderContext& renderer, Image& image,
 
 	const auto      format   = image.backing.format;
 	const std::string tag_copy = tag;
+	const std::string stem_copy = exact_stem != nullptr ? *exact_stem : std::string {};
 	scheduler.DeferPriorityOperation(
 	    [&download, mapped, offset, byte_size, width, height, format, frame_num, tag_copy,
-	     address, raw] {
+	     address, raw, stem_copy, on_complete] {
 		    download.Invalidate(offset, byte_size);
 		    std::vector<uint8_t> packed(mapped, mapped + byte_size);
 		    std::vector<uint8_t> bgra;
@@ -383,8 +391,10 @@ void DumpGpuImage(CommandBuffer& command, RenderContext& renderer, Image& image,
 		    ConvertPackedToBgra(format, width, height, packed.data(), bgra, nonzero, max_channel);
 		    std::error_code ec;
 		    std::filesystem::create_directories("D:/PS5/dumps", ec);
-		    const auto path = std::filesystem::path("D:/PS5/dumps") /
-		                      (tag_copy + "-f" + std::to_string(frame_num) + ".bmp");
+		    const auto path = stem_copy.empty()
+		                          ? std::filesystem::path("D:/PS5/dumps") /
+		                                (tag_copy + "-f" + std::to_string(frame_num) + ".bmp")
+		                          : std::filesystem::path(stem_copy + ".bmp");
 		    WriteBmpBgra(path, width, height, bgra);
 		    if (raw) {
 			    auto raw_path = path;
@@ -393,10 +403,14 @@ void DumpGpuImage(CommandBuffer& command, RenderContext& renderer, Image& image,
 			    output.write(reinterpret_cast<const char*>(packed.data()),
 			                 static_cast<std::streamsize>(packed.size()));
 		    }
+		    const auto xxh3 = XXH3_64bits(packed.data(), packed.size());
 		    LOGF("VideoOut dump: %s frame=%d fmt=%d addr=0x%016" PRIx64
-		         " extent=%ux%u nonzero=%" PRIu64 "/%u max8=%u file=%s\n",
+		         " extent=%ux%u nonzero=%" PRIu64 "/%u max8=%u xxh3=0x%016" PRIx64 " file=%s\n",
 		         tag_copy.c_str(), frame_num, static_cast<int>(format), address, width, height,
-		         nonzero, width * height, max_channel, path.string().c_str());
+		         nonzero, width * height, max_channel, xxh3, path.string().c_str());
+		    if (on_complete) {
+			    on_complete(xxh3, byte_size);
+		    }
 	    });
 }
 
@@ -612,6 +626,99 @@ void DumpShaderBufferInput(CommandBuffer& command, RenderContext& renderer, vk::
 		    output.write(reinterpret_cast<const char*>(mapped), static_cast<std::streamsize>(byte_size));
 		    LOGF("InputCapture: buffer bytes=%" PRIu64 " file=%s success=%d\n",
 		         byte_size, path.string().c_str(), static_cast<int>(output.good()));
+	    });
+}
+
+void FinishInspectorSidecar(const InspectorCaptureRecord& record, std::string metadata_json,
+                            uint64_t xxh3, const char* status) {
+	nlohmann::json meta = nlohmann::json::parse(metadata_json, nullptr, false);
+	if (meta.is_discarded()) {
+		meta = nlohmann::json::object();
+	}
+	meta["xxh3"]   = fmt::format("0x{:016x}", xxh3);
+	meta["status"] = status;
+	std::error_code ec;
+	std::filesystem::create_directories("D:/PS5/dumps", ec);
+	const auto json_path = record.json_path.empty() ? record.stem + ".json" : record.json_path;
+	std::ofstream file {json_path, std::ios::trunc};
+	file << meta.dump(2) << '\n';
+	auto complete          = record;
+	complete.xxh3          = xxh3;
+	complete.ready         = true;
+	complete.json_path     = json_path;
+	complete.note          = status;
+	NoteInspectorCaptureComplete(complete);
+}
+
+void DumpInspectorGpuImage(CommandBuffer& command, RenderContext& renderer, Image& image,
+                           const InspectorCaptureRecord& record, std::string metadata_json) {
+	const auto saved = image.backing.state;
+	if (command.IsInvalid() || image.backing.image == nullptr ||
+	    saved.layout == vk::ImageLayout::eUndefined || image.backing.samples != 1 ||
+	    !DumpFormatSupported(image.backing.format) || image.backing.extent.depth != 1) {
+		FinishInspectorSidecar(record, std::move(metadata_json), 0, "skipped_unsupported");
+		return;
+	}
+	if (!image.IsGpuModified()) {
+		FinishInspectorSidecar(record, std::move(metadata_json), 0, "skipped_not_gpu_modified");
+		return;
+	}
+	auto complete = record;
+	DumpGpuImage(command, renderer, image, record.stem.c_str(), image.info.data.address, true, true,
+	             &record.stem,
+	             [complete, metadata_json = std::move(metadata_json)](uint64_t xxh3, uint64_t) {
+		             FinishInspectorSidecar(complete, metadata_json, xxh3, "captured");
+	             });
+	image.Transit(saved.layout, saved.access_mask, {}, command.Handle());
+}
+
+void DumpInspectorGpuBuffer(CommandBuffer& command, RenderContext& renderer, vk::Buffer buffer,
+                            uint64_t offset, uint64_t size, const InspectorCaptureRecord& record,
+                            std::string metadata_json) {
+	if (command.IsInvalid() || buffer == nullptr || size == 0 || size > (1ull << 20)) {
+		FinishInspectorSidecar(record, std::move(metadata_json), 0, "skipped_buffer");
+		return;
+	}
+	auto& download = renderer.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
+	auto [mapped, map_offset] = download.Map(size, 256);
+	if (mapped == nullptr) {
+		FinishInspectorSidecar(record, std::move(metadata_json), 0, "skipped_map");
+		return;
+	}
+	command.EndRendering();
+	auto vk_command = command.Handle();
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eCopy;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	vk_command.pipelineBarrier2(dependency);
+	const vk::BufferCopy copy {offset, map_offset, size};
+	vk_command.copyBuffer(buffer, download.Handle(), 1, &copy);
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	barrier.dstStageMask =
+	    vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eHost;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
+	                        vk::AccessFlagBits2::eHostRead;
+	vk_command.pipelineBarrier2(dependency);
+	download.Commit();
+	auto complete = record;
+	renderer.GetCommandScheduler().DeferPriorityOperation(
+	    [&download, mapped, map_offset, size, complete,
+	     metadata_json = std::move(metadata_json)] {
+		    download.Invalidate(map_offset, size);
+		    std::error_code ec;
+		    std::filesystem::create_directories("D:/PS5/dumps", ec);
+		    const auto path = complete.bin_path.empty() ? complete.stem + ".bin" : complete.bin_path;
+		    std::ofstream output(path, std::ios::binary);
+		    output.write(reinterpret_cast<const char*>(mapped), static_cast<std::streamsize>(size));
+		    const auto xxh3 = XXH3_64bits(mapped, static_cast<size_t>(size));
+		    FinishInspectorSidecar(complete, metadata_json, xxh3,
+		                           output.good() ? "captured" : "write_failed");
 	    });
 }
 
