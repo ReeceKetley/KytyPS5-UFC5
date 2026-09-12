@@ -697,7 +697,18 @@ IR::Value Translator::SanitizeStoredNaN(IR::Value data) {
 // correct answers; this reads the actual values. Channel 0 carries the probed register, channel 1
 // its value as a float, so a predicate register (e.g. the V_CMPX source) can be compared per pixel
 // against where the output is corrupt.
-IR::Value Translator::ProbeStoredVgpr(IR::Value data) {
+IR::Value Translator::ProbeStoredVgpr(IR::Value data, uint32_t pc) {
+	// KYTY_PROBE_PC selects WHICH store to hijack, by instruction pc. A shader with more than one
+	// IMAGE_STORE otherwise has every store replaced, and the captured buffer may not be the one
+	// being read back - which is exactly how the first probe run produced two different values for
+	// the same register.
+	static const uint32_t probe_pc = [] {
+		const char* env = std::getenv("KYTY_PROBE_PC");
+		return env == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(env, nullptr, 16));
+	}();
+	if (probe_pc != 0 && probe_pc != pc) {
+		return data;
+	}
 	// Up to four comma-separated registers, one per stored channel, so a single navigation into a
 	// fight reads four registers instead of one. Fewer than four leaves the rest at -1 (untouched).
 	static const std::array<int, 4> probes = [] {
@@ -746,7 +757,7 @@ bool Translator::IMAGE_STORE(const Decoder::Instruction& inst) {
 	const auto resource = GetImageResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 1));
 	const auto data     = ProbeStoredVgpr(
-        SanitizeStoredNaN(ConstructU32x4(MemorySourceAt(inst, 0), memory.data_dwords)));
+        SanitizeStoredNaN(ConstructU32x4(MemorySourceAt(inst, 0), memory.data_dwords)), inst.pc);
 	ir.Emit(IR::ValueOpcode::ImageWrite, {resource, address, data, ir.GetExec()},
 	        AddMemoryInfo(memory, inst.pc));
 	return true;

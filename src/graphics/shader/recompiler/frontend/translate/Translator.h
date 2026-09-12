@@ -85,7 +85,7 @@ private:
 	// Diagnostic only (KYTY_NAN_SANITIZE), default OFF. See Memory.cpp.
 	IR::Value     SanitizeStoredNaN(IR::Value data);
 	// Diagnostic only (KYTY_PROBE_VGPR), default OFF. See Memory.cpp.
-	IR::Value     ProbeStoredVgpr(IR::Value data);
+	IR::Value     ProbeStoredVgpr(IR::Value data, uint32_t pc);
 	void          WriteImageComponents(const Decoder::Operand& dst, IR::Value value,
 	                                   const IR::MemoryInfo& memory, uint32_t component_limit);
 	BufferAddress ReadBufferAddress(const Decoder::Instruction& inst, uint32_t source_offset);

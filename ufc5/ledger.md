@@ -603,6 +603,74 @@ read; and **block 6 rewrites v29/v30 at `0x166c`/`0x1674` before the store**, so
 reads post-accumulate values, not the block-5 values. Fix: let the probe select a store index, and
 probe only registers block 6 does not overwrite.
 
+### SESSION 7c — BLOCK 4 OF THE UPSCALER NEVER EXECUTES
+
+**MEASURED, and this is the strongest result of the session.** Nine registers have their last
+write in the whole shader inside block 4 (`0x148c-0x15b0`): `v18 v13 v14 v15 v16 v17 v12 v11 v31`.
+Nothing downstream can touch them, so their value at the store is block 4's output. Probed four:
+```
+v11 = 0        100% of pixels   (0x1588 V_MUL_F32 v11.clamp, v11, v4 - would be per-pixel in [0,1])
+v12 = 0.49976  100%
+v13 = 0.49976  100%
+v17 = 0        100%
+v31 = 0        100%             (0x1598 V_MAD_F32 v31, v9, v5, v2)
+```
+Four different formulas, four uniform results. **Block 4 does not run.** Block 3 *does* - `v63`
+(last write `0x11d8`) has 1065 distinct values and `v74` (`0x125c`) has 1983, both per-pixel.
+
+**Why this explains everything.** Block 4 holds the last write before the output for `v29`
+(`0x15a0`), `v30` (`0x15a8`) and `v31` (`0x1598`) - exactly the registers feeding the three corrupt
+channels. `v32`/`v33` (channel 3, the one that was always sane) are last written in block 2. With
+`v31 = 0`, block 5's seven adds degenerate, which produces the +/-65504 and the negative colour,
+and NaN downstream.
+
+**AND THE CONDITION SAYS IT SHOULD RUN.** Block 4 is entered by:
+```
+0x1470 V_CMP_LT_F32 vcc_lo, 0, v13      0x147c S_OR_B32 vcc_lo, s4, vcc_lo
+0x1474 V_CMP_LT_F32 s5, 0, v2           0x1480 S_OR_B32 vcc_lo, vcc_lo, s5
+0x1484 S_AND_SAVEEXEC_B32 vcc_hi, vcc_lo    0x1488 S_CBRANCH_EXECZ 0x15b0
+```
+`v13` is written only at `0x1500`, *inside block 4*, so the `v13` measured at the store is the same
+`v13` seen at `0x1470`: **0.49976, i.e. > 0 for every lane**. So `vcc_lo` is all-ones, EXEC is
+unchanged and non-zero (`v87 > 0` on 29.6% of lanes), and the EXECZ branch must not be taken.
+
+**FIX APPLIED, CORRECT, BUT IT DID NOT FIX THE ROUND.** `AddBranchCondition` lowered
+`S_CBRANCH_EXECZ`/`VCCZ` with `LogicalNot(GetExec())` - the *current lane's* bit - where the ISA
+defines a wave-wide "is the whole mask word zero" test. `MaskIsZero`'s own comment records this
+exact defect being fixed in two *read* paths and predicts the symptom ("a branch on EXECZ took the
+wrong direction whenever some other lane was still active"); **the branch terminator was a third
+site and was missed.** Now uses `MaskIsZero(false)` / `MaskIsZero(true)`. It is a genuine ISA
+conformance fix and is kept, but measured after it: scene `0x1162c00000` 1600x900 still 0.87%
+nonzero, scanout still 12.5% (HUD only). **The round is unchanged.** The shader *was* recompiled
+that run (5 recompile phases for the hash; `_PipelineCache` caches driver pipelines, not our
+SPIR-V), so the test was valid.
+
+**THE OPEN QUESTION, and the first thing to measure next:** re-probe `v11,v12,v13,v17` with the
+EXECZ fix in place. If they now vary, block 4 runs and the black round has a further cause
+downstream. If they are still uniform, the branch is not what is suppressing block 4 and the
+`S_AND_SAVEEXEC_B32` -> EXEC -> structurizer path is where to look.
+
+**Audited and correct, on top of the eight above - do not re-read:** `S_OR_B32`/`S_AND_B32` via
+`SimpleInteger` -> `WriteOperand` (updates both the mask word and the per-lane bit),
+`WriteMask` for SGPR destinations (explicitly does not clobber the neighbouring SGPR in wave32),
+and `ReadMask(VccLo)` (derives the lane bit from the word in wave32, consistent with the writes).
+
+**Probe tooling (all opt-in, default OFF):**
+```
+KYTY_PROBE_VGPR=33,87,29,30   up to four registers, one per stored channel
+KYTY_PROBE_HASH=<hash>        REQUIRED for low register numbers, or every image store in the
+                              game is replaced and the menus cannot be navigated
+KYTY_PROBE_PC=16fc            which store to hijack, by pc - this shader has two
+```
+Read the result out of the upscaler's history via `CAPTURE_HASHES` + `DUMP_INPUTS`, decoding
+`input-<hash>-i3-<addr>-f<N>.bin` as `<f2` (it is `vk=97`, R16G16B16A16_SFLOAT).
+- **Shader dumps live in `D:\PS5\shader-dumps\hang_cs\`, not the root** - the root copies were
+  deleted and I wasted a navigation regenerating what was already on disk.
+- The probe writes through an f16 store, so values outside f16 range or below its denormal floor
+  are distorted. Trust sign, zero/non-zero and *variance*; do not trust absolute magnitude.
+- No register has its last write in block 1, so the store probe **cannot** test whether block 1
+  executes. That needs a probe that can store at an arbitrary pc.
+
 **NEXT: bisect inside the shader, do not keep auditing opcodes.** Reading one implementation at a
 time has now cost eight correct answers. Add a debug path that stores a chosen VGPR at a chosen PC
 into a scratch image, then walk backwards from `v29/v30/v36` through blocks 3-5 to the first value

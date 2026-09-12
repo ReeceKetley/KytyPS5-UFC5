@@ -798,10 +798,15 @@ void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 		case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
 		case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
 		case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.GetVcc()); break;
-		case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
-		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
-		case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
+		// S_CBRANCH_*CBRANCH_VCCZ/EXECZ test the WHOLE mask word, not this lane's bit. This is the
+		// third site with that bug: MaskIsZero's comment records the two read paths that were
+		// already fixed, but the branch terminator - the one that actually decides the branch -
+		// still used the per-lane bit, so an EXECZ branch was taken by every inactive lane even
+		// while other lanes were still active.
+		case CFG::BranchCondition::VccZero: condition = MaskIsZero(true); break;
+		case CFG::BranchCondition::VccNonZero: condition = ir.LogicalNot(MaskIsZero(true)); break;
+		case CFG::BranchCondition::ExecZero: condition = MaskIsZero(false); break;
+		case CFG::BranchCondition::ExecNonZero: condition = ir.LogicalNot(MaskIsZero(false)); break;
 		case CFG::BranchCondition::GotoVariable:
 			if (source.terminator.goto_variable == UINT32_MAX) {
 				EXIT("block %u reads an invalid goto variable", source.id);
