@@ -1790,14 +1790,36 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			// Until host occlusion queries are implemented, publish an always-visible result. The
 			// PS5 layout contains one interleaved begin/end pair per DB, and bit 63 marks a result
 			// ready.
-			constexpr uint64_t ready_bit    = 1ull << 63u;
-			constexpr uint64_t counter_mask = ready_bit - 1u;
-			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
-			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
-			for (uint32_t db = 0; db < 16u; db++) {
-				results[db * 2u] = value;
+			//
+			// This previously wrote only the EVEN (begin) slots, with a counter that incremented on
+			// every dump, and left the ODD (end) slots as whatever was already in guest memory. A
+			// visible-sample count is end - begin, so the guest was differencing a drifting
+			// synthetic value against stale memory: the result could be zero ("nothing visible",
+			// i.e. cull it) or a wild number, and it changed every frame. Write BOTH halves of each
+			// pair instead, with a fixed positive difference, so "always visible" is actually what
+			// the guest computes and is stable frame to frame.
+			//
+			// KYTY_OCCLUSION_LEGACY=1 restores the old begin-only behaviour for A/B.
+			constexpr uint64_t ready_bit       = 1ull << 63u;
+			constexpr uint64_t counter_mask    = ready_bit - 1u;
+			constexpr uint64_t visible_samples = 0x1000;
+			static const bool  legacy          = [] {
+                const char* env = std::getenv("KYTY_OCCLUSION_LEGACY");
+                return env != nullptr && std::strcmp(env, "0") != 0;
+			}();
+			auto* results = reinterpret_cast<volatile uint64_t*>(event_address);
+			if (legacy) {
+				const auto value = ready_bit | m_synthetic_occlusion_counter;
+				for (uint32_t db = 0; db < 16u; db++) {
+					results[db * 2u] = value;
+				}
+				m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
+			} else {
+				for (uint32_t db = 0; db < 16u; db++) {
+					results[db * 2u]      = ready_bit;                          // begin = 0 samples
+					results[db * 2u + 1u] = ready_bit | visible_samples;        // end   = N samples
+				}
 			}
-			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
 			break;
 		}
 		default:

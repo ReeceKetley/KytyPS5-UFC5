@@ -850,6 +850,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			}
 			cache.ClearImage(buffer, binding.image_id, range, clear);
 			cleared++;
+			// WHICH images the stub wipes has only ever been inferred from the count, never
+			// matched by address. The upscaler's fresh scene-colour inputs (i4/i7) measure 0%
+			// nonzero throughout a round while the game still submits ~2,469 draws/frame and the
+			// renderer drops none of them - so "the stub zeroes the scene the draws just wrote"
+			// is the leading explanation for the black round, and this is what confirms or kills
+			// it. Compare these addresses against the upscaler's CaptureBinding lines.
+			LOGF("GraphicsRenderDispatchDirect: stub cleared image=%u addr=0x%016" PRIx64
+			     " extent=%ux%u fmt=%u levels=%u layers=%u depth=%s\n",
+			     i, image.info.data.address, image.backing.extent.width,
+			     image.backing.extent.height, static_cast<uint32_t>(image.backing.format),
+			     image.info.resources.levels, image.backing.layers, is_depth ? "true" : "false");
 		}
 		LOGF("GraphicsRenderDispatchDirect: stubbing watched compute shader hash=0x%016" PRIx64
 		     " addr=0x%016" PRIx64 " groups=%ux%ux%u local=%ux%ux%u cleared_images=%u "

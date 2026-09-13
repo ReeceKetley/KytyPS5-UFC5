@@ -287,22 +287,63 @@ KYTY_HW_CTX_PARSER(HwCtxSetCentroidPriority) {
 	return num_values;
 }
 
-static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
-                                      [[maybe_unused]] uint32_t value) {}
+// An ignored register that the game never writes costs nothing; one written every frame with a
+// non-default value is a silent behavioural gap. These were all invisible, so there was no way to
+// tell the two apart. Report each ignored register once, with its first value and a running count,
+// so the inventory can be ranked by what the game actually uses before anything is implemented.
+// KYTY_LOG_IGNORED_REGS=0 silences it.
+static void NoteIgnoredRegister(const char* name, uint32_t cmd_offset, uint32_t value) {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_LOG_IGNORED_REGS");
+		return env == nullptr || std::strcmp(env, "0") != 0;
+	}();
+	if (!enabled) {
+		return;
+	}
+	struct Seen {
+		std::atomic<uint64_t> count {0};
+	};
+	static std::mutex                                     lock;
+	static std::unordered_map<uint64_t, uint64_t>         counts;
+	const auto key = (static_cast<uint64_t>(cmd_offset) << 32u) | value;
+	std::scoped_lock guard {lock};
+	const auto       hits = ++counts[key];
+	if (hits == 1) {
+		LOGF("IgnoredRegister: %s offset=0x%08" PRIx32 " value=0x%08" PRIx32 " (first write)\n", name,
+		     cmd_offset, value);
+	} else if (hits == 1000 || hits == 100000) {
+		LOGF("IgnoredRegister: %s offset=0x%08" PRIx32 " value=0x%08" PRIx32 " x%" PRIu64 "\n", name,
+		     cmd_offset, value, hits);
+	}
+}
 
-static void HwCtxIgnoreAlphaToMaskRegister([[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnoreAaMaskRegister(uint32_t cmd_offset, uint32_t value) {
+	NoteIgnoredRegister("PA_SC_AA_MASK", cmd_offset, value);
+}
+
+static void HwCtxIgnoreAlphaToMaskRegister(uint32_t value) {
+	NoteIgnoredRegister("DB_ALPHA_TO_MASK", 0, value);
+}
 
 static void HwCtxIgnoreDisabledUserClipPlane(CommandProcessor& cp, uint32_t value) {
 	EXIT_NOT_IMPLEMENTED(value != 0 || cp.GetCtx().GetClipControl().user_clip_planes != 0);
 }
 
-static void HwCtxIgnoreDrawPayloadControl([[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnoreDrawPayloadControl(uint32_t value) {
+	NoteIgnoredRegister("VGT_DRAW_PAYLOAD_CNTL", 0, value);
+}
 
-static void HwCtxIgnoreObjprimIdControl([[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnoreObjprimIdControl(uint32_t value) {
+	NoteIgnoredRegister("VGT_OBJPRIM_ID_CNTL", 0, value);
+}
 
-static void HwCtxIgnorePrimitiveIdReset([[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnorePrimitiveIdReset(uint32_t value) {
+	NoteIgnoredRegister("VGT_PRIMITIVEID_RESET", 0, value);
+}
 
-static void HwCtxIgnoreVtxControl([[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnoreVtxControl(uint32_t value) {
+	NoteIgnoredRegister("VGT_VTX_CNTL", 0, value);
+}
 
 static void HwCtxSetDepthBoundsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
 	auto& ctx    = cp.GetCtx();
@@ -315,26 +356,37 @@ static void HwCtxSetDepthBoundsRegister(CommandProcessor& cp, uint32_t cmd_offse
 	}
 }
 
-static void HwCtxIgnoreDepthMetadataRegister([[maybe_unused]] uint32_t cmd_offset,
-                                             [[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnoreDepthMetadataRegister(uint32_t cmd_offset, uint32_t value) {
+	NoteIgnoredRegister("DB_depth_metadata(HTILE)", cmd_offset, value);
+}
 
-static void HwCtxIgnoreFovWindow([[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnoreFovWindow(uint32_t value) {
+	NoteIgnoredRegister("PA_SC_FOV_WINDOW", 0, value);
+}
 
-static void HwCtxIgnoreFsrRegister([[maybe_unused]] uint32_t cmd_offset,
-                                   [[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnoreFsrRegister(uint32_t cmd_offset, uint32_t value) {
+	NoteIgnoredRegister("FSR", cmd_offset, value);
+}
 
-static void HwCtxIgnoreScanModeControl1([[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnoreScanModeControl1(uint32_t value) {
+	NoteIgnoredRegister("PA_SC_MODE_CNTL_1", 0, value);
+}
 
-static void HwCtxIgnorePaScExtendedControl([[maybe_unused]] uint32_t cmd_offset,
-                                           [[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnorePaScExtendedControl(uint32_t cmd_offset, uint32_t value) {
+	NoteIgnoredRegister("PA_SC_EXTENDED_CONTROL", cmd_offset, value);
+}
 
-static void HwCtxIgnoreCbDccControl([[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnoreCbDccControl(uint32_t value) {
+	NoteIgnoredRegister("CB_DCC_CONTROL", 0, value);
+}
 
-static void HwCtxIgnorePointState([[maybe_unused]] uint32_t cmd_offset,
-                                  [[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnorePointState(uint32_t cmd_offset, uint32_t value) {
+	NoteIgnoredRegister("PA_SU_POINT_STATE", cmd_offset, value);
+}
 
-static void HwCtxIgnoreBorderColorTableAddr([[maybe_unused]] uint32_t cmd_offset,
-                                            [[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnoreBorderColorTableAddr(uint32_t cmd_offset, uint32_t value) {
+	NoteIgnoredRegister("TA_BORDER_COLOR_BASE", cmd_offset, value);
+}
 
 static void HwCtxIgnoreSpiTmpringSize(uint32_t value) {
 	static std::atomic<uint32_t> log_count {0};

@@ -994,6 +994,89 @@ surface including the bloom/downsample pyramid - **4,206 recreations of a 400x22
 walkout** - which blew the frame to white and destroyed the visual readout.
 `KYTY_SEED_NEW_IMAGES_MIN_WIDTH` (default 1280) now keeps it to full-resolution surfaces.
 
+### SESSION 14 (2026-09-13) — THE STUB IS EXONERATED, i4/i7 WERE MISREAD, AND A 118-INSTRUCTION SHADER IS THE NEW LEAD
+
+**1. THE STUB DOES NOT CLEAR THE UPSCALER'S INPUTS. Hypothesis dead.** Added per-image logging to the
+skip stub (`renderCompute.cpp`). It clears:
+```
+addr=0x1164b20000  1600x904  fmt=97  (R16G16B16A16_SFLOAT)
+addr=0x1165750000  1600x904  fmt=100 (R32_SFLOAT)
+```
+The upscaler's B10G11R11 surfaces are **1600x900 fmt=122** — different format, extent and surface.
+Tracing both stub addresses through the whole log: touched by **nothing but the occlusion CS itself**
+(read-write storage + read-only sampled, 75/70 hits). They are its private Hi-Z working buffers and
+zeroing them is the intended "nothing occludes".
+
+**2. CORRECTION TO SESSION 12: i4/i7 ARE THE UPSCALER'S OWN OUTPUT PING-PONG, NOT SCENE INPUTS.**
+```
+frame 705 pass 0:  115f570000 is image=7   read
+frame 706 pass 1:  115f570000 is image=4   read
+frame 706 pass 1:  115f570000 is image=11  WRITE
+```
+`11bc800000` <-> `115f570000` is a B10G11R11 ping-pong written by `i11`, exactly as
+`12a2800000` <-> `12a3800000` is the RGBA16F history ping-pong written by `i12`. **So "the fresh
+scene inputs i4/i7 are empty in the round" was wrong** — their emptiness is an EFFECT of the
+upscaler producing nothing. The genuine render-resolution inputs are i0, i1, i2, i9, i10 at 1068x600.
+
+**3. THE IGNORED-REGISTER INVENTORY IS SMALL, CONSTANT, AND DOES NOT VARY BY SCENE.** Added
+`NoteIgnoredRegister` (first value + counts at 1k/100k; `KYTY_LOG_IGNORED_REGS=0` silences).
+Everything the game actually writes, identical in menu and walkout:
+```
+DB_ALPHA_TO_MASK          0x0000aa00                      x100000+
+TA_BORDER_COLOR_BASE      0x1115239d / 0x11500000 / 0      x100000+
+DB_depth_metadata(HTILE)  0x11000100                       x1000+
+PA_SC_AA_MASK             0x00000000                       x1000+
+PA_SC_MODE_CNTL_1         0x06020000                       x1000+
+```
+**FSR, CB_DCC_CONTROL, PA_SC_FOV_WINDOW and every VGT_* never fire at all.** Values never change
+between scenes, so ignored registers cannot explain the walkout/round difference. They remain
+candidates for *constant* baseline corruption only.
+
+**4. OCCLUSION QUERIES: real bug fixed, no visible change.** The synthetic result wrote only the EVEN
+(begin) slots with a counter that incremented every dump, leaving ODD (end) slots as stale guest
+memory — the guest computed `end - begin` from a drifting value minus garbage. Now writes both halves
+with a fixed positive difference (`KYTY_OCCLUSION_LEGACY=1` restores the old path). **Round still
+black.** Honest negative: real defect, not this one.
+
+**5. THE NEW LEAD — `CS 0x0c399ab0b1e7fa33`, 944 bytes, ~118 instructions.**
+Found by putting `TRACE_ADDRS` on the upscaler's i10 (`0x1161fb0000`, 1068x600 `R8G8B8A8_UNORM`),
+which reads all-zero in **every** scene:
+```
+ResourceTrace frame=1635 hash=0x0c399ab0b1e7fa33 image=2  read=true  write=false addr=0x1161fb0000
+ResourceTrace frame=1635 hash=0x0c399ab0b1e7fa33 image=3  read=false write=true  addr=0x1161fb0000
+ResourceTrace frame=1635 hash=0xe17349e0d437757b image=10 read=true  write=false addr=0x1161fb0000
+```
+It read-modify-writes that surface and the upscaler samples it. **Measured, same dispatch:**
+```
+i0 @0x1176ae0000  1068x600 RGBA8   97.6% nonzero, 0..255, 256 distinct   REAL DATA IN
+i2 @0x1161fb0000  1068x600 RGBA8    0.0% nonzero, all zeros              NOTHING OUT
+```
+Opcode profile is **tonemap-shaped**: `V_LOG_F32` x2 + `V_EXP_F32` x2 (= pow), `V_RCP_F32` x5,
+`V_MAX_F32` x8, `V_MIN_F32` x3, `V_MUL_F32` x19, 3 `IMAGE_LOAD`, 3 `IMAGE_STORE`. That fits the
+user's symptoms — "colours wrong, hue wrong, sometimes bright red and white" is what a broken
+tonemapper looks like — and it is present in the WALKOUT too, not only the round.
+
+Structure; the third store is EXEC-gated exactly like the upscaler's block 4:
+```
+0x0228  IMAGE_STORE v3, v10, s4    dmask=0xf
+0x0234  IMAGE_STORE v0, v10, s12   dmask=0xf
+0x0240  V_CMPX_GT_I32 exec_lo, vcc_lo, v10
+0x0244  V_CMPX_GT_I32 exec_lo, vcc_hi, v11
+0x0248  S_CBRANCH_EXECZ 0x0264
+0x025c  IMAGE_STORE v0, v10, s4    dmask=0x1 d16=1
+```
+**WHY THIS IS THE BEST TARGET THE PROJECT HAS HAD:** 118 instructions instead of 969; it dispatches
+in menus and walkouts so it needs **no fight navigation**; one clearly good input and one clearly
+dead output; and it feeds the upscaler. Small enough to be a realistic offline-replay candidate once
+`RunCase` can bind more than one sampled image.
+
+**METHOD TRAP HIT AGAIN:** `input-*` captures are dumped at BIND time — **before** the dispatch. They
+show what a shader READ, never what it wrote. To see output, capture on a LATER dispatch (the next
+dispatch's input is the previous dispatch's output) or use the panel's armed before+after dump. An
+all-zero `i2` on input is also consistent with a self-sustaining zero: if this is a read-modify-write
+accumulator whose operation is multiplicative in its own previous value, zero in gives zero out
+forever — the same shape as the upscaler's NaN loop.
+
 ### SESSION 13 (2026-09-13) — THE GPU TEST SUITE IS ALIVE AGAIN, WAVE64 IS CORRECT, AND STAGE 2 IS ARCHITECTURALLY BLOCKED
 
 **THE HEADLINE: there is now a fast local loop. Seconds, no game, no navigation, no TDR.**
