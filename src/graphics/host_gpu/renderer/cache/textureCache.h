@@ -55,6 +55,20 @@ public:
 	// self-feeding temporal buffer recovers once its poisoned history is discarded, which
 	// separates "NaN generated every frame" from "NaN injected once and then persisting".
 	uint32_t ClearImagesAtAddress(CommandBuffer& command, uint64_t address, uint64_t size);
+	// DIAGNOSTIC, NOT A FIX. Seeds freshly created colour images with a non-zero constant
+	// instead of leaving them at the zero the host OS hands us. Guest direct memory on the
+	// console holds whatever was there before; VirtualAlloc(MEM_COMMIT) zero-fills, and zero is
+	// PATHOLOGICAL rather than merely different - it feeds 0/0 and rcp(0) into the temporal
+	// upscaler, which is exactly where the black round starts (ledger session 12 point 7).
+	// Enabled by KYTY_SEED_NEW_IMAGES=<float>; inert when unset. KYTY_SEED_NEW_IMAGES_FORMAT
+	// overrides the format filter (decimal VkFormat, default 97 = R16G16B16A16_SFLOAT).
+	uint32_t SeedNewImages(CommandBuffer& command);
+	// nullptr when KYTY_SEED_NEW_IMAGES is unset, so the whole path stays inert by default.
+	static const float* SeedNewImagesValue();
+	// KYTY_SEED_NEW_IMAGES_NOISE=1: fill with a replicated noise tile instead of a constant, so
+	// the seed carries spatial VARIATION. A constant seed (0.0 or 0.5) fails identically, which
+	// is what put the blame on uniformity rather than on the value - ledger session 12.
+	bool SeedImageWithNoise(Image& image);
 	[[nodiscard]] ImageId       FindLastPresentableColor();
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
@@ -203,6 +217,9 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	// Images created since the last SeedNewImages sweep, for KYTY_SEED_NEW_IMAGES. Filtering
+	// happens at sweep time, not insert time, because `backing` is not usable until then.
+	std::vector<ImageId> m_pending_seed;
 	uint64_t         m_presentable_address    = 0;
 	uint64_t         m_presentable_size       = 0;
 

@@ -458,6 +458,11 @@ void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCac
 	// frames that are not dumping.
 	RefreshTracedResources();
 	ClearImagesOnRequest(command, renderer, cache);
+	// DIAGNOSTIC, inert unless KYTY_SEED_NEW_IMAGES is set. Runs before the dump check so a
+	// seeded frame is still capturable.
+	if (const auto seeded = cache.SeedNewImages(command); seeded != 0) {
+		LOGF("SeedNewImages: seeded=%u frame=%d\n", seeded, renderer.GetGpu().GetFrameNum());
+	}
 	const bool dump = ShouldDumpGpuImage(renderer.GetGpu().GetFrameNum());
 	if (!dump) {
 		return;

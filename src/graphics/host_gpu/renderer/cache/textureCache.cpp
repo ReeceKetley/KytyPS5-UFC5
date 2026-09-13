@@ -338,7 +338,153 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	if (!pinned.data.Empty()) {
 		RegisterImage(id);
 	}
+	if (SeedNewImagesValue() != nullptr) {
+		m_pending_seed.push_back(id);
+	}
 	return id;
+}
+
+// DIAGNOSTIC, NOT A FIX. See the declaration in textureCache.h.
+const float* TextureCache::SeedNewImagesValue() {
+	static const bool  set   = std::getenv("KYTY_SEED_NEW_IMAGES") != nullptr;
+	static const float value = set ? std::strtof(std::getenv("KYTY_SEED_NEW_IMAGES"), nullptr) : 0.0f;
+	return set ? &value : nullptr;
+}
+
+namespace {
+
+// Minimal f32 -> f16 bit encoder for the noise seed. Only needs to be right for the ordinary
+// finite values generated below, so it does not handle Inf/NaN or subnormal inputs.
+uint16_t EncodeHalf(float value) {
+	uint32_t bits = 0;
+	std::memcpy(&bits, &value, sizeof(bits));
+	const uint32_t sign     = (bits >> 16u) & 0x8000u;
+	const auto     exponent = static_cast<int32_t>((bits >> 23u) & 0xffu) - 127 + 15;
+	const uint32_t mantissa = (bits >> 13u) & 0x3ffu;
+	if (exponent <= 0) {
+		return static_cast<uint16_t>(sign);
+	}
+	if (exponent >= 31) {
+		return static_cast<uint16_t>(sign | 0x7bffu);
+	}
+	return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10u) | mantissa);
+}
+
+// A 64x64 RGBA16F tile of spatially varied values, replicated across the image. The point of the
+// experiment is variation between neighbouring texels, not realism, and a small tile keeps the
+// staging upload at 32 KiB instead of the 11.5 MiB a full 1600x900 surface would need.
+constexpr uint32_t kNoiseTile = 64;
+
+const std::vector<uint16_t>& NoiseTileData() {
+	static const std::vector<uint16_t> tile = [] {
+		std::vector<uint16_t> data(static_cast<size_t>(kNoiseTile) * kNoiseTile * 4u);
+		// xorshift32, kept inline so this diagnostic pulls in no extra headers. Fixed seed: the
+		// experiment must be repeatable across runs.
+		uint32_t   state = 0x5eed1234u;
+		const auto next  = [&state] {
+			state ^= state << 13u;
+			state ^= state >> 17u;
+			state ^= state << 5u;
+			return static_cast<float>(state >> 8u) / static_cast<float>(1u << 24u);
+		};
+		for (size_t i = 0; i < data.size(); i += 4) {
+			data[i + 0] = EncodeHalf(next() * 2.0f);
+			data[i + 1] = EncodeHalf(next() * 2.0f);
+			data[i + 2] = EncodeHalf(next() * 2.0f);
+			data[i + 3] = EncodeHalf(0.5f + next() * 3.5f);
+		}
+		return data;
+	}();
+	return tile;
+}
+
+bool SeedNoiseEnabled() {
+	static const bool enabled = std::getenv("KYTY_SEED_NEW_IMAGES_NOISE") != nullptr;
+	return enabled;
+}
+
+} // namespace
+
+// Replicate the noise tile over every texel of mip 0. Returns false if the image is not a shape we
+// can stage into, so the caller can fall back to the constant clear.
+bool TextureCache::SeedImageWithNoise(Image& image) {
+	const auto width  = image.backing.extent.width;
+	const auto height = image.backing.extent.height;
+	if (width == 0 || height == 0 || image.backing.image == nullptr) {
+		return false;
+	}
+	const auto& tile = NoiseTileData();
+	auto&       stream =
+	    m_buffer_cache.GetUtilityBuffer(MemoryUsage::Stream);
+	const auto bytes  = tile.size() * sizeof(uint16_t);
+	const auto offset = stream.Copy(tile.data(), bytes, 16);
+
+	std::vector<vk::BufferImageCopy> copies;
+	copies.reserve(static_cast<size_t>((width / kNoiseTile + 1) * (height / kNoiseTile + 1)));
+	for (uint32_t y = 0; y < height; y += kNoiseTile) {
+		for (uint32_t x = 0; x < width; x += kNoiseTile) {
+			vk::BufferImageCopy copy {};
+			copy.bufferOffset      = offset;
+			copy.bufferRowLength   = kNoiseTile;
+			copy.bufferImageHeight = kNoiseTile;
+			copy.imageSubresource  = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+			copy.imageOffset       = {static_cast<int32_t>(x), static_cast<int32_t>(y), 0};
+			copy.imageExtent = {std::min(kNoiseTile, width - x), std::min(kNoiseTile, height - y), 1};
+			copies.push_back(copy);
+		}
+	}
+	if (copies.empty()) {
+		return false;
+	}
+	image.Upload(copies, stream.Handle(), offset, bytes);
+	return true;
+}
+
+uint32_t TextureCache::SeedNewImages(CommandBuffer& command) {
+	const float* seed = SeedNewImagesValue();
+	if (seed == nullptr) {
+		return 0;
+	}
+	static const uint32_t want_format = [] {
+		const char* env = std::getenv("KYTY_SEED_NEW_IMAGES_FORMAT");
+		return env == nullptr ? 97u : static_cast<uint32_t>(std::strtoul(env, nullptr, 10));
+	}();
+	// Without a size floor this also seeds the bloom/downsample pyramid - 4,206 recreations of a
+	// 400x225 surface in one walkout - which blows the whole frame to white and destroys the
+	// visual readout the experiment depends on. Only the full-resolution history is wanted.
+	static const uint32_t min_width = [] {
+		const char* env = std::getenv("KYTY_SEED_NEW_IMAGES_MIN_WIDTH");
+		return env == nullptr ? 1280u : static_cast<uint32_t>(std::strtoul(env, nullptr, 10));
+	}();
+	std::scoped_lock lock {m_lock};
+	std::vector<ImageId> pending;
+	pending.swap(m_pending_seed);
+	uint32_t seeded = 0;
+	for (const auto id: pending) {
+		const auto owner = m_slot_images.try_get(id);
+		if (owner == nullptr || owner->info.IsDepth() || owner->backing.image == nullptr ||
+		    static_cast<uint32_t>(owner->backing.format) != want_format ||
+		    owner->backing.extent.width < min_width) {
+			continue;
+		}
+		vk::ImageSubresourceRange range {};
+		range.aspectMask     = vk::ImageAspectFlagBits::eColor;
+		range.baseMipLevel   = 0;
+		range.levelCount     = owner->backing.mip_levels;
+		range.baseArrayLayer = 0;
+		range.layerCount     = owner->backing.layers;
+		const bool noise = SeedNoiseEnabled() && SeedImageWithNoise(*owner);
+		if (!noise) {
+			vk::ClearValue clear {};
+			clear.color = vk::ClearColorValue {std::array<float, 4> {*seed, *seed, *seed, *seed}};
+			ClearImage(command, id, range, clear);
+		}
+		++seeded;
+		LOGF("SeedNewImages: addr=0x%016" PRIx64 " extent=%ux%u fmt=%u mode=%s seed=%f\n",
+		     owner->info.data.address, owner->backing.extent.width, owner->backing.extent.height,
+		     want_format, noise ? "noise" : "constant", static_cast<double>(*seed));
+	}
+	return seeded;
 }
 
 void TextureCache::RegisterImage(ImageId id) {

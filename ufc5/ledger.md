@@ -939,6 +939,61 @@ Tooling added: `tools/capture_walkin.ps1` (fires DUMP_INPUTS on a cadence so a w
 keyboard; writes the occurrence count into the trigger file, which removes the
 `KYTY_CAPTURE_OCCURRENCES` footgun entirely), `tools/history_content.py`, `tools/nan_seed.py`.
 
+**8. THE ANSWER. THE UPSCALER IS NOT BROKEN - ITS FRESH SCENE INPUTS ARE EMPTY IN THE FIGHT. THE NaN
+HAS BEEN A DOWNSTREAM SYMPTOM FOR TWELVE SESSIONS.**
+
+Three seeding experiments, each killing a hypothesis (`KYTY_SEED_NEW_IMAGES`, added this session):
+```
+history contents at the fight's first dispatch      pass 0's output
+  all zero (the natural case)                       0 / -65504 / +65504 -> NaN
+  uniform 0.5 (constant seed)                       0 / -65504 / +65504 -> NaN
+  varied noise, 2400+ distinct/channel              0 / -65504 / +65504 -> NaN
+```
+**The history contents are irrelevant.** "Zero is the poison" and "uniform is the poison" are both
+dead. Seeding is confirmed reaching the image (captures show exactly the seeded values in `i3`
+immediately before the dispatch that saturates).
+
+The real cause, straight from the `VideoOut dump` `nonzero=` counters, percent of non-zero texels:
+```
+frame        i4%      i7%      i9%     i10%
+85-1691        0        0      100        0     entire menu
+1694        42.6     69.2      100     68.6     WALKOUT - inputs light up
+1696-1707   ~100     ~100      100      100     WALKOUT - fully populated
+1775+          0        0      100        0     FIGHT - empty again
+```
+`i4`/`i7` (1600x900 `B10G11R11` scene colour) and `i10` (1068x600 `R8G8B8A8`) are **empty during the
+round**. They are populated in exactly one window - the walkout - which is the one window the
+picture looks right. **The upscaler has nothing to upscale**, and faithfully produces saturation and
+then NaN from an empty scene.
+
+**EXACT CONSISTENCY CHECK: `i9` is the only input that is 100% populated at every frame, and `ch3` is
+the only output channel healthy at every frame.** The one live input feeds the one live output. That
+relationship has held in every measurement all session and now has an explanation.
+
+**CONSEQUENCE.** Every shader-level hypothesis this project has chased - `V_RCP_F32`, MAD_MIX
+lowering, block 4's compares, EXEC/`S_AND_SAVEEXEC`, the structurizer, EXECZ/VCCZ, the f16 path -
+was investigating a shader doing the correct thing with empty data. The decode cross-check in point
+1 said the shader translates correctly; it does, and it was never the problem.
+
+**This substantially rehabilitates SESSION 5's withdrawn hypothesis** ("the black round directly
+consumes output from the skipped wave64 CS"), and matches what `run_ufc5.ps1` has asserted in a
+comment all along: *"KYTY_SKIP_CS_HASH ... Skipping it is why the fight round renders BLACK - that is
+expected, not a regression."*
+
+**NOT YET PROVEN:** that the skipped occlusion CS `0xea0aceac518ec52d` is the reason the inputs are
+empty. We have measured that the inputs ARE empty, not why. That is the leading candidate and now
+has real evidence behind it, but it is the next thing to test, not a conclusion.
+
+**THE QUESTION IS NOW:** why does the scene stop rendering into `i4`/`i7`/`i10` when the round
+starts? Use previous-writer tracing on those addresses in a round (the inspector already does this),
+and check whether the skipped CS is a producer for them. **Stop looking inside
+`CS 0xe17349e0d437757b`.**
+
+Caveat on the seeding tool: it must be kept narrow. The first noise run seeded every `RGBA16F`
+surface including the bloom/downsample pyramid - **4,206 recreations of a 400x225 target in one
+walkout** - which blew the frame to white and destroyed the visual readout.
+`KYTY_SEED_NEW_IMAGES_MIN_WIDTH` (default 1280) now keeps it to full-resolution surfaces.
+
 ### SESSION 8 (2026-09-12) — BLOCK 4 **DOES** EXECUTE. 7c WITHDRAWN. THE PROBE WAS READING TWO PASSES AT ONCE.
 
 **THE MEASUREMENT DEFECT, AND IT INVALIDATES EVERY PROBE NUMBER IN SESSION 7.**
