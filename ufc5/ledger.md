@@ -994,7 +994,98 @@ surface including the bloom/downsample pyramid - **4,206 recreations of a 400x22
 walkout** - which blew the frame to white and destroyed the visual readout.
 `KYTY_SEED_NEW_IMAGES_MIN_WIDTH` (default 1280) now keeps it to full-resolution surfaces.
 
-### SESSION 8 (2026-09-12) — BLOCK 4 **DOES** EXECUTE. 7c WITHDRAWN. THE PROBE WAS READING TWO PASSES AT ONCE.
+### SESSION 13 (2026-09-13) — THE GPU TEST SUITE IS ALIVE AGAIN, WAVE64 IS CORRECT, AND STAGE 2 IS ARCHITECTURALLY BLOCKED
+
+**THE HEADLINE: there is now a fast local loop. Seconds, no game, no navigation, no TDR.**
+```
+cd D:\PS5\src\KytyPS5\_Build\windows
+.\shader_recompiler_compute_tests.exe --wave64-only      # ~26 cases, exit 0
+```
+~30 other selectors exist (`--ds-inc-only`, `--scheduler-only`, `--descriptor-heap-only`, …), so most
+of the suite is reachable. **Use this before spending a navigation on anything instruction-level.**
+
+**1. THE SUITE WAS DEAD, NOT FAILING — TWO PRE-EXISTING BREAKAGES, BOTH FIXED.** It aborted before a
+single GPU case ran; confirmed pre-existing by building HEAD with **no** local changes.
+- Diagnostic instrumentation reads the frame number unconditionally through
+  `GetGpu().GetFrameNum()` (`descriptors.cpp:974` is on every dispatch's binding path), and
+  `BufferCache` marshals readbacks with `GetGpu().SendCommandSync()`. The harness builds a
+  `RenderContext` directly and never calls `InitializeGpu`, so every one hit
+  `EXIT_IF(m_gpu == nullptr)`. Fixed with `RenderContext::DiagnosticFrameNum()` (returns 0) and
+  `HasGpu()`; emulator behaviour unchanged. Commit `d68fc24`.
+- `CheckPm4WaitResume` drives a `CommandProcessor` without `scheduler.Begin()`, and is the one PM4
+  case that reaches a `Flush` (via `IT_WAIT_REG_MEM` suspend/resume) → `Submit` on an invalid
+  command buffer. Commit `902fede`. **0 → 58 tests.**
+- Still broken further along: a `PageManager` teardown fail-fast ("destroyed with live page state")
+  around the RenderExecutor discovery cases. **Not worth fixing — the selectors bypass it.**
+- Environment trap, again: `--wave64-only` needs the full 13,824 MB commit reservation
+  (`PhysicalMemory::TotalSize()`, hardcoded constexpr, correct — it is the PS5's real memory size).
+  It failed at 10.2 GB free commit and passed at 13.2 GB. **Close apps or raise the page file.**
+
+**2. WAVE64 EMULATION IS CORRECT. All 26 compute cases pass, exit 0.**
+```
+DsBpermuteWave64UsesIndependentHalves   Wave64CrossHalfLaneAndLds
+Wave64RawMasksAndScalarBranch           Wave64PartialMultidimensionalWorkgroup
+Wave64AppendConsumeHighHalf             Wave32VccMasksPreserveOtherHalf
++ ScalarSaveExecOps, ScalarOrn2Saveexec, ScalarWqmB64*, ScalarMaskProvenance*,
+  BranchVccnzUsesWaveMask, DispatcherIrreducibleControlFlow, ScratchIsPrivatePerInvocation
+```
+**The pair-packed wave64 path is slow, not wrong.** It is not silently corrupting anything these
+cover — cross-half lane ops, LDS interaction, raw mask reads, scalar branches on wave masks,
+partial workgroups, append/consume on the high half. This closes a long-standing suspicion. Passing
+tests prove only what they cover, but this is real coverage of exactly the suspect mechanisms.
+
+**3. WAVE64 STAGE 2 IS BLOCKED BY DESIGN, NOT UNFINISHED. DO NOT RESUME IT.**
+A prior attempt is parked in `git stash` ("wave64 stage2 WIP (Cursor/Grok) - broken"). It is 308
+lines and the hard part is written, but it cannot work:
+- `EmitWave64SharedBallot` assembles the 64-bit mask from two subgroups via LDS +
+  `EmitWave64WaveBarrier`, which emits **`OpControlBarrier` at Workgroup scope**.
+- It is called from the Ballot lowering (`spirvEmitterProgram.cpp:701`) — i.e. **every** EXEC/VCC
+  evaluation — and this shader evaluates masks **inside divergent control flow** (34
+  `S_CBRANCH_EXECZ`, nested four deep). A workgroup barrier in non-uniform flow is undefined
+  behaviour, and it over-synchronises all 4 waves of the 256-thread group.
+- The escape (one wave per workgroup, so the barrier is uniform by construction) is closed: the
+  shader uses `s_barrier` (`0x159c`, `0x1658`) and `DS_APPEND` across the full group with shared LDS.
+- **Root reason:** pair-packing exists *because* it keeps all 64 GCN lanes inside one 32-wide host
+  subgroup where subgroup intrinsics work with no cross-subgroup traffic. `lane_count=1` on a
+  32-wide host makes every wave-wide value cross a subgroup boundary, and Vulkan offers no
+  primitive for that which is legal in divergent flow. NVIDIA cannot widen the subgroup
+  (`VK_EXT_subgroup_size_control` reports min=max=32).
+
+**4. AND IT WOULD NOT HAVE PAID ANYWAY.** Selects are ~1,771 of ~8,000 instructions; Stage 1's 26%
+select cut yielded "~10-15% fewer instrs". Eliminating **every** select caps out near **15-20%**.
+Against a measured **3,400×** gap (one work item: 1 ms walkout vs 3,426 ms round) no codegen work
+is relevant. **The round's blowup is data-dependent, not throughput.**
+
+**5. LOOP 50 IS A LINKED-LIST WALK WHOSE NEXT POINTER COMES FROM A STALE BUFFER.** Bisecting the
+6 nested loops localised the runaway to loop 50 (header block 50, `0x1130`):
+```
+0x112c  S_MOV_B64 s60, exec_lo            save EXEC for loop exit
+0x1130  V_CMPX_NE_U32 exec_lo, -1, v55    EXEC = (v55 != 0xffffffff)   <- header
+0x1134  S_CBRANCH_EXECZ 0x1488            all lanes hit sentinel -> exit
+0x1148  S_LOAD_DWORDX4 s40, s0, offset=240
+0x1190  BUFFER_LOAD_DWORD v54, v46, s40   <- THE NEXT POINTER, from a buffer
+0x1478  S_MOV_B64 exec_lo, s62            restore EXEC
+0x1480  V_MOV_B32 v55, v54                v55 = next
+0x1484  S_BRANCH 0x1130
+```
+`v55` is initialised at `0x1124 V_CNDMASK_B32 v55, -1, v10` — `-1` is the sentinel. **The list lives
+in a buffer the CS builds itself, and the stub logs `cleared_buffers=0`, so those buffers are
+STALE.** Zero is not a terminator, so a zeroed/garbage buffer walks forever. **Structural
+consequence: one-shot execution can never succeed** — the shader builds the list it later walks, so
+executing it once into a buffer it has never populated chases garbage regardless of loop caps.
+
+**6. THE PROBE READOUT IS FORMAT-LIMITED — READ `actual_vk` FIRST (again).** For this CS:
+`image 0/3 @1170210000 = R16G16B16A16_SFLOAT`, `image 1/4 @1170e40000 = R32_SFLOAT`,
+`image 2 = D32_SFLOAT_S8_UINT`. Taps are **integers**; through the f16 store at `0x1600` any small
+integer becomes a denormal and **flushes to 0**, indistinguishable from a real zero. Use the
+`R32_SFLOAT` store at `0x1618` (dmask=0x1, channel 0 only) for values that must survive. Also:
+`group_cap=1` writes ~256 pixels into a 1.44M-pixel image, so the probe's output cannot be found by
+inspection — that image already holds 1.39M small integers (it is the shader's own head/count
+buffer, typed float).
+
+**PROBE syntax gotchas:** `loop_header` is a **block index** (`50`), not a pc; taps/marks/execlo are
+pcs. The `GDS capped dispatch done … ms=` timing line only appears when the GDS cap actually binds
+(`gds_limit` below the real item count).
 
 **THE MEASUREMENT DEFECT, AND IT INVALIDATES EVERY PROBE NUMBER IN SESSION 7.**
 `CS 0xe17349e0d437757b` is dispatched **twice per frame**, and the two dispatches bind **different**
