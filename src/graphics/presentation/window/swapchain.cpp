@@ -331,7 +331,7 @@ void DumpGpuImage(CommandBuffer& command, RenderContext& renderer, Image& image,
 	if (width == 0 || height == 0 || image.backing.extent.depth != 1) {
 		return;
 	}
-	const auto frame_num = renderer.GetGpu().GetFrameNum();
+	const auto frame_num = renderer.DiagnosticFrameNum();
 
 	const uint64_t byte_size =
 	    static_cast<uint64_t>(width) * height * DumpBytesPerPixel(image.backing.format);
@@ -448,7 +448,7 @@ void ClearImagesOnRequest(CommandBuffer& command, RenderContext& renderer, Textu
 		cursor             = end;
 		const auto cleared = cache.ClearImagesAtAddress(command, address, 0x0000000002000000ull);
 		LOGF("ClearImages: addr=0x%016" PRIx64 " cleared=%u frame=%d\n", address, cleared,
-		     renderer.GetGpu().GetFrameNum());
+		     renderer.DiagnosticFrameNum());
 	}
 }
 
@@ -461,9 +461,9 @@ void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCac
 	// DIAGNOSTIC, inert unless KYTY_SEED_NEW_IMAGES is set. Runs before the dump check so a
 	// seeded frame is still capturable.
 	if (const auto seeded = cache.SeedNewImages(command); seeded != 0) {
-		LOGF("SeedNewImages: seeded=%u frame=%d\n", seeded, renderer.GetGpu().GetFrameNum());
+		LOGF("SeedNewImages: seeded=%u frame=%d\n", seeded, renderer.DiagnosticFrameNum());
 	}
-	const bool dump = ShouldDumpGpuImage(renderer.GetGpu().GetFrameNum());
+	const bool dump = ShouldDumpGpuImage(renderer.DiagnosticFrameNum());
 	if (!dump) {
 		return;
 	}
@@ -526,7 +526,7 @@ void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCac
 			     all_tag, address, each.index, each.generation, img.backing.extent.width,
 			     img.backing.extent.height, static_cast<int>(img.backing.format),
 			     img.usage.render_target ? 1 : 0, img.IsGpuModified() ? 1 : 0,
-			     renderer.GetGpu().GetFrameNum(), all.size());
+			     renderer.DiagnosticFrameNum(), all.size());
 			DumpGpuImage(command, renderer, cache.GetImage(each), all_tag, address, true);
 		}
 		auto id = cache.FindImageFromRange(address, 0x0000000002000000ull, false);
@@ -547,9 +547,9 @@ void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCac
 		LOGF("DumpResolve: %s addr=0x%016" PRIx64
 		     " img=%u:%u draw_img=%u:%u draw_frame=%u dump_frame=%d tracked=%d\n",
 		     tag, address, id.index, id.generation, draw_img, draw_generation, draw_frame,
-		     renderer.GetGpu().GetFrameNum(), tracked ? 1 : 0);
+		     renderer.DiagnosticFrameNum(), tracked ? 1 : 0);
 		DumpGpuImage(command, renderer, cache.GetImage(id), tag, address, true);
-		if (tracked && draw_frame == static_cast<uint32_t>(renderer.GetGpu().GetFrameNum()) &&
+		if (tracked && draw_frame == static_cast<uint32_t>(renderer.DiagnosticFrameNum()) &&
 		    (draw_img != id.index || draw_generation != id.generation)) {
 			const ImageId draw_id {draw_img, draw_generation};
 			char          draw_tag[40];
@@ -573,7 +573,7 @@ void DumpShaderInput(CommandBuffer& command, RenderContext& renderer, Image& ima
 	static uint64_t budget_bytes = 0;
 	static std::mutex capture_lock;
 	std::scoped_lock guard {capture_lock};
-	const auto frame = renderer.GetGpu().GetFrameNum();
+	const auto frame = renderer.DiagnosticFrameNum();
 	if (budget_frame != frame) {
 		budget_frame = frame;
 		budget_bytes = 0;
@@ -619,7 +619,7 @@ void DumpShaderBufferInput(CommandBuffer& command, RenderContext& renderer, vk::
 	                        vk::AccessFlagBits2::eHostRead;
 	vk_command.pipelineBarrier2(dependency);
 	download.Commit();
-	const auto frame = renderer.GetGpu().GetFrameNum();
+	const auto frame = renderer.DiagnosticFrameNum();
 	renderer.GetCommandScheduler().DeferPriorityOperation(
 	    [&download, mapped, offset, byte_size, tag, frame] {
 		    download.Invalidate(offset, byte_size);

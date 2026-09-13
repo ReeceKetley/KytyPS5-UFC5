@@ -35,6 +35,15 @@ public:
 	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
 	void                                    ShutdownGpu();
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
+	// False in the GPU test harness, which builds a RenderContext directly and never calls
+	// InitializeGpu. Work that would be marshalled onto the GPU thread must then run inline,
+	// because the caller is the only thread there is.
+	[[nodiscard]] bool                      HasGpu() const noexcept { return m_gpu != nullptr; }
+	// Frame number for DIAGNOSTICS ONLY (capture, inspector, resource tracing). Returns 0 when no
+	// GuestGpu is attached instead of aborting, which is the normal state in the GPU test harness:
+	// it builds a RenderContext directly and never calls InitializeGpu. Unconditional
+	// GetGpu().GetFrameNum() calls on the dispatch path made every GPU test abort before running.
+	[[nodiscard]] int                       DiagnosticFrameNum() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
 	Common::Mutex&      GetMutex() { return m_mutex; }

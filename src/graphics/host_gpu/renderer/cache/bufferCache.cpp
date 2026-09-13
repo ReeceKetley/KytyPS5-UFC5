@@ -616,11 +616,19 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	const bool on_gpu_thread = GuestGpu::IsGpuThread();
 	const auto t0            = Common::Timer::QueryPerformanceCounter();
 	uint64_t   work_ticks    = 0;
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, &work_ticks] {
+	const auto read_on_gpu = [this, vaddr, size, is_write, &work_ticks] {
 		const auto w0 = Common::Timer::QueryPerformanceCounter();
 		ReadMemoryOnGpu(vaddr, size, is_write);
 		work_ticks = Common::Timer::QueryPerformanceCounter() - w0;
-	});
+	};
+	if (!m_scheduler.Context().HasGpu()) {
+		// GPU test harness: no GuestGpu, so no GPU thread to marshal onto and no frame loop
+		// holding a command buffer open. Running the download inline reaches Finish() -> Submit()
+		// with an invalid command. Tests own their buffer contents directly and never observe
+		// guest memory, so there is nothing to download back.
+		return;
+	}
+	m_scheduler.Context().GetGpu().SendCommandSync(read_on_gpu);
 	{
 		static std::atomic<uint64_t> n_gpu {0}, n_guest {0}, us_gpu {0}, us_guest {0},
 		    us_guest_work {0};
@@ -666,6 +674,9 @@ void BufferCache::DiscardMemory(uint64_t vaddr, uint64_t size) {
 	}
 	if (vaddr == 0 || size == 0 || !GuestRange {vaddr, size}.Valid()) {
 		return;
+	}
+	if (!m_scheduler.Context().HasGpu()) {
+		return; // see ReadMemory: no GPU thread and no open command buffer in the test harness
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync(
 	    [this, vaddr, size] { DiscardMemoryOnGpu(vaddr, size); });

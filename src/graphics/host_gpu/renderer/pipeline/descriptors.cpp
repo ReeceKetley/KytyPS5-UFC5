@@ -909,7 +909,7 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		g_bind_phase.clamp_ns.fetch_add(BindPhaseNs(cl_t0, cl_t1), std::memory_order_relaxed);
 		if (TraceResourceAddress(address, size)) {
 			const auto& resource = program.info.buffers[i];
-			TraceResourceBinding(m_context.GetGpu().GetFrameNum(),
+			TraceResourceBinding(m_context.DiagnosticFrameNum(),
 			    fmt::format("stage={} hash=0x{:016x} buffer={} addr=0x{:x} bytes={} "
 			                "read={} write={} atomic={} stride={} records={} guest_format={}",
 			                static_cast<uint32_t>(program.stage), program.shader_hash, i,
@@ -971,7 +971,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto& texture_cache = m_context.GetTextureCache();
 	// >= 0 is the occurrence of this hash within the captured frame; a shader dispatched twice in
 	// one frame is two different passes and must not be conflated.
-	const int  capture_pass    = CaptureShaderInputs(program.shader_hash, m_context.GetGpu().GetFrameNum());
+	const int  capture_pass    = CaptureShaderInputs(program.shader_hash, m_context.DiagnosticFrameNum());
 	const bool capture_inputs  = capture_pass >= 0;
 	static const bool capture_buffers = std::getenv("KYTY_CAPTURE_INPUT_BUFFERS") != nullptr;
 	if (capture_inputs && capture_buffers) {
@@ -988,7 +988,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			                source.address));
 			LOGF("CaptureBuffer: frame=%" PRIu64 " hash=0x%016" PRIx64
 			     " buffer=%u addr=0x%" PRIx64 " bytes=%" PRIu64 " adjustment=%u\n",
-			     static_cast<uint64_t>(m_context.GetGpu().GetFrameNum()), program.shader_hash,
+			     static_cast<uint64_t>(m_context.DiagnosticFrameNum()), program.shader_hash,
 			     i, source.address, source.size, adjustment);
 		}
 	}
@@ -1059,10 +1059,10 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			                image.info.data.address, image.backing.mip_levels, image.backing.layers);
 			if (capture_inputs) {
 				LOGF("CaptureBinding: frame=%" PRIu64 " pass=%d %s\n",
-				     static_cast<uint64_t>(m_context.GetGpu().GetFrameNum()), capture_pass,
+				     static_cast<uint64_t>(m_context.DiagnosticFrameNum()), capture_pass,
 				     message.c_str());
 			} else {
-				TraceResourceBinding(m_context.GetGpu().GetFrameNum(), message);
+				TraceResourceBinding(m_context.DiagnosticFrameNum(), message);
 			}
 		}
 		image.usage.storage |= storage;

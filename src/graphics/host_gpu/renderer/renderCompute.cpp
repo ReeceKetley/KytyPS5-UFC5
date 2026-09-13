@@ -412,7 +412,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		input_info.dispatch_threads_num[2]    = thread_group_z;
 	}
 
-	const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+	const uint32_t frame_num = static_cast<uint32_t>(m_context.DiagnosticFrameNum());
 	const bool     large_workgroup =
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
@@ -743,7 +743,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			operation.submission_tick  = m_context.GetCommandScheduler().CurrentTick();
 			operation.stages.push_back(
 			    CaptureInspectorStage(bindings, m_context.GetTextureCache()));
-			skipped_inspector_frame = m_context.GetGpu().GetFrameNum();
+			skipped_inspector_frame = m_context.DiagnosticFrameNum();
 			skipped_inspector_op_index = PeekInspectorOperationIndex(skipped_inspector_frame);
 			skipped_inspector_capture =
 			    InspectorShouldCapture(operation, skipped_inspector_op_index,
@@ -921,7 +921,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			operation.submission_tick  = m_context.GetCommandScheduler().CurrentTick();
 			operation.stages.push_back(
 			    CaptureInspectorStage(bindings, m_context.GetTextureCache()));
-			inspector_frame    = m_context.GetGpu().GetFrameNum();
+			inspector_frame    = m_context.DiagnosticFrameNum();
 			inspector_op_index = PeekInspectorOperationIndex(inspector_frame);
 			inspector_capture  = InspectorShouldCapture(operation, inspector_op_index,
 			                                            &inspector_cap_in, &inspector_cap_out);

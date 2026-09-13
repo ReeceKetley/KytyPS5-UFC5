@@ -338,7 +338,7 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	    " blend=%s src=%u dst=%u comb=%u ps_tex=%d sampled=%d storage=%d ps_kill=%s target_mode0=%u"
 	    " depth_test=%s depth_write=%s depth_func=%u depth_clear=%s viewport=(%.1f,%.1f %.1fx%.1f) "
 	    "scissor=(%d,%d)-(%d,%d)\n",
-	    log_id, buffer.GetContext().GetGpu().GetFrameNum(), draw_name, RenderColorTypeName(color),
+	    log_id, buffer.GetContext().DiagnosticFrameNum(), draw_name, RenderColorTypeName(color),
 	    color.desc.info.data.address, extent.width, extent.height,
 	    static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags, ctx.GetRenderTargetMask(),
 	    cc.mode, cc.op,
@@ -366,7 +366,7 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	LOGF("DrawInputState[%u]: frame=%d target=%s addr=0x%010" PRIx64
 	     " index_type=%u index_count=%u index_addr=0x%016" PRIx64
 	     " vs_resources=%d vs_buffers=%d\n",
-	     log_id, buffer.GetContext().GetGpu().GetFrameNum(), RenderColorTypeName(color),
+	     log_id, buffer.GetContext().DiagnosticFrameNum(), RenderColorTypeName(color),
 	     color.desc.info.data.address, index_type_and_size, index_count,
 	     reinterpret_cast<uint64_t>(index_addr), vs_input_info.resources_num,
 	     vs_input_info.buffers_num);
@@ -622,7 +622,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
 		if (TraceResourceAddress(target.desc.info.data.address, target.desc.info.data.size)) {
-			TraceResourceBinding(m_context.GetGpu().GetFrameNum(),
+			TraceResourceBinding(m_context.DiagnosticFrameNum(),
 			    fmt::format("color_target={} ps_hash=0x{:016x} image_id={}.{} addr=0x{:x} bytes={} "
 			                "format={} extent={}x{} mip={} layer={}+{}",
 			                i, pixel ? pixel->program->shader_hash : uint64_t {0},
@@ -1440,7 +1440,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			operation.scissor[3] = sc.bottom;
 			operation.has_viewport = true;
 		}
-		inspector_frame    = m_context.GetGpu().GetFrameNum();
+		inspector_frame    = m_context.DiagnosticFrameNum();
 		inspector_op_index = PeekInspectorOperationIndex(inspector_frame);
 		inspector_capture  = InspectorShouldCapture(operation, inspector_op_index,
 		                                            &inspector_cap_in, &inspector_cap_out);
@@ -1452,7 +1452,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		RecordInspectorOperation(inspector_frame, std::move(operation));
 	}
 	if (ShouldTrackDrawTargets()) {
-		const auto frame_num = static_cast<uint32_t>(buffer.GetContext().GetGpu().GetFrameNum());
+		const auto frame_num = static_cast<uint32_t>(buffer.GetContext().DiagnosticFrameNum());
 		for (uint32_t i = 0; i < state.color_count; i++) {
 			TrackDrawTarget(state.color_info[i].desc.info.data.address,
 			                state.color_info[i].image_id, frame_num);
@@ -1462,7 +1462,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    state.color_info[0].Extent().width >= 1280u &&
 	    state.color_info[0].Extent().height >= 720u;
 	if (large_draw_target && ShouldCensusLargeDrawTargets()) {
-		const auto frame_num = static_cast<uint32_t>(buffer.GetContext().GetGpu().GetFrameNum());
+		const auto frame_num = static_cast<uint32_t>(buffer.GetContext().DiagnosticFrameNum());
 		if ((frame_num % 30u) == 0u) {
 			static std::mutex census_lock;
 			static uint32_t census_frame = UINT32_MAX;
@@ -1508,7 +1508,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    draw_ps_hash != 0 && IsWatchedDrawPixelShader(draw_ps_hash) && state.color_count != 0 &&
 	    state.color_info[0].desc.info.data.address == 0x0000001168360000ull;
 	if (watched_fight_target) {
-		const auto frame_num = static_cast<uint32_t>(buffer.GetContext().GetGpu().GetFrameNum());
+		const auto frame_num = static_cast<uint32_t>(buffer.GetContext().DiagnosticFrameNum());
 		static std::atomic<uint32_t> last_state_frame {UINT32_MAX};
 		if ((frame_num % 30u) == 0u &&
 		    last_state_frame.exchange(frame_num, std::memory_order_relaxed) != frame_num) {
@@ -1580,7 +1580,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		entry.image_id       = color0.image_id.index;
 		entry.depth_test     = state.depth_info.depth_test_enable;
 		entry.depth_write    = state.depth_info.depth_write_enable;
-		const auto id = SceneDrawDebug::NoteDraw(m_context.GetGpu().GetFrameNum(), entry);
+		const auto id = SceneDrawDebug::NoteDraw(m_context.DiagnosticFrameNum(), entry);
 		if (SceneDrawDebug::ShouldSuppress(id)) {
 			// Skip drops the draw entirely, which also removes its depth writes. Hide keeps
 			// depth behaviour and only stops colour. The difference distinguishes "this draw
@@ -1941,7 +1941,7 @@ bool RenderExecutor::ResolveColorTargets(uint64_t submit_id, CommandBuffer& buff
 		FillInspectorImageResource(dest_res, cache);
 		operation.attachments.push_back(source_res);
 		operation.attachments.push_back(dest_res);
-		RecordInspectorOperation(m_context.GetGpu().GetFrameNum(), std::move(operation));
+		RecordInspectorOperation(m_context.DiagnosticFrameNum(), std::move(operation));
 	}
 	return true;
 }
