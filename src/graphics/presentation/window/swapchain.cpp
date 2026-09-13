@@ -458,6 +458,14 @@ void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCac
 	// frames that are not dumping.
 	RefreshTracedResources();
 	ClearImagesOnRequest(command, renderer, cache);
+	// Zero any image created this frame that nothing has initialised, so a shader that reads
+	// one reads deterministic memory instead of undefined VRAM. Default on; size-capped.
+	if (const auto zeroed = cache.ZeroNewImages(command); zeroed != 0) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("ZeroNewImages: cleared=%u frame=%d\n", zeroed, renderer.DiagnosticFrameNum());
+		}
+	}
 	// DIAGNOSTIC, inert unless KYTY_SEED_NEW_IMAGES is set. Runs before the dump check so a
 	// seeded frame is still capturable.
 	if (const auto seeded = cache.SeedNewImages(command); seeded != 0) {

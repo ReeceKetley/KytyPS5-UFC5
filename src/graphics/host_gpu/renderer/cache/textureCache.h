@@ -55,6 +55,14 @@ public:
 	// self-feeding temporal buffer recovers once its poisoned history is discarded, which
 	// separates "NaN generated every frame" from "NaN injected once and then persisting".
 	uint32_t ClearImagesAtAddress(CommandBuffer& command, uint64_t address, uint64_t size);
+	// A freshly created VkImage has UNDEFINED contents - and measurably so: UFC 5 read
+	// 1.048e-19 out of a 1x1 R32_SFLOAT nothing ever wrote, which scaled the whole frame by
+	// ~1e-16 (ledger session 15). Zero the images nothing initialises, so a shader that READS
+	// one reads deterministic memory. Default on, size-capped by KYTY_CLEAR_UNINIT_MAX_BYTES
+	// (0 disables). Note this corrects the assumption in the comment below: the host does not
+	// hand us a zeroed IMAGE, only zeroed guest MEMORY.
+	uint32_t ZeroNewImages(CommandBuffer& command);
+
 	// DIAGNOSTIC, NOT A FIX. Seeds freshly created colour images with a non-zero constant
 	// instead of leaving them at the zero the host OS hands us. Guest direct memory on the
 	// console holds whatever was there before; VirtualAlloc(MEM_COMMIT) zero-fills, and zero is
@@ -220,6 +228,10 @@ private:
 	// Images created since the last SeedNewImages sweep, for KYTY_SEED_NEW_IMAGES. Filtering
 	// happens at sweep time, not insert time, because `backing` is not usable until then.
 	std::vector<ImageId> m_pending_seed;
+	// Images created since the last ZeroNewImages sweep. Filtering happens at sweep time so an
+	// image that was created and immediately rendered into is no longer uninitialised and is
+	// skipped.
+	std::vector<ImageId> m_pending_zero_init;
 	uint64_t         m_presentable_address    = 0;
 	uint64_t         m_presentable_size       = 0;
 

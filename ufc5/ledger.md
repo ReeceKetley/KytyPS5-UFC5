@@ -994,7 +994,8 @@ surface including the bloom/downsample pyramid - **4,206 recreations of a 400x22
 walkout** - which blew the frame to white and destroyed the visual readout.
 `KYTY_SEED_NEW_IMAGES_MIN_WIDTH` (default 1280) now keeps it to full-resolution surfaces.
 
-### SESSION 15 (2026-09-13) — ROOT CAUSE: THE 1x1 AUTO-EXPOSURE TEXTURE HAS NO PRODUCER AND READS 1.05e-19. EVERY COLOUR IS SCALED BY ~1e-16.
+### SESSION 15 (2026-09-13) — THE 1x1 AUTO-EXPOSURE TEXTURE IS UNINITIALISED VRAM (1.05e-19),
+SCALING EVERY COLOUR BY ~1e-16. FIXED IN THE TEXTURE CACHE; THE VISIBLE EFFECT IS NOT YET MEASURED.
 
 **The whole render is multiplied by 1.29e-16 before the tonemap. That is the "colours wrong, hue
 wrong, black round" defect.** Measured end to end in one run, with one build of the emulator and no
@@ -1166,6 +1167,161 @@ directly off the disassembly's `S_BUFFER_LOAD_DWORD ... offset=104`. This produc
   the inspector's `coherency` field before trusting it. Here it was right because nothing on the GPU
   ever wrote the exposure image.
 
+**12. THE BUFFER LEAD IS DEAD, AND THE REAL MECHANISM IS TRANSIENT-SLOT ALIASING.**
+Point 4 proposed that the exposure was produced into the structured buffer written at the same
+address by `CS 0x1f4dc8c408985d4f`. **Killed by measurement** (`KYTY_CAPTURE_INPUT_BUFFERS=1`): in a
+fresh run neither `0x1f4dc8c408985d4f` nor `0x9cbc1ec72e110491` has a buffer at that address at all.
+Both are `groups=743x1x1 local=64x1x1`, **no textures**, with 141k/1.1M-record tables and a
+bit-pattern LUT (`0x08102040, 0x40810204, ...`) — skinning or particles. The shared base address was
+an allocator coincidence, exactly as the caveat warned.
+
+**What `0x1162e90000` really is: a recycled transient-allocator slot.** The inspector says so
+directly — `ALIAS addr=0x0000001162e90000 image_ids=116.5,4849.1,4851.1` — and in ONE frame it hosts
+four unrelated resources:
+```
+tick 423761  CS 0c399ab0b1e7fa33 / e17349e0d437757b / 3c6058d66788f544  READ  1x1   R32_SFLOAT
+tick 423763  PS f1ff054b0973bcad  DRAW indices=3   WRITE 54x600 RGBA16F   ) a luminance
+tick 423764  PS ceea5f712ba42fda  DRAW indices=3   READ  54x600           ) reduction
+tick 423764  PS 116e6210be83a632  DRAW indices=3   WRITE 54x30  RGBA16F   ) chain, all
+tick 423765  PS 654607b31fe5f6d6  DRAW indices=3   READ  54x30            ) fullscreen tris
+             CS 1f4dc8c408985d4f                   WRITE 134,576-byte buffer
+```
+**The three consumers read the 1x1 BEFORE the reduction chain writes the slot**, and the reduction
+targets hold healthy data (2,982-7,597 distinct, 0% NaN) whose first bytes reinterpret to
+2.7e-15 / 1.2e-14 / 2.0e-36 — **none of them 1.048e-19**. So the 1x1 is not a reinterpreted view of
+them either. It is simply an image nothing ever writes.
+
+**Also identified, and it is NOT the missing producer:** `CS 0x1a19faa210398edd` is the real
+auto-exposure/eye-adaptation pass — it reads the 1068x600 HDR scene, read-modify-writes a **1x1
+R32G32_SFLOAT at `0x12a2810000`**, atomically accumulates into a **1x1 R32_UINT** and writes the
+534x300 luminance downsample. It runs, and it writes a different address and a different format from
+what the tonemapper reads. **Nothing in the frame writes a 1x1 `R32_SFLOAT` anywhere.**
+
+**13. THE FIX — Kyty left newly created images with UNDEFINED contents. Now zeroed.**
+```
+TextureCache::InitializeImage:  uploads only if IsBufferModified() || IsCpuDirty()
+TextureCache::RefreshImage:     returns EARLY when the image is not dirty
+```
+so an image that nothing has ever written never reaches an initialisation path at all, and keeps
+whatever its `VkImage` allocation happened to contain. **A shader reading such an image reads
+undefined VRAM** — nondeterministic, and here catastrophic.
+- `TextureCache::ZeroNewImages(CommandBuffer&)` sweeps images created since the last sweep and
+  zero-clears the ones that are **still** uninitialised, so a target created and immediately
+  rendered into is untouched. Modelled on the existing `SeedNewImages` path (`m_pending_zero_init`
+  filled in `InsertImage`, swept once per frame from `DumpUfcSurfaces`), because that is the only
+  place with both a new-image list and a valid command buffer.
+- Guarded by `Image::IsUninitialized()` = `!gpu_modified && !buffer_modified && !cpu_dirty &&
+  !zero_initialized` — **exactly the inspector's own `coherency=uninitialized` classification**.
+  One-shot via the new `m_zero_initialized`.
+- Size-capped by `KYTY_CLEAR_UNINIT_MAX_BYTES`, default **64 KiB**, `0` disables and restores the
+  old undefined-contents behaviour. A large render target is about to be fully written anyway, so
+  clearing it is pure cost; this is for the lookup/1x1 class whose contents are read as DATA.
+- **Why zero:** deterministic, what PS5 memory reads before anything writes it, and precisely what
+  the game's own `if (exposure == 0) exposure = 1.0` guard is written against.
+
+**FIRST ATTEMPT FAILED AND THE FAILURE IS THE USEFUL PART.** The hook was first placed in
+`InitializeImage`, which looks like the right function and never fires: `RefreshImage` returns
+before calling it whenever the image is clean, which is exactly the case under study. **Zero log
+lines, zero effect.** If a change to the texture cache appears to do nothing, check that the
+function you edited is on the path for a *clean* image before assuming the logic is wrong.
+
+**VERIFIED IN-RUN, at the menu, with the probe still armed:**
+```
+tap                                    BEFORE           AFTER
+|texel|^(1/6)  (log-domain readout)    45/65535         0        -> the texel is EXACTLY 0
+v3 after the ==0 -> 1.0 guard          0                65535    -> THE GUARD NOW FIRES, v3 = 1.0
+raw texel through a UNORM store        0                0        (says nothing either way)
+```
+Sweep volume is 1-4 images per frame, so the cost is negligible by inspection; confirm with
+`frame_stats.py` against the 5.00 baseline before treating that as settled.
+
+**STILL OPEN AFTER THE FIX, and it is the next thing:** 1.0 is the game's *fallback*, not
+necessarily its intended exposure — with `rcp(cb[104]) = x1228.8` and a scene median of ~0.008, a
+1.0 exposure puts the median pixel near 0.9 after the Reinhard, which would be washed out. Whether
+that is right depends on whether the scene is genuinely stored pre-divided by 1228.8. **It cannot be
+judged by eye until the upscaler defect (point 6) is fixed**, because the upscaler still destroys the
+frame regardless. Do not tune the exposure against a broken upscaler.
+
+**14. WHAT THE FIX DOES ON SCREEN IS NOT YET ESTABLISHED. A CLAIM WAS MADE AND WITHDRAWN THE SAME
+HOUR.**
+
+**Written and immediately retracted: "the pre-fight now renders where it was black before."** That
+was wrong, and the user corrected it directly: *"I told you the pre-fight scenes always render, it's
+just the colours that are wrong. It's only the fight that has the black issue."* This matches the
+original brief exactly — *"the walkout isn't actually correct, it's just less corrupted, colours are
+wrong, hue is wrong, sometimes it's bright red and white."* The post-fix screenshots show a legible
+but red/white-washed pre-fight, which is **the symptom that was already being reported**, not a new
+improvement. **The error was reading a screenshot as a before/after without a before.**
+
+**AND IT OPENS A REAL PROBLEM WITH THE CAUSAL STORY.** The bisection at frames 1767 and 1869 was
+taken **in the pre-fight**, and it measured `v3` (exposure after the guard) = 0 and
+`rcp(1+max)` = 1.0 there — i.e. the tonemapper's colour output was already dead in the pre-fight.
+Yet the pre-fight was rendering a visible scene at that moment. **Those two facts cannot both be
+explained by "everything visible comes through `CS 0x0c399ab0b1e7fa33`".**
+Possibilities, none tested:
+- the pre-fight's visible image reaches the screen by a path that does not go through this
+  tonemapper (a different variant, a different present path, or a UI/composite layer);
+- or it does, and 1e-16 through this shader is not actually what the eye is seeing.
+**Resolve this before claiming any visual effect for the exposure fix.** The correct experiment is
+an A/B on one scene: same build, `KYTY_CLEAR_UNINIT_MAX_BYTES=0` versus default, screenshot each.
+
+**WHAT IS MEASURED AND STANDS, independent of any visual claim:**
+```
+                                            BEFORE          AFTER
+exposure texel (via the 6th-root readout)   1.048e-19       exactly 0
+v3 after the game's ==0 -> 1.0 guard        0               1.0  (the guard now fires)
+tonemapper output, per channel              1 distinct      27982 / 22407 / 13647 / 48778 distinct
+```
+Those are readbacks, not interpretations. The shader's arithmetic is demonstrably repaired. Whether
+that repair is visible yet is a separate question, and the answer is "unknown", because the round is
+still gated behind the upscaler defect (point 6) and the pre-fight comparison was never run.
+
+**A remaining prediction, still untested:** 1.0 is the game's *fallback*, not its real exposure, and
+`rcp(cb[104]) = x1228.8` is applied on top. Scene median ~0.008 x 1228.8 x 1.0 ~ 9.8, which Reinhard
+maps to ~0.91 — white. So if the visible frame does come through this shader, the fix should make it
+**more** blown out, not less, and the intended exposure is nearer 0.01. That is a falsifiable
+prediction for the A/B above.
+
+**Do not conflate the other symptoms in those screenshots.** The rainbow noise on the name plates,
+the dithered band across the lower half, and the menu corruption are pre-existing and separate
+(issue 4b and the speckle entry); the ledger has said since session 12 that these are **three
+distinct symptoms**.
+
+**15. THE FIX REGRESSED PERFORMANCE BY 29%, THE MECHANISM WAS ALREADY IN THIS LEDGER, AND IT IS
+FIXED. A/B ON THE SAME BUILD, SAME SESSION:**
+```
+                              samples   fps    us/draw   p25/p75        gc
+without the zero-init sweep      392    4.92     82.7    80.6 / 85.5    2.7
+with it                           76    3.45    106.5    92.0 / 136.4   6.8   <- gc 2.5x
+```
+`ClearImage` ends in `CommitGpuWrite`, which calls `MarkGpuModified()` — and this ledger already
+root-caused that **the texture GC can never evict a GPU-modified TILED image**. Every image the
+sweep zeroed became a permanent resident. The `gc` bucket, not the total, is what identified it:
+2.7 -> 6.8 us/draw is the signature of the mechanism, and it is what makes this an explanation
+rather than a number.
+**Fix: `ClearGpuModified()` immediately after the clear.** Zeroing creates nothing the guest needs
+read back, so ownership goes straight back to guest memory; `m_zero_initialized` is what stops the
+sweep repeating, not the GPU-modified flag.
+
+**RE-MEASURED, three-way, all in-fight on the same build family:**
+```
+                              samples   fps    us/draw   p25/p75         gc
+no zero-init (control)           392    4.92     82.7    80.6 /  85.5    2.7
+zero-init, no GC fix              88    3.75     99.7    90.0 / 120.3    6.4
+zero-init + ClearGpuModified      64    4.70     80.5    77.7 /  92.1    4.2
+```
+**The regression is gone — 80.5 vs 82.7 is within noise.** Stated with its limits: 64 samples
+against the control's 392, a wider p25/p75 band, and `gc` still somewhat elevated (4.2 vs 2.7). Good
+enough to keep the fix on by default; re-measure with a longer in-fight run before treating 80.5 as
+a number to quote.
+- **Method note: the free A/B.** The comparison did not cost a navigation. An earlier run *in the
+  same session on the same build* had already reached the fight, so `frame_stats.py` over both logs
+  was the control. Before asking for a run, check whether one already on disk answers the question.
+- **And the trap the ledger warns about, hit live:** the first reading of this was `samples 6,
+  fps 2.16, TOTAL 93.6, p25 50.6 p75 169.3` at 5,994 draws/frame — a transition scene, not steady
+  state. It drifted to 106.5 as samples accumulated. **A wide p25/p75 means the run has not
+  settled; do not quote it.**
+
 **METHOD NOTES WORTH KEEPING**
 - **"Occupancy is not correctness" has a twin: a UNORM store cannot tell 0 from 1e-19.** The first
   bisection concluded "v3 == 0, so the cndmask is broken" and was wrong for exactly that reason.
@@ -1178,13 +1334,14 @@ directly off the disassembly's `S_BUFFER_LOAD_DWORD ... offset=104`. This produc
   `CAPTURE_HASHES`, `DUMP_INPUTS`, `TRACE_ADDRS`, `CLEAR_IMAGES`) against a running game.
 
 **NEXT, IN ORDER**
-1. `KYTY_CAPTURE_INPUT_BUFFERS=1` + `CAPTURE_HASHES=9cbc1ec72e110491` — is there a real exposure
-   value in the buffer at `0x1162e90000`? That decides whether the fix is a buffer->image sync or a
-   broken producer shader.
-2. Whatever the answer, the exposure has to reach that image. Until it does, nothing downstream can
-   be judged.
-3. Then, and only then, `CS 0xe17349e0d437757b` with a known-good input — a new problem with new
-   evidence (`dumps/input-*-f2501.bin`), not a resumption of sessions 7-12.
+1. **`CS 0xe17349e0d437757b`, the upscaler** - now the only thing between a correct tonemap and a
+   visible frame, and reproducible against known-good input for the first time
+   (`dumps/input-*-f2501.bin`). It saturates a healthy input to 3 distinct values and then NaNs.
+2. Only once that is fixed: decide whether the exposure fallback of 1.0 is the game's intended
+   value, or whether a real producer for the 1x1 `R32_SFLOAT` is still missing. It cannot be judged
+   by eye before then.
+3. Re-measure `frame_stats.py` against the 5.00 / 79.0 us-per-draw baseline with the zero-init
+   sweep on.
 
 ### SESSION 14 (2026-09-13) — THE STUB IS EXONERATED, i4/i7 WERE MISREAD, AND A 118-INSTRUCTION SHADER IS THE NEW LEAD
 
