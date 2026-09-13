@@ -77,6 +77,10 @@ uint64_t ParseHash(const char* text) {
 	return text == nullptr ? 0ull : std::strtoull(text, nullptr, 16);
 }
 
+uint32_t ParseU32(const char* text) {
+	return text == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(text, nullptr, 0));
+}
+
 ProbeConfig ConfigFromEnvironment() {
 	ProbeConfig config;
 	config.hash     = ParseHash(std::getenv("KYTY_PROBE_HASH"));
@@ -87,6 +91,15 @@ ProbeConfig ConfigFromEnvironment() {
 	ParseTapList(std::getenv("KYTY_PROBE_MARKX"), ProbeTap::Kind::Marker, true, config.taps);
 	ParseTapList(std::getenv("KYTY_PROBE_EXECLO"), ProbeTap::Kind::ExecLo, false, config.taps);
 	ParseTapList(std::getenv("KYTY_PROBE_EXECZ"), ProbeTap::Kind::ExecZ, false, config.taps);
+	config.loop_header     = ParseU32(std::getenv("KYTY_PROBE_LOOP_HEADER"));
+	config.loop_iterations = ParseU32(std::getenv("KYTY_PROBE_LOOP_ITERATIONS"));
+	config.gds_limit_cap   = ParseU32(std::getenv("KYTY_PROBE_GDS_LIMIT"));
+	config.group_cap       = ParseU32(std::getenv("KYTY_PROBE_GROUP_CAP"));
+	if (const auto count = ParseU32(std::getenv("KYTY_PROBE_EXECUTE_COUNT")); count != 0) {
+		config.execute_count = count;
+	}
+	config.sync_once       = ParseU32(std::getenv("KYTY_PROBE_SYNC")) != 0;
+	config.execute_once    = ParseU32(std::getenv("KYTY_PROBE_EXECUTE_ONCE")) != 0;
 	return config;
 }
 
@@ -94,6 +107,8 @@ ProbeConfig ConfigFromEnvironment() {
 //   hash=e17349e0d437757b   pc=16fc   vgpr=90,91,92,93
 //   mark=1140:91,148c:92    markx=113c:93   tap=1138:87:92
 //   execlo=113c:92          execz=113c:90
+//   loop_header=50          loop_iterations=1
+//   gds_limit=1             group_cap=1       sync=1       execute_once=1 execute_count=2
 // An absent key means "none", so the file is the whole configuration.
 ProbeConfig ConfigFromText(const std::string& text) {
 	ProbeConfig config;
@@ -141,6 +156,22 @@ ProbeConfig ConfigFromText(const std::string& text) {
 			ParseTapList(value.c_str(), ProbeTap::Kind::ExecLo, false, config.taps);
 		} else if (key == "execz") {
 			ParseTapList(value.c_str(), ProbeTap::Kind::ExecZ, false, config.taps);
+		} else if (key == "loop_header") {
+			config.loop_header = ParseU32(value.c_str());
+		} else if (key == "loop_iterations") {
+			config.loop_iterations = ParseU32(value.c_str());
+		} else if (key == "gds_limit") {
+			config.gds_limit_cap = ParseU32(value.c_str());
+		} else if (key == "group_cap") {
+			config.group_cap = ParseU32(value.c_str());
+		} else if (key == "execute_count") {
+			if (const auto count = ParseU32(value.c_str()); count != 0) {
+				config.execute_count = count;
+			}
+		} else if (key == "sync") {
+			config.sync_once = ParseU32(value.c_str()) != 0;
+		} else if (key == "execute_once") {
+			config.execute_once = ParseU32(value.c_str()) != 0;
 		} else {
 			unknown++;
 		}
@@ -203,6 +234,11 @@ std::string GetProbeConfigText() {
 	std::string text = fmt::format("hash={:016x}\npc={:x}\nvgpr={},{},{},{}\n", config->hash,
 	                               config->store_pc, config->vgpr[0], config->vgpr[1],
 	                               config->vgpr[2], config->vgpr[3]);
+	text += fmt::format("loop_header={}\nloop_iterations={}\ngds_limit={}\ngroup_cap={}\n"
+	                    "sync={}\nexecute_once={}\nexecute_count={}\n",
+	                    config->loop_header, config->loop_iterations, config->gds_limit_cap,
+	                    config->group_cap, config->sync_once ? 1 : 0,
+	                    config->execute_once ? 1 : 0, config->execute_count);
 	auto append_taps = [&](const char* key, ProbeTap::Kind kind, bool masked) {
 		bool first = true;
 		for (const auto& tap: config->taps) {
@@ -295,10 +331,17 @@ void ReloadProbeConfig() {
 	auto config = Frontend::ConfigFromText(text);
 	// Publish the generation inside the config so a dump can say which probe produced it.
 	config.generation = Frontend::g_generation.load(std::memory_order_relaxed) + 1u;
-	const auto taps   = config.taps.size();
-	const auto hash   = config.hash;
-	const auto pc     = config.store_pc;
-	const auto vgpr   = config.vgpr;
+	const auto taps       = config.taps.size();
+	const auto hash       = config.hash;
+	const auto pc         = config.store_pc;
+	const auto vgpr       = config.vgpr;
+	const auto loop       = config.loop_header;
+	const auto iterations = config.loop_iterations;
+	const auto execute    = config.execute_once;
+	const auto count      = config.execute_count;
+	const auto limit      = config.gds_limit_cap;
+	const auto groups     = config.group_cap;
+	const auto sync       = config.sync_once;
 	{
 		std::scoped_lock guard {Frontend::ConfigLock()};
 		Frontend::CurrentConfig() = std::make_shared<const Frontend::ProbeConfig>(std::move(config));
@@ -307,9 +350,11 @@ void ReloadProbeConfig() {
 	// generation and reused with the new probe.
 	Frontend::g_generation.fetch_add(1, std::memory_order_relaxed);
 	LOGF("ProbeConfig: reloaded generation=%u hash=0x%016" PRIx64
-	     " store_pc=0x%x vgpr=%d,%d,%d,%d taps=%zu\n",
+	     " store_pc=0x%x vgpr=%d,%d,%d,%d taps=%zu loop=%u/%u execute_once=%u/%u "
+	     "gds_limit=%u group_cap=%u sync=%u\n",
 	     Frontend::g_generation.load(std::memory_order_relaxed), hash, pc, vgpr[0], vgpr[1], vgpr[2],
-	     vgpr[3], taps);
+	     vgpr[3], taps, loop, iterations, execute ? 1u : 0u, count, limit, groups,
+	     sync ? 1u : 0u);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler

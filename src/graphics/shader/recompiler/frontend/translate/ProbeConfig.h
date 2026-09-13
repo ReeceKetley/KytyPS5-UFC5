@@ -45,7 +45,16 @@ struct ProbeConfig {
 	uint32_t              store_pc = 0;  // 0 = every image store
 	std::array<int, 4>    vgpr {-1, -1, -1, -1};
 	std::vector<ProbeTap> taps;
-	uint32_t              generation = 0;
+	// Hash-scoped one-shot execution controls for a compute shader that is normally skipped.
+	// They share the PROBE file so changing a loop cap also bumps the shader-cache generation.
+	uint32_t loop_header     = 0;
+	uint32_t loop_iterations = 0;
+	uint32_t gds_limit_cap   = 0;
+	uint32_t group_cap       = 0;
+	uint32_t execute_count   = 1;
+	bool     sync_once       = false;
+	bool     execute_once    = false;
+	uint32_t generation      = 0;
 
 	[[nodiscard]] bool AppliesTo(uint64_t shader_hash) const {
 		return hash == 0 || hash == shader_hash;

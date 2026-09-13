@@ -41,8 +41,11 @@ uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t
 	if (kind == IR::StageInputKind::LocalInvocationIndex) {
 		return EmitLocalInvocationIndex(state);
 	}
-	if (state.lane_count == 2 && (kind == IR::StageInputKind::LocalInvocationId ||
-	                              kind == IR::StageInputKind::GlobalInvocationId)) {
+	// Both wave64 host layouts flatten the workgroup to 1D, so the guest's 3D ids have to be
+	// rebuilt from the linear index rather than read from the builtin.
+	if ((state.lane_count == 2 || state.split_wave64) &&
+	    (kind == IR::StageInputKind::LocalInvocationId ||
+	     kind == IR::StageInputKind::GlobalInvocationId)) {
 		const auto* cs      = ShaderWorkgroupInput(state.stage, state.input_info);
 		uint32_t    divisor = 1;
 		for (uint32_t axis = 0; axis < component; axis++) {

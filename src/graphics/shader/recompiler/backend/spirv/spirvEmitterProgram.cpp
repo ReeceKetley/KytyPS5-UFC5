@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/frontend/translate/ProbeConfig.h"
 
 #include "common/assert.h"
 
@@ -107,17 +108,28 @@ void ConfigureDiagnosticLoopCap(EmitterState& state, const IR::Program& program)
 	if (program.shader_hash != kUfcHangCsHash || program.dispatcher_fallback) {
 		return;
 	}
-	const char* header_env = std::getenv("KYTY_WAVE64_LOOP_CAP_HEADER");
-	const char* count_env  = std::getenv("KYTY_WAVE64_LOOP_CAP");
-	if (header_env == nullptr || count_env == nullptr) {
-		return;
+	unsigned long header = 0;
+	unsigned long count  = 0;
+	const auto probe = Frontend::GetProbeConfig();
+	if (probe->hash == kUfcHangCsHash && probe->loop_header != 0 &&
+	    probe->loop_iterations != 0) {
+		header = probe->loop_header;
+		count  = probe->loop_iterations;
+	} else {
+		const char* header_env = std::getenv("KYTY_WAVE64_LOOP_CAP_HEADER");
+		const char* count_env  = std::getenv("KYTY_WAVE64_LOOP_CAP");
+		if (header_env == nullptr || count_env == nullptr) {
+			return;
+		}
+		char* header_end = nullptr;
+		char* count_end  = nullptr;
+		header = std::strtoul(header_env, &header_end, 0);
+		count  = std::strtoul(count_env, &count_end, 0);
+		if (header_end == header_env || count_end == count_env) {
+			return;
+		}
 	}
-	char*               header_end = nullptr;
-	char*               count_end  = nullptr;
-	const unsigned long header      = std::strtoul(header_env, &header_end, 0);
-	const unsigned long count       = std::strtoul(count_env, &count_end, 0);
-	if (header_end == header_env || count_end == count_env || header > UINT32_MAX || count == 0 ||
-	    count > UINT32_MAX) {
+	if (header > UINT32_MAX || count == 0 || count > UINT32_MAX) {
 		return;
 	}
 	const auto header_it = std::ranges::find_if(program.block_info, [&](const auto& info) {

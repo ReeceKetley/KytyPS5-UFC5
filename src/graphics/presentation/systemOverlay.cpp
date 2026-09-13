@@ -1969,7 +1969,10 @@ struct SystemOverlay::Impl {
 					inspector_status = "PROBE remove failed: " + error;
 				}
 			}
-			ImGui::TextDisabled("Keys: hash, pc, vgpr, tap, mark, markx, execlo, execz. File/env state remains authoritative.");
+			ImGui::TextDisabled(
+			    "Keys: hash, pc, vgpr, tap, mark, markx, execlo, execz, loop_header, "
+			    "loop_iterations, gds_limit, group_cap, sync, execute_once, execute_count.");
+			ImGui::TextDisabled("File/env state remains authoritative; execute_count defaults to 1.");
 		}
 		ImGui::End();
 	}

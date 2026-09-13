@@ -322,10 +322,14 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	state.stage     = program.stage;
 	state.wave_size = program.wave_size;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
-	state.lane_count =
-	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
-	        ? 2u
-	        : 1u;
+	const bool pair_packed_wave64 =
+	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u;
+	// Wave64 stage 2, opt-in. Pair-packing emits every instruction twice and turns each
+	// exec-predicated region into a per-lane select; one invocation per GCN lane removes both.
+	// Gated because wave-wide values then span two host subgroups - see EmitterState::split_wave64.
+	static const bool split_wave64_enabled = std::getenv("KYTY_WAVE64_LANE1") != nullptr;
+	state.split_wave64 = pair_packed_wave64 && split_wave64_enabled;
+	state.lane_count   = pair_packed_wave64 && !state.split_wave64 ? 2u : 1u;
 	state.inputs.reserve(program.info.inputs.size());
 	state.outputs.reserve(program.info.outputs.size());
 	state.interface_variables.reserve(program.info.inputs.size() + program.info.outputs.size());

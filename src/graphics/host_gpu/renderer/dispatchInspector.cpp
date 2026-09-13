@@ -33,6 +33,7 @@ namespace {
 constexpr size_t kMaxOperations = 32768;
 constexpr size_t kMaxResources  = 524288;
 constexpr auto   kDumpTrigger   = "D:/PS5/dumps/DUMP_INSPECTOR";
+constexpr auto   kCaptureTrigger = "D:/PS5/dumps/CAPTURE_INSPECTOR";
 constexpr uint64_t kPageShift   = 20;
 
 struct InspectorState {
@@ -112,6 +113,7 @@ nlohmann::json ResourceJson(const InspectorResource& resource) {
 	        {"guest_format", resource.guest_format},
 	        {"actual_vk", resource.actual_vk},
 	        {"vk_handle", fmt::format("0x{:016x}", resource.vk_handle)},
+	        {"vk_offset", resource.vk_offset},
 	        {"last_access_tick", resource.last_access_tick},
 	        {"read", resource.read},
 	        {"write", resource.written},
@@ -124,13 +126,13 @@ nlohmann::json ResourceJson(const InspectorResource& resource) {
 
 void WriteResource(std::ofstream& file, const InspectorResource& resource) {
 	file << fmt::format("    {}[{}] addr=0x{:016x} bytes={} image_id={}.{} buffer_id={}.{} "
-	                    "extent={}x{}x{} guest_fmt={} actual_vk={} vk=0x{:016x} tick={} "
+	                    "extent={}x{}x{} guest_fmt={} actual_vk={} vk=0x{:016x}+{} tick={} "
 	                    "read={} write={} atomic={} coherency={}\n",
 	                    InspectorResourceName(resource.kind), resource.index, resource.address,
 	                    resource.size, resource.image_id, resource.image_generation,
 	                    resource.buffer_id, resource.buffer_generation, resource.width,
 	                    resource.height, resource.depth, resource.guest_format, resource.actual_vk,
-	                    resource.vk_handle, resource.last_access_tick, resource.read,
+	                    resource.vk_handle, resource.vk_offset, resource.last_access_tick, resource.read,
 	                    resource.written, resource.atomic, InspectorCoherencyName(resource));
 }
 
@@ -309,21 +311,27 @@ void CaptureOneResource(CommandBuffer& command, RenderContext& renderer, uint64_
 	record.address          = resource.address;
 	record.input            = input;
 	record.note             = slot_prefix;
-	const auto meta = CaptureMetadata(frame, operation_index, operation, resource, input, 0).dump();
+	auto metadata = CaptureMetadata(frame, operation_index, operation, resource, input, 0);
 	if (resource.kind != InspectorResourceKind::Buffer && resource.image_id != 0) {
 		auto& cache = renderer.GetTextureCache();
 		auto& image = cache.GetImage({resource.image_id, resource.image_generation});
-		DumpInspectorGpuImage(command, renderer, image, record, meta);
+		DumpInspectorGpuImage(command, renderer, image, record, metadata.dump());
 		return;
 	}
 	if (resource.vk_handle != 0 && resource.size != 0) {
+		constexpr uint64_t kMaxBufferCapture = 1ull << 20;
+		const auto capture_size = std::min(resource.size, kMaxBufferCapture);
+		metadata["buffer_capture"] = {{"vk_offset", resource.vk_offset},
+		                              {"captured_bytes", capture_size},
+		                              {"resource_bytes", resource.size},
+		                              {"truncated", capture_size != resource.size}};
 		DumpInspectorGpuBuffer(command, renderer, vk::Buffer {reinterpret_cast<VkBuffer>(resource.vk_handle)},
-		                       0, resource.size, record, meta);
+		                       resource.vk_offset, capture_size, record, metadata.dump());
 		return;
 	}
 	std::error_code ec;
 	std::filesystem::create_directories("D:/PS5/dumps", ec);
-	nlohmann::json json = nlohmann::json::parse(meta, nullptr, false);
+	nlohmann::json json = std::move(metadata);
 	if (json.is_discarded()) {
 		json = nlohmann::json::object();
 	}
@@ -398,6 +406,7 @@ InspectorStage CaptureInspectorStage(const PreparedBindings& bindings,
 		if (index < bindings.buffers.size() && bindings.buffers[index].buffer) {
 			captured.vk_handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
 			    static_cast<VkBuffer>(bindings.buffers[index].buffer)));
+			captured.vk_offset = bindings.buffers[index].offset;
 		}
 		result.resources.push_back(captured);
 	}
@@ -1118,6 +1127,38 @@ void RefreshDispatchInspector() {
 		return;
 	}
 	std::error_code error;
+	if (std::filesystem::exists(kCaptureTrigger, error)) {
+		std::string capture_text;
+		{
+			std::ifstream trigger {kCaptureTrigger};
+			std::getline(trigger, capture_text, '\0');
+		}
+		std::filesystem::remove(kCaptureTrigger, error);
+		const auto begin = capture_text.find_first_not_of(" \t\r\n\xef\xbb\xbf");
+		const auto* text = begin == std::string::npos ? "" : capture_text.c_str() + begin;
+		unsigned long long parsed_hash = 0;
+		char               mode[32]     = "before-after";
+		unsigned           occurrence   = 0;
+		const int fields = std::sscanf(text, "%llx %31s %u", &parsed_hash, mode, &occurrence);
+		if (fields >= 1 && parsed_hash != 0) {
+			InspectorCaptureArm arm;
+			arm.kind                   = InspectorOperationKind::Dispatch;
+			arm.shader_hashes[0]       = static_cast<uint64_t>(parsed_hash);
+			arm.shader_hash_count      = 1;
+			arm.occurrence             = occurrence;
+			arm.mode = std::strcmp(mode, "inputs") == 0
+			               ? InspectorCaptureMode::Inputs
+			               : std::strcmp(mode, "outputs") == 0
+			                     ? InspectorCaptureMode::Outputs
+			                     : InspectorCaptureMode::BeforeAfter;
+			ArmInspectorCapture(arm);
+			LOGF("DispatchInspector: headless capture armed hash=0x%016" PRIx64
+			     " mode=%s occurrence=%u\n",
+			     arm.shader_hashes[0], mode, occurrence + 1);
+		} else {
+			LOGF("DispatchInspector: invalid CAPTURE_INSPECTOR contents '%s'\n", text);
+		}
+	}
 	if (!std::filesystem::exists(kDumpTrigger, error)) {
 		return;
 	}

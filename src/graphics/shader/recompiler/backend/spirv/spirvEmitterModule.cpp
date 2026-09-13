@@ -423,7 +423,7 @@ static bool MrtUsesUintOutput(const EmitterState& state, uint32_t index) {
 }
 
 void AllocateInputVariables(EmitterState& state) {
-	if (state.lane_count == 2) {
+	if (state.lane_count == 2 || state.split_wave64) {
 		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
 		                             const char* name) {
 			if (std::ranges::none_of(state.inputs, [kind](const InputBinding& input) {
@@ -736,11 +736,11 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(CapabilityImageGatherExtended);
 	}
-	if (state.lane_count == 2 || state.requirements.subgroup_ballot ||
+	if (state.lane_count == 2 || state.split_wave64 || state.requirements.subgroup_ballot ||
 	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {
+	if (state.lane_count == 2 || state.split_wave64 || state.requirements.subgroup_ballot) {
 		state.builder.RequireCapability(CapabilityGroupNonUniformBallot);
 	}
 	if (state.requirements.subgroup_shuffle) {
@@ -775,8 +775,10 @@ void DefineModule(EmitterState& state) {
 		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
 		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
 		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
-		if (state.lane_count == 2) {
-			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
+		if (state.lane_count == 2 || state.split_wave64) {
+			// Pair-packed: 32 host invocations per wave64. Split: 64, one per GCN lane.
+			const auto per_wave = state.split_wave64 ? 64u : 32u;
+			local_x = ((local_x * local_y * local_z + 63u) / 64u) * per_wave;
 			local_y = local_z = 1u;
 			if (state.requirements.compute_derivatives) {
 				local_y = local_x / 2u;

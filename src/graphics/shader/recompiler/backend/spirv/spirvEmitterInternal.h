@@ -365,6 +365,12 @@ struct EmitterState {
 	uint32_t                                         wave_size               = 64;
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
+	// Wave64 stage 2: one host invocation per GCN lane, so a wave64 spans TWO host subgroups of
+	// 32 instead of being pair-packed into one. lane_count is then 1 and the per-instruction
+	// duplication disappears, but every wave-wide value (EXEC/VCC masks, ballot, readlane) now
+	// crosses a subgroup boundary and cannot use a plain subgroup intrinsic. Distinct from a
+	// natively 64-wide host subgroup, where wave_size==64 ballots already span the whole wave.
+	bool                                             split_wave64            = false;
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};

@@ -41,6 +41,7 @@ struct InspectorResource {
 	int32_t               guest_format     = -1;
 	int32_t               actual_vk        = -1;
 	uint64_t              vk_handle        = 0;
+	uint64_t              vk_offset        = 0;
 	uint64_t              last_access_tick = 0;
 	bool                  read             = false;
 	bool                  written          = false;
@@ -244,6 +245,8 @@ void NoteInspectorCaptureComplete(const InspectorCaptureRecord& record);
 
 // Consumes D:/PS5/dumps/DUMP_INSPECTOR and writes the same snapshot shown by the panel to
 // paired dispatch-inspector-f<N>.txt/.json files. Optional contents are a shader hash filter.
+// CAPTURE_INSPECTOR arms a one-shot dispatch resource capture for the next frame. Its contents
+// are: <shader-hash> [inputs|outputs|before-after] [zero-based-occurrence].
 void RefreshDispatchInspector();
 
 [[nodiscard]] const char* InspectorStageName(uint32_t stage) noexcept;

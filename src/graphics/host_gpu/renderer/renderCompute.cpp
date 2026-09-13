@@ -24,6 +24,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/frontend/translate/ProbeConfig.h"
 #include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
@@ -468,7 +469,52 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const bool                   fullscreen_cs =
 	    !indirect && thread_group_x >= 200 && thread_group_y >= 100 && thread_group_z <= 1;
 	const uint64_t shader_hash = program.shader_hash;
-	const bool     skip_cs     = ShouldSkipComputeHash(shader_hash);
+	bool           skip_cs     = ShouldSkipComputeHash(shader_hash);
+	std::shared_ptr<const ShaderRecompiler::Frontend::ProbeConfig> execution_probe;
+	bool     execute_probe_once    = false;
+	uint32_t execution_ordinal     = 0;
+	uint32_t execution_count_limit = 0;
+	if (skip_cs) {
+		execution_probe = ShaderRecompiler::Frontend::GetProbeConfig();
+		if (execution_probe->execute_once && execution_probe->hash == shader_hash) {
+			// Pack the live PROBE generation and the number of dispatches already claimed for it.
+			// This keeps the old one-shot behaviour when execute_count is absent/defaulted to 1,
+			// while allowing the two same-hash UFC passes to be tested in one frame. A generation
+			// change resets the claim count atomically, so headless edits cannot accidentally
+			// inherit an occurrence from the previous configuration.
+			execution_count_limit = std::max(execution_probe->execute_count, 1u);
+			static std::atomic<uint64_t> execution_state {UINT64_MAX};
+			auto                         observed = execution_state.load(std::memory_order_acquire);
+			while (true) {
+				const auto observed_generation = static_cast<uint32_t>(observed >> 32u);
+				const auto observed_count      = static_cast<uint32_t>(observed);
+				if (observed_generation == execution_probe->generation &&
+				    observed_count >= execution_count_limit) {
+					break;
+				}
+				const uint32_t claimed_count =
+				    observed_generation == execution_probe->generation ? observed_count + 1u : 1u;
+				const uint64_t desired =
+				    (static_cast<uint64_t>(execution_probe->generation) << 32u) | claimed_count;
+				if (execution_state.compare_exchange_weak(observed, desired,
+				                                          std::memory_order_acq_rel,
+				                                          std::memory_order_acquire)) {
+					execute_probe_once = true;
+					execution_ordinal  = claimed_count;
+					break;
+				}
+			}
+			skip_cs = !execute_probe_once;
+			if (execute_probe_once) {
+				LOGF("GraphicsRenderDispatchDirect: PROBE executing skipped hash=0x%016" PRIx64
+				     " generation=%u occurrence=%u/%u loop=%u/%u limit=%u groups=%u sync=%u\n",
+				     shader_hash, execution_probe->generation, execution_ordinal,
+				     execution_count_limit, execution_probe->loop_header,
+				     execution_probe->loop_iterations, execution_probe->gds_limit_cap,
+				     execution_probe->group_cap, execution_probe->sync_once ? 1u : 0u);
+			}
+		}
+	}
 	const bool     watch_cs =
 	    shader_hash == kUfcHangCsHash || skip_cs ||
 	    EnvListContainsHash("KYTY_DUMP_SHADER_HASH", shader_hash);
@@ -499,8 +545,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const uint32_t original_limit = work_limit;
 	uint32_t       work_counter   = have_gds_words ? gds_words[1] : 0;
 	uint32_t       limit_cap      = 0;
-	if (!skip_cs && shader_hash == kUfcHangCsHash && TryParseEnvU32("KYTY_GDS_LIMIT_CAP", limit_cap) &&
-	    limit_cap > 0) {
+	const bool have_probe_limit = execute_probe_once && execution_probe->gds_limit_cap > 0;
+	if (have_probe_limit) {
+		limit_cap = execution_probe->gds_limit_cap;
+	}
+	if (!skip_cs && shader_hash == kUfcHangCsHash &&
+	    (have_probe_limit || TryParseEnvU32("KYTY_GDS_LIMIT_CAP", limit_cap)) && limit_cap > 0) {
 		if (work_limit == 0 || limit_cap < work_limit) {
 			work_limit = limit_cap;
 		}
@@ -591,9 +641,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	uint32_t group_cap = 0;
+	uint32_t group_cap = execute_probe_once ? execution_probe->group_cap : 0;
 	if (!indirect && !skip_cs && shader_hash == kUfcHangCsHash &&
-	    TryParseEnvU32("KYTY_GDS_GROUP_CAP", group_cap) && group_cap > 0 &&
+	    ((execute_probe_once && group_cap > 0) || TryParseEnvU32("KYTY_GDS_GROUP_CAP", group_cap)) &&
+	    group_cap > 0 &&
 	    group_cap < thread_group_x) {
 		LOGF("GraphicsRenderDispatchDirect: GDS group cap hash=0x%016" PRIx64
 		     " groups_x=%u original=%u\n",
@@ -658,6 +709,54 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	if (skip_cs) {
+		// A skipped dispatch is still a real node in the guest frame graph. Record it before
+		// applying the fallback so the inspector can follow its outputs into later draws and
+		// compare the resource contents before/after the replacement. Previously the early
+		// return made the operation invisible, which hid the most important edge in the UFC 5
+		// black-frame investigation.
+		InspectorOperation skipped_inspector_operation;
+		bool               skipped_inspector_capture = false;
+		bool               skipped_inspector_cap_in  = false;
+		bool               skipped_inspector_cap_out = false;
+		uint32_t           skipped_inspector_op_index = 0;
+		uint64_t           skipped_inspector_frame    = 0;
+		if (DispatchInspectorEnabled()) {
+			buffer.EndRendering();
+			auto bindings = PrepareBindings(input_info.stage);
+			FindBuffers(bindings);
+			if (program.info.uses_dma) {
+				m_context.GetGpuResources().PrepareBda();
+			}
+			RebindBuffers(bindings);
+			RebindImages(bindings);
+
+			InspectorOperation operation;
+			operation.kind             = InspectorOperationKind::Dispatch;
+			operation.groups[0]        = thread_group_x;
+			operation.groups[1]        = thread_group_y;
+			operation.groups[2]        = thread_group_z;
+			operation.local[0]         = input_info.threads_num[0];
+			operation.local[1]         = input_info.threads_num[1];
+			operation.local[2]         = input_info.threads_num[2];
+			operation.indirect_address = indirect_args_addr;
+			operation.submit_id        = submit_id;
+			operation.submission_tick  = m_context.GetCommandScheduler().CurrentTick();
+			operation.stages.push_back(
+			    CaptureInspectorStage(bindings, m_context.GetTextureCache()));
+			skipped_inspector_frame = m_context.GetGpu().GetFrameNum();
+			skipped_inspector_op_index = PeekInspectorOperationIndex(skipped_inspector_frame);
+			skipped_inspector_capture =
+			    InspectorShouldCapture(operation, skipped_inspector_op_index,
+			                           &skipped_inspector_cap_in, &skipped_inspector_cap_out);
+			if (skipped_inspector_capture && skipped_inspector_cap_in) {
+				CaptureInspectorResources(buffer, m_context, operation,
+				                          skipped_inspector_op_index, skipped_inspector_frame, true,
+				                          false);
+			}
+			skipped_inspector_operation = operation;
+			RecordInspectorOperation(skipped_inspector_frame, std::move(operation));
+		}
+
 		// Experimental replacement: clear written images and leave buffers untouched.
 		// The watched UFC shader clears these images at tile setup, but later accumulates
 		// color and reads/writes packed data and linked entries in its buffers. This
@@ -714,9 +813,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			}
 		}
 
+		// Diagnostic A/B: the historical stub clears both storage images. If that clear suppresses
+		// later scene draws, KYTY_STUB_CLEAR_IMAGES=0 turns the skipped dispatch into a true no-op
+		// while preserving every other binding and scheduling decision.
+		static const bool clear_stub_images = [] {
+			const char* env = std::getenv("KYTY_STUB_CLEAR_IMAGES");
+			return env == nullptr || std::strcmp(env, "0") != 0;
+		}();
 		auto&    cache        = buffer.GetContext().GetTextureCache();
 		uint32_t cleared      = 0;
-		for (uint32_t i = 0; i < program.info.images.size() && i < resources.images.size(); i++) {
+		for (uint32_t i = 0; clear_stub_images && i < program.info.images.size() &&
+		                     i < resources.images.size(); i++) {
 			const auto& resource = program.info.images[i];
 			if (!resource.written) {
 				continue;
@@ -746,10 +853,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		LOGF("GraphicsRenderDispatchDirect: stubbing watched compute shader hash=0x%016" PRIx64
 		     " addr=0x%016" PRIx64 " groups=%ux%ux%u local=%ux%ux%u cleared_images=%u "
-		     "cleared_buffers=%u\n",
+		     "cleared_buffers=%u clear_images=%s\n",
 		     shader_hash, sh_ctx.GetCs().cs_regs.data_addr, thread_group_x, thread_group_y,
 		     thread_group_z, input_info.threads_num[0], input_info.threads_num[1],
-		     input_info.threads_num[2], cleared, cleared_buffers);
+		     input_info.threads_num[2], cleared, cleared_buffers,
+		     clear_stub_images ? "true" : "false");
+		if (skipped_inspector_capture && skipped_inspector_cap_out) {
+			CaptureInspectorResources(buffer, m_context, skipped_inspector_operation,
+			                          skipped_inspector_op_index, skipped_inspector_frame, false,
+			                          true);
+		}
+		if (skipped_inspector_capture) {
+			InspectorCompleteCapture();
+		}
 		ResetBindings();
 		return;
 	}
@@ -901,9 +1017,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			FillGdsDword(gds, 0, work_limit);
 		}
 		uint32_t sync_cap = 0;
+		const bool probe_sync = execute_probe_once && execution_probe->sync_once;
 		const bool sync_capped_dispatch =
 		    !indirect && shader_hash == kUfcHangCsHash && limit_cap > 0 &&
-		    TryParseEnvU32("KYTY_GDS_SYNC_CAP", sync_cap) && sync_cap != 0;
+		    (probe_sync || (TryParseEnvU32("KYTY_GDS_SYNC_CAP", sync_cap) && sync_cap != 0));
 		const auto dispatch_t0 = std::chrono::steady_clock::now();
 		record_dispatch();
 		if (sync_capped_dispatch) {
