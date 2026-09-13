@@ -994,6 +994,198 @@ surface including the bloom/downsample pyramid - **4,206 recreations of a 400x22
 walkout** - which blew the frame to white and destroyed the visual readout.
 `KYTY_SEED_NEW_IMAGES_MIN_WIDTH` (default 1280) now keeps it to full-resolution surfaces.
 
+### SESSION 15 (2026-09-13) — ROOT CAUSE: THE 1x1 AUTO-EXPOSURE TEXTURE HAS NO PRODUCER AND READS 1.05e-19. EVERY COLOUR IS SCALED BY ~1e-16.
+
+**The whole render is multiplied by 1.29e-16 before the tonemap. That is the "colours wrong, hue
+wrong, black round" defect.** Measured end to end in one run, with one build of the emulator and no
+fight navigation needed for the decisive part.
+
+**1. THE CHAIN, ALL MEASURED.**
+```
+1x1 R32_SFLOAT auto-exposure texture @0x1162e90000   reads 1.048e-19   <- NOBODY WRITES IT
+  x  rcp(cb[104]) = rcp(0.000813802) = 1228.8         (correct, verified)
+  =  net scale 1.29e-16 applied to the scene colour in CS 0x0c399ab0b1e7fa33
+  -> tonemapped RGB ~1e-19..1e-12, i.e. 0 in any 8/16-bit UNORM store
+  -> the temporal upscaler saturates to (0, -65504, +65504) and then goes 100% NaN
+  -> NaN is self-sustaining through the history feedback; only disocclusion pixels escape
+  -> black round, with a surviving band at the frame edge (the cage outline the user always saw)
+```
+
+**2. THE BISECTION THAT FOUND IT — four taps, one dispatch, no navigation.**
+`CS 0x0c399ab0b1e7fa33` is dispatched **twice per frame** in menus, pre-fight and round alike. Its
+`IMAGE_STORE` at `0x234` targets the `R16G16B16A16_UNORM` image that the upscaler re-reads as its
+`i9` (same `image_id`, verified per frame), so `PROBE pc=234 vgpr=...` gives a free 16-bit readout
+of any four registers. Taps fire **BEFORE** the instruction at their pc, so each pc is the *next*
+instruction after the one that produced the value.
+```
+tap  pc   register                                healthy     MEASURED
+a8   v5 = rcp(1 + max(exposed rgb))               ~0.051      1.0      <- max is zero
+84   v3 = exposure AFTER the ==0 -> 1.0 guard     1.0         0        <- THE BREAK
+64   v0 = i0.r * rcp(cb[104])                     saturated   saturated, 365 distinct  OK
+38   v0 = raw i0.r straight out of IMAGE_LOAD     ~0.015      0.024, 705 distinct      OK
+```
+**The image read and the constant-buffer multiply both work.** Everything dies on the exposure.
+
+**3. THE GUARD IS NOT BROKEN — THE TEXEL IS NOT ZERO. AND HOW TO MEASURE 1e-19 THROUGH A UNORM
+STORE.** The obvious reading of "v3 = 0 after a `V_CNDMASK` whose whole job is `0 -> 1.0`" is that
+the cndmask is mistranslated. It is not. A UNORM8/16 store **cannot tell 0 from 1e-19**, so that
+reading was unfalsifiable as posed.
+
+The shader carries its own logarithm: `0x1f8 V_LOG_F32 v7, |v5|` -> `0x220 v7 *= 1/6` ->
+`0x230 V_EXP_F32 v3, v7`, i.e. channel 3 of the `0x234` store is `|v5|^(1/6)`. Forcing `v5` to the
+register under test turns that channel into a **log-domain readout with ~30 decades of range**:
+```
+tap=7c:3:92     # v92 = the raw exposure texel, before the cndmask
+tap=1f8:92:5    # v5 = v92, just before the V_LOG_F32
+vgpr=88,89,90,3 # channel 3 = the shader's own exp2 result = |texel|^(1/6)
+```
+Read back **raw 45/65535**, so `|texel| = (45/65535)^6 = 1.048e-19` (bracket 9.6e-20..1.14e-19).
+**Bit-identical in the menu, the pre-fight and the round** — a dead constant, not an adaptation that
+has drifted. Exactly 0 would have read back as 0, so the `V_CNDMASK` at `0x7c` is correct and the
+ISA guard simply does not apply.
+**Reusable: when a value is outside a store's range, look for a `V_LOG`/`V_EXP` pair already in the
+shader and redirect its input. It costs one tap and no rebuild.**
+
+**4. THE TEXTURE HAS NO PRODUCER. `TRACE_ADDRS` on `0x1162e90000`, one frame, deduplicated:**
+```
+READ  by stage=4 hash=0x0c399ab0b1e7fa33  image=1   1x1 vk=100 (R32_SFLOAT)
+READ  by stage=4 hash=0xe17349e0d437757b  image=6   1x1 vk=100   (the upscaler)
+READ  by stage=4 hash=0x3c6058d66788f544  image=0   1x1 vk=100
+WRITE by                     -- nothing, anywhere in the log --
+```
+Its guest memory reads `0x00000000` (dumped directly with the new `CS texture[n] guest texel` line),
+and the dispatch inspector has always called it `coherency=uninitialized`. **1.048e-19 is
+uninitialised VRAM.**
+
+**THE LEAD FOR THE FIX, NOT YET PROVEN:** the same guest address is written as a **BUFFER**:
+```
+WRITE stage=4 hash=0x1f4dc8c408985d4f buffer=6 addr=0x1162e90000 stride=4 records=33644
+READ  stage=4 hash=0x9cbc1ec72e110491 buffer=2 addr=0x1162e90000 stride=4 records=33644
+READ  stage=4 hash=0xe327a0730ba4f226 buffer=1 addr=0x1162e90000 stride=4 records=33644
+```
+i.e. the exposure may be produced into a structured buffer and consumed as a 1x1 image. BufferCache
+and TextureCache are separate, so the image would never receive it. **Next experiment, and it is
+cheap:** `KYTY_CAPTURE_INPUT_BUFFERS=1` with `CAPTURE_HASHES=9cbc1ec72e110491` dumps that buffer's
+real GPU contents. If dword 0 is a sane exposure the fix is a buffer->image sync; if it is garbage
+too, then `CS 0x1f4dc8c408985d4f` is the broken producer. **Do not assume the first branch** — the
+address is heavily aliased (the same trace shows 54x30 and 54x600 `R16G16B16A16_SFLOAT` colour
+targets there), so a 33,644-dword arena sharing a base address with a 1x1 texture may be an accident
+of the allocator rather than a producer/consumer pair.
+
+**5. CONFIRMED ON SCREEN, TWICE. `mark=` IS AN ACTUATOR, NOT JUST A PROBE.** `mark=<pc>:<dst>`
+writes **1.0f** into `v<dst>` — exactly the fallback the exposure guard was meant to apply — so it
+overrides a live register with no rebuild and no restart. And a probe with no `vgpr=` hijacks **no**
+store (`ProbeStoredVgpr` returns early when `vgpr[0] < 0`), so the frame is otherwise untouched.
+- `mark=84:3` (exposure -> 1.0, keeping the x1228.8): the cage band at the frame edge, which the
+  user reports has **always** been visible, changed from **blue to pure white**. A x1229
+  over-exposure is exactly what should blow the survivors out. Interior still black.
+- `mark=60:4` + `mark=84:3` (net scale 1.0, plain Reinhard on the raw HDR): **the tonemapper's own
+  output becomes genuinely healthy.**
+```
+upscaler i9 (= this shader's 0x234 store)      BEFORE              AFTER
+  ch0                                          0,     1 distinct   0.0062, 27982 distinct
+  ch1                                          32767, 1 distinct   0.5009, 22407 distinct
+  ch2                                          32767, 1 distinct   0.4999, 13647 distinct
+  ch3                                          ~0.001              0.62,   48778 distinct
+```
+The "three dead channels, one live channel" signature is now explained: `ch1`/`ch2` are
+`0.5 + 0.5(R-B)` and `0.5 - 0.25R + 0.5G - 0.25B`, which are **0.5 for any input scaled to zero**,
+and `ch3` passes through a 6th root, the only channel with the dynamic range to show 1e-16.
+**The identical signature in the upscaler history (`0 / -65504 / +65504`, ch3 alone healthy) has the
+same cause and is not a separate mystery.**
+
+**6. WITHDRAWN — SESSION 12 POINT 8, "THE UPSCALER IS NOT BROKEN, ITS FRESH SCENE INPUTS ARE EMPTY."
+HALF RIGHT. THE INPUTS WERE EMPTY *BECAUSE OF THIS BUG*, AND THE UPSCALER IS **ALSO** BROKEN.**
+With the exposure neutralised and the history cleared, the upscaler is fed the measurably healthy
+`i9` above and still produces:
+```
+history p0  ch0/1/2  0% NaN but only 3 DISTINCT VALUES: -65504, 0, +65504   ch3 1061 distinct, fine
+history p1  ch0/1/2  98.81% NaN                                             ch3 1962 distinct, fine
+its own B10G11R11 scene output i4/i7   the single constant 3.9375 across all 1600x900 texels
+```
+**That is a real, independent defect in `CS 0xe17349e0d437757b`, now reproducible with a KNOWN-GOOD
+INPUT for the first time in nine sessions.** Every previous attempt on that shader was debugging it
+against ~1e-16 garbage. Captures of the good-input case are on disk as `dumps/input-*-f2501.bin`.
+Also settled: the round's scene input `i0 @0x1176ae0000` is **99.3% nonzero with real HDR content**
+in the round — the scene never stopped rendering; only everything downstream of the exposure did.
+
+**7. NEGATIVE RESULT — CLEARING THE HISTORY IS NOT A FIX.** `CLEAR_IMAGES` on all four ping-pong
+buffers (`12c1000000,12c2000000,12c0800000,11be000000`; note it matches an image by **exact base
+address**, not by range — a 32 MB span cleared only the one image at its base) gives **one white
+frame and then black again**. The NaN regenerates within a frame or two even with a healthy input.
+So the upscaler is a NaN *generator*, not merely a NaN *accumulator* — a different question from the
+one sessions 7-12 asked.
+
+**8. THE SAME HASH HAS TWO PROGRAM VARIANTS. This has silently broken binding-index readings.**
+`0x0c399ab0b1e7fa33` appears as **5 images (`sampled=2`)** early in boot and as **6 images
+(`sampled=3`)** later, from different `shader=0x...` code addresses. In the 6-image variant the
+read-modify-written surface occupies **two** binding slots (`image=2` read-only, `image=3`
+write-only, same `image_id`); in the 5-image variant it is one read-write slot at `image=2`. **A
+binding index is only meaningful together with the variant it came from.** The 6-image map:
+```
+i0  1068x600 vk=122 B10G11R11    read    the HDR scene colour        (SRT offset 0)
+i1  1x1      vk=100 R32_SFLOAT   read    THE AUTO-EXPOSURE TEXTURE   (SRT offset 32)
+i2  1068x600 vk=37  RGBA8        read  \ the RMW lightness history   (SRT offset 128)
+i3  1068x600 vk=37  RGBA8        write /   store at 0x228
+i4  1068x600 vk=91  RGBA16_UNORM write  YCoCg + L*^(1/6) = upscaler i9 (SRT offset 96, store 0x234)
+i5  1068x600 vk=98  R32_UINT     write  the EXEC-gated d16 zero store  (SRT offset 64, store 0x25c)
+```
+
+**9. WHAT THE SHADER ACTUALLY IS, from the ISA (it was only ever guessed at before).** Reinhard
+tonemap + CIE L* + YCoCg, ~118 instructions:
+```
+rgb = load(i0) * rcp(cb[104]);  exposure = load(i1)[0,0];  if (exposure == 0) exposure = 1.0
+rgb = exposure * max(0, rgb);   rgb = rgb / (1 + max3(0, rgb))        Reinhard
+Y   = 0.2126 R + 0.7152 G + 0.0722 B
+L*  = Y <= 0.008856 ? 903.2963*Y : 116*Y^(1/3) - 16                   the LOG/EXP pair, EXEC-gated
+store i4 = (0.25R+0.5G+0.25B, 0.5+0.5(R-B), 0.5-0.25R+0.5G-0.25B, (L*/100)^(1/6))
+store i3 = (old_i2.g, old_i2.b, L*/100, flicker)   a 3-frame rolling lightness history
+store i5 = 0                                       gated on (x < cb[0] && y < cb[4])
+```
+`cb[0..12]` are literally `1068, 600, 1600, 900` as integers, which is what the `V_CMPX_GT_I32` pair
+at `0x240`/`0x244` bounds-tests against — **independent confirmation that the scalar buffer resolves
+to the right guest bytes**, immediate offsets included.
+
+**10. THE EXEC-GATED THIRD STORE IS A RED HERRING.** It stores a literal **zero**, gated on the
+in-bounds test above. It was flagged as "the same shape that silently skipped block 4 in the
+upscaler"; it is a clear-to-zero and cannot carry colour. Likewise `cb[28] = 0 or 1`, so
+`S_CMP_GT_U32 vcc_lo, 3` is false and block 3 never runs — which is why `i3`'s channel 3 is 0. Both
+are correct behaviour. Stop looking at them.
+
+**11. NEW TOOLING, COMMITTED.** `KYTY_DUMP_BUFFER_DWORDS=<n>` (default 0, capped at 64 dwords and 4
+dispatches) prints, for the shaders named by `KYTY_DUMP_SHADER_HASH`, the first `n` dwords of every
+bound scalar/constant buffer **and the single texel of every 1x1 image**, as hex AND float, read
+straight out of guest memory via `TryReadBacking`. Labels are **byte** offsets, so `[104]` is read
+directly off the disassembly's `S_BUFFER_LOAD_DWORD ... offset=104`. This produced
+`cb[104] = 0x3a555555` in one run at the menu.
+- **Trap, and it cost a rebuild:** the first version scoped itself with `watch_cs`, which is also
+  true for `kUfcHangCsHash` and for every skipped shader. Those ate the whole dispatch budget before
+  the shader under study reached its first dispatch. It is now scoped to the hash actually **named**
+  in `KYTY_DUMP_SHADER_HASH`.
+- Caveat the line carries itself: for a GPU-produced surface the guest dword is stale. Cross-check
+  the inspector's `coherency` field before trusting it. Here it was right because nothing on the GPU
+  ever wrote the exposure image.
+
+**METHOD NOTES WORTH KEEPING**
+- **"Occupancy is not correctness" has a twin: a UNORM store cannot tell 0 from 1e-19.** The first
+  bisection concluded "v3 == 0, so the cndmask is broken" and was wrong for exactly that reason.
+  Check the readout's dynamic range against the hypothesis before believing the reading.
+- **Taps fire BEFORE the instruction at their pc.** To read a value produced at pc P, tap at P+1.
+- **A probe with no `vgpr=` hijacks no store**, so `mark=`/`tap=` can *change* the game's behaviour
+  live without disturbing any output. That turns the probe from an instrument into an actuator, and
+  it is how the on-screen confirmation was obtained with no rebuild.
+- The whole session needed **one** build. Everything else was live file writes (`PROBE`,
+  `CAPTURE_HASHES`, `DUMP_INPUTS`, `TRACE_ADDRS`, `CLEAR_IMAGES`) against a running game.
+
+**NEXT, IN ORDER**
+1. `KYTY_CAPTURE_INPUT_BUFFERS=1` + `CAPTURE_HASHES=9cbc1ec72e110491` — is there a real exposure
+   value in the buffer at `0x1162e90000`? That decides whether the fix is a buffer->image sync or a
+   broken producer shader.
+2. Whatever the answer, the exposure has to reach that image. Until it does, nothing downstream can
+   be judged.
+3. Then, and only then, `CS 0xe17349e0d437757b` with a known-good input — a new problem with new
+   evidence (`dumps/input-*-f2501.bin`), not a resumption of sessions 7-12.
+
 ### SESSION 14 (2026-09-13) — THE STUB IS EXONERATED, i4/i7 WERE MISREAD, AND A 118-INSTRUCTION SHADER IS THE NEW LEAD
 
 **1. THE STUB DOES NOT CLEAR THE UPSCALER'S INPUTS. Hypothesis dead.** Added per-image logging to the

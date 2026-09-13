@@ -28,6 +28,7 @@
 #include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -138,6 +139,34 @@ static bool TryParseEnvU32(const char* name, uint32_t& out) {
 	}
 	out = static_cast<uint32_t>(value);
 	return true;
+}
+
+// KYTY_DUMP_BUFFER_DWORDS=<n>: for the shaders named by KYTY_DUMP_SHADER_HASH, print the first
+// <n> dwords of every bound constant/scalar buffer, and the single texel of every 1x1 image, as
+// hex AND float. S_BUFFER_LOAD offsets are byte offsets, so the label is the byte offset - read
+// "[104]" straight off the disassembly. Default 0 (off); capped at 64 dwords and 4 dispatches.
+static uint32_t DumpBufferDwords() {
+	static const uint32_t value = [] {
+		uint32_t parsed = 0;
+		TryParseEnvU32("KYTY_DUMP_BUFFER_DWORDS", parsed);
+		return std::min(parsed, 64u);
+	}();
+	return value;
+}
+
+static std::string GuestDwordsText(uint64_t address, uint32_t dwords) {
+	std::array<uint32_t, 64> words {};
+	const uint64_t           bytes = static_cast<uint64_t>(dwords) * sizeof(uint32_t);
+	if (address == 0 || !Libs::LibKernel::Memory::TryReadBacking(address, words.data(), bytes)) {
+		return fmt::format(" <unreadable addr=0x{:012x} bytes={}>", address, bytes);
+	}
+	std::string text;
+	for (uint32_t d = 0; d < dwords; d++) {
+		float as_float = 0.0F;
+		std::memcpy(&as_float, &words[d], sizeof(as_float));
+		text += fmt::format(" [{}]=0x{:08x}({:g})", d * 4u, words[d], as_float);
+	}
+	return text;
 }
 
 static bool ReadGdsDwords(RenderContext& context, std::array<uint32_t, 8>& words) {
@@ -519,6 +548,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    shader_hash == kUfcHangCsHash || skip_cs ||
 	    EnvListContainsHash("KYTY_DUMP_SHADER_HASH", shader_hash);
 	static std::atomic<uint32_t> dispatch_log_count {0};
+	static std::atomic<uint32_t> buffer_content_count {0};
 	static std::atomic<uint32_t> fullscreen_log_count {0};
 	std::array<uint32_t, 8> gds_words {};
 	bool                    have_gds_words = false;
@@ -577,6 +607,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		         ? static_cast<uint32_t>(sizeof(ShaderRecompiler::IR::PushData))
 		         : 0u,
 		     skip_cs ? " skip=1" : "");
+		// Scope the content dump to the hash the user NAMED. watch_cs is also true for the hang
+		// CS and for every skipped shader, and those ate the whole budget before the shader
+		// under study reached its first dispatch.
+		const bool dump_contents = DumpBufferDwords() > 0 &&
+		    EnvListContainsHash("KYTY_DUMP_SHADER_HASH", shader_hash) &&
+		    buffer_content_count.load(std::memory_order_relaxed) < 4;
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& buffer = program.info.buffers[i];
 			const auto  r      = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
@@ -584,6 +620,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			     " stride=%u records=%u format=%u\n",
 			     i, buffer.source, buffer.written ? "read-write" : "read-only", r.Base48(),
 			     r.Stride(), r.NumRecords(), r.RawFormat());
+			if (dump_contents) {
+				LOGF("  CS buffer[%u] contents:%s\n", i,
+				     GuestDwordsText(r.Base48(), DumpBufferDwords()).c_str());
+			}
 		}
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			const auto& image = program.info.images[i];
@@ -602,6 +642,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			         ? 1u
 			         : static_cast<uint32_t>(image.r128 ? r.LastLevel() : r.MaxMip()) + 1u,
 			     static_cast<uint32_t>(r.TileMode()));
+			if (dump_contents && r.Width5() == 0 && r.Height5() == 0) {
+				// A 1x1 texture has no tiling to unpick, so the guest dword IS the texel - as long
+				// as nothing on the GPU has written it since. Check the inspector coherency field
+				// before trusting this for a GPU-produced surface.
+				LOGF("  CS texture[%u] guest texel:%s\n", i, GuestDwordsText(r.Base40(), 1).c_str());
+			}
+		}
+		if (dump_contents) {
+			buffer_content_count.fetch_add(1, std::memory_order_relaxed);
 		}
 		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 			const auto r = DecodeNativeDescriptor<ShaderSamplerResource>(resources.samplers[i]);
