@@ -299,7 +299,12 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 				break;
 			case SDLK_F12:
 				if (!key.repeat) {
-					SceneDrawDebug::ToggleWireframe();
+					// Ctrl+F12 captures the scene buffer; F12 alone toggles wireframe.
+					if ((key.mod & KMOD_CTRL) != 0) {
+						SceneDrawDebug::DumpSceneShot();
+					} else {
+						SceneDrawDebug::ToggleWireframe();
+					}
 				}
 				break;
 			case SDLK_RETURN:

@@ -67,6 +67,17 @@ uint32_t NoteDraw(uint32_t frame_num, const Entry& entry);
 [[nodiscard]] bool WireframeEnabled() noexcept;
 void               ToggleWireframe();
 
+// Arm a capture of the scene colour buffer (the tonemapper's i0) by writing the same trigger
+// files the panel writes. Bound to Ctrl+F12.
+//
+// Why this exists: on-screen wireframe cannot show the scene in this title. The scene is
+// rasterised into a 1068x600 HDR buffer that the broken post chain destroys before present,
+// so only fullscreen post triangles and UI quads survive to the screen. Capturing that buffer
+// and decoding it offline sidesteps post entirely - see tools/scene_shot.py.
+//
+// Override the captured shader with KYTY_SCENE_SHOT_HASH (hex, no 0x).
+void               DumpSceneShot();
+
 // --- ui thread ---------------------------------------------------------------------------
 void Capture();        // arm a one-frame capture; call again to report
 void ReportCapture();  // print the most recent capture

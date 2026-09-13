@@ -1485,14 +1485,38 @@ point 19 (already in `i0`, ~5% of pixels at saturation, no lattice) this places 
 or texture sampling **at the point the scene is drawn**, not in any post pass and not in the
 compositor. That is a much smaller search space than "somewhere in post".
 
-**TOOLING: `tools/decode_b10g11r11.py`.** Decodes a raw B10G11R11 capture, auto-exposes off the
-median, Reinhards and gammas it to a PNG:
-```
-python tools/decode_b10g11r11.py dumps/input-...-i0-...-fNNN.bin out.png
-```
+**TOOLING: `tools/scene_shot.py`** (see point 25 for the full workflow).
 **Reach for this before theorising about what a buffer contains.** It cost a minute and settled two
 hypotheses that would otherwise have cost builds and navigations. Reference images kept:
 `dumps/round-scene-f1941.png` (shaded) and `dumps/round-wireframe-f929.png` (wireframe).
+
+**25. ON-SCREEN WIREFRAME CANNOT WORK IN THIS TITLE. SCENE SHOTS ARE NOW A KEYPRESS.**
+Two independent reasons, neither a defect in the wireframe path:
+- **The scene wireframe never reaches the screen.** The scene is rasterised into the 1068x600 HDR
+  buffer that post destroys, so its wireframe dies with it. Only the fullscreen post triangles (one
+  corner-to-corner diagonal each) and the UI quads survive to be seen.
+- **A GLOBAL polygon-mode override collapses the depth prepass.** Depth is written only along
+  triangle edges, so the depth buffer is nearly empty and every pass that samples it - lighting,
+  occlusion, the compositor - reads garbage. That garbage is the blocky red/white/green mess on
+  screen. Inherent to the override; not tunable.
+
+**The workflow that does work, now bound to a key:**
+```
+F12        toggle wireframe
+Ctrl+F12   capture the scene colour buffer (SceneDrawDebug::DumpSceneShot)
+python tools/scene_shot.py            decode the newest capture to a PNG
+python tools/scene_shot.py --watch    decode every new capture as it lands
+```
+`DumpSceneShot` just writes the existing `CAPTURE_HASHES` + `DUMP_INPUTS` trigger files (hash
+overridable with `KYTY_SCENE_SHOT_HASH`), so it reuses the proven capture path rather than adding a
+second one. It writes `2` as the occurrence count, which removes the `KYTY_CAPTURE_OCCURRENCES`
+footgun for this shader permanently.
+
+**`tools/scene_shot.py` replaces the ad-hoc decode script.** It auto-exposes off the median, then
+Reinhard + gamma, and prints the exposure it chose along with the NaN fraction and max - all three
+are diagnostic. **This is why the emulator's own `.bmp` dumps looked empty and cost this project
+time: they clamp HDR to 8 bits, and the scene's median luminance is ~0.002, so every one of them is
+essentially black.**
 
 **METHOD NOTES WORTH KEEPING**
 - **"Occupancy is not correctness" has a twin: a UNORM store cannot tell 0 from 1e-19.** The first

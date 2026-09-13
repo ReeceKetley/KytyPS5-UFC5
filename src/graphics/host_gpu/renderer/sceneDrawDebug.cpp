@@ -7,6 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <filesystem>
+#include <fstream>
+#include <string_view>
 
 namespace Libs::Graphics::SceneDrawDebug {
 
@@ -182,6 +185,39 @@ std::atomic<bool> g_wireframe {false};
 } // namespace
 
 bool WireframeEnabled() noexcept { return g_wireframe.load(std::memory_order_relaxed); }
+
+namespace {
+bool WriteTrigger(const char* path, std::string_view contents) {
+	std::error_code ec;
+	const std::filesystem::path out {path};
+	std::filesystem::create_directories(out.parent_path(), ec);
+	std::ofstream file {out, std::ios::binary | std::ios::trunc};
+	if (!file) {
+		return false;
+	}
+	file.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+	file.close();
+	return file.good();
+}
+} // namespace
+
+void DumpSceneShot() {
+	// The tonemapper: its i0 IS the scene colour buffer at render resolution.
+	static const std::string hash = [] {
+		const char* env = std::getenv("KYTY_SCENE_SHOT_HASH");
+		return std::string(env != nullptr && env[0] != '\0' ? env : "0c399ab0b1e7fa33");
+	}();
+	// "2" is the occurrence count: this shader is dispatched twice per frame and a capture that
+	// mixes the two passes is worthless. Writing it into the trigger avoids the
+	// KYTY_CAPTURE_OCCURRENCES footgun entirely.
+	if (WriteTrigger("D:/PS5/dumps/CAPTURE_HASHES", hash) &&
+	    WriteTrigger("D:/PS5/dumps/DUMP_INPUTS", "2")) {
+		LOGF("SceneShot: armed for hash=%s. Decode with: python tools/scene_shot.py\n",
+		     hash.c_str());
+	} else {
+		LOGF("SceneShot: could not write the trigger files in D:/PS5/dumps\n");
+	}
+}
 
 void ToggleWireframe() {
 	const bool on = !g_wireframe.load(std::memory_order_relaxed);
