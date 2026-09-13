@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/sceneDrawDebug.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -834,6 +835,11 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	static_params.face       = mc.face;
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
+	// Debug wireframe (F12). polygon_mode is part of the pipeline key, so the override yields
+	// a distinct pipeline rather than mutating the filled one - no cache invalidation needed.
+	if (SceneDrawDebug::WireframeEnabled()) {
+		static_params.polygon_mode = vk::PolygonMode::eLine;
+	}
 
 	for (uint32_t i = 0; i < color_count; i++) {
 		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);

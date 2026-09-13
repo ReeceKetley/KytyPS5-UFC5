@@ -1322,6 +1322,144 @@ a number to quote.
   state. It drifted to 106.5 as samples accumulated. **A wide p25/p75 means the run has not
   settled; do not quote it.**
 
+**16. THE ZERO SWEEP WIPED REAL TEXTURES. THE USER CAUGHT IT FROM A COLOUR, NOT FROM A NUMBER.**
+*"The stamina bar has lost its colour now, it used to be yellow?"* — and it had. So had the
+scorebar's "UFC 4:48" text. Both are HUD gradients, and the sweep was zeroing the textures they are
+drawn from:
+```
+ZeroNewImages: addr=0x1155f20000 bytes=65536 extent=128x1   fmt=71    <- a colour ramp LUT
+ZeroNewImages: addr=0x11e0201000 bytes=12288 extent=128x128 fmt=134   <- a BC-compressed texture
+ZeroNewImages: addr=0x11e0858000 bytes=8192  extent=64x64   fmt=138
+```
+**`Image::IsUninitialized()` could not tell "never had contents" from "was uploaded and is now
+clean".** From the code, and it is worth writing out because the two states really are identical
+without an extra bit:
+```
+IsCpuDirty() == m_cpu_dirty || m_maybe_cpu_dirty
+a new image is marked MAYBE-cpu-dirty, so the first bind reaches InitializeImage
+InitializeImage uploads real guest content ... then RefreshComplete() clears BOTH dirty bits
+and the upload path never sets m_gpu_modified
+=> by end of frame an UPLOADED texture looks exactly like one that never had contents
+```
+The sweep runs at end of frame, so it caught every small texture that had been uploaded that frame.
+**Fix: `image.MarkContentsDefined()` on a successful upload** (flag renamed from
+`m_zero_initialized`, which was the wrong concept — it is "contents are defined", not "we zeroed
+it"). An image that has not been bound yet is still maybe-cpu-dirty and was always skipped; the only
+images the sweep now touches are those that were bound, found clean, and received no upload — which
+is exactly the exposure texture's state.
+
+**THE LESSON IS ABOUT THE GUARD, NOT THE FEATURE.** The guard was copied from the dispatch
+inspector's `coherency=uninitialized` classification on the grounds that it was "exactly the
+inspector's own classification". That was true and still wrong: the inspector uses it to *describe*,
+where a miss costs a confusing log line, and the sweep uses it to *destroy*, where a miss costs real
+texture data. **A predicate is only as good as the consequence attached to it.**
+
+**And on how it was found:** three quantitative checks passed on this change — the texel went to 0,
+the guard fired, the tonemapper's channels went from 1 distinct value to ~28k, and the perf A/B came
+back clean. **None of them looked at anything the sweep was not aimed at.** The regression was found
+by a person noticing a yellow bar had gone grey. Keep asking.
+
+**17. THE FIX'S VERIFICATION WAS WORTHLESS: EVERY "AFTER" READING WAS TAKEN AT THE MENU, WHERE THE
+BUG DOES NOT OCCUR. THE EXPOSURE TEXTURE MOVES ADDRESS BETWEEN SCENES.**
+```
+run        frame  scene       addr          image_id   texel
+sweepoff      52  MENU        0x1162c00000  150.1      0
+zeroinit4    303  MENU        0x1162c00000  ...        0
+zeroinit2     70  MENU        0x1162c00000  ...        0        <- the "verified, fix works" reading
+cbdump2     1767  PRE-FIGHT   0x1162e90000  3555.7     1.048e-19  <- the actual bug
+```
+**`0x1162e90000` is the aliased transient slot; `0x1162c00000` is a different, clean allocation that
+reads 0 with or without the fix.** Every "after" measurement landed on the clean one, so "the texel
+is now exactly 0 and the guard fires" was true at the menu *before* the fix as well and demonstrated
+nothing. Proved by running with `KYTY_CLEAR_UNINIT_MAX_BYTES=0` (sweep fully disabled): the texel
+still read 0 and the guard still fired — with the feature switched off.
+- **The diagnosis is unaffected.** 1.048e-19 at `0x1162e90000` in the pre-fight and the round is
+  measured, repeatedly, and undefined VkImage contents remain the only explanation offered for it.
+  What is retracted is the claim that the sweep was shown to change it.
+- **The trap, and it is a general one: measure where the bug lives, not where measuring is cheap.**
+  The menu was chosen for every verification because it needs no navigation. The bug needs a scene.
+  A control that cannot exhibit the failure cannot confirm a fix, and three "confirmations" in a row
+  agreed with each other precisely because none of them was looking at the defect.
+- **The A/B that actually settles it** is one navigation, because the control already exists on disk
+  (`cbdump2`, 1.048e-19 at `0x1162e90000`, frames 1767/1869/1941): run with the sweep ON, get to the
+  pre-fight, read the texel at `0x1162e90000`. Do not accept a reading from any other address.
+
+**18. THE ROUND'S GEOMETRY IS PERFECT. LOOK AT THE PICTURE, NOT THE OCCUPANCY NUMBER.**
+The user asked whether the black round could be exploding geometry, and pushed back when that was
+dismissed on the grounds that `i0` is "99.3% nonzero". **They were right to push back — that is an
+occupancy number, and this ledger's own first trap is that occupancy is not correctness.** Exploded
+geometry would pass it.
+
+Decoding the round's `i0` capture (`input-0c399ab0b1e7fa33-p0-i0-1176ae0000-f1941.bin`, raw
+B10G11R11, 1068x600) and applying a sane exposure renders **a completely correct scene**: both
+fighters, the referee, the cage, the mat, the crowd, all properly lit and posed.
+**So: geometry, transforms, culling, materials and lighting are all fine in the black round. The
+frame is drawn correctly at render resolution and destroyed entirely downstream.** Wireframe would
+have shown nothing wrong; do not spend a build on it for this bug.
+**The tool is three lines of numpy and it is on disk** — decode the B10G11R11 dump, divide by the
+median, Reinhard, gamma. A picture answered in one minute a question that a build-and-navigate cycle
+would have answered in an hour, and answered it better.
+
+**19. THE SPECKLE AND THE RAINBOW SKIN ARE ALREADY IN `i0`, UPSTREAM OF THE TONEMAPPER.**
+Visible directly in that render: white salt-and-pepper dots across the whole frame and the oil-slick
+colours on the fighters' skin (issue 4b) are **present in the render-resolution scene colour before
+`CS 0x0c399ab0b1e7fa33` runs**. Session 12 established the speckle "comes from a different buffer"
+than the upscaler history; this identifies which one, and it is much earlier in the frame than
+assumed.
+```
+scene median luma                      0.0063741
+pixels > 1000x the median              33,938 = 5.30%
+those pixels: median luma 38,121, max 64,512 (saturated); 11,313 saturated in R alone
+lattice test  x&1 49.9/50.1   y&1 49.8/50.2   (x+y)&1 49.9/50.1
+              x&3 25.0/25.0/24.9/25.1        y&3 24.6/25.2/25.2/25.0
+```
+**Spatially random, not a checkerboard or quad pattern** — the same negative lattice result session
+12 got for the NaN mask, now measured on the buffer where the speckle actually lives. ~5% of pixels
+blown to saturation at random, in a buffer that is otherwise a correct render.
+**This is a much better starting point for issue 4b than "somewhere in post".**
+
+**20. ATTEMPT 3 AT THE ZERO-INIT FIX ALSO FAILED. STOPPING.** Retaining undecided images across
+sweeps (rather than considering each once) still clears **nothing**, and at the scene address the
+texel is unchanged across three consecutive frames:
+```
+sweepon2, addr=0x1162e90000, frames 810 / 821 / 833
+  |texel|^(1/6) = 45/65535 -> 1.048e-19   (identical to the control)
+  v3 after the guard = 0                  (the guard still does not fire)
+  images cleared by the sweep = 0
+```
+**The sweep has never once touched the image it was written for, in any build.** The 16 images it
+cleared in the earlier builds were all *uploaded* textures — which is what wiped the HUD gradients.
+Cause: the `maybe-cpu-dirty` lifecycle never leaves the image in the "clean, with no contents" state
+the guard tests for. A new image is marked maybe-dirty; the first bind only records a guest hash and
+returns; and re-marking keeps `IsCpuDirty()` true whenever the aliased guest range is touched.
+**The one approach not yet tried:** clear at image **creation** in `InsertImage` using
+`m_scheduler.Current()` directly. At creation the image definitionally has no contents, which
+sidesteps the lifecycle entirely. The risk is calling `EndRendering` mid-recording.
+
+**21. THE ZERO-INIT FIX IS REVERTED. THE DIAGNOSIS IS KEPT.**
+Three attempts, none of which ever touched the image the fix was written for, and one of which
+wiped real uploaded textures. Carrying a default-on feature that does not work and has broken
+rendering once is worse than carrying nothing, and a default-off version would be dead code whose
+knowledge already lives here. `textureCache.cpp/.h`, `image.h` and `swapchain.cpp` are back to their
+pre-fix state; the analysis in points 1-13 and the failure modes in 15-17 and 20 stand.
+**The approach to try next is clearing at image CREATION in `InsertImage`, using
+`m_scheduler.Current()` directly** — at creation the image definitionally has no contents, which
+sidesteps the `maybe-cpu-dirty` lifecycle that defeated all three attempts. The risk is calling
+`EndRendering` mid-recording.
+
+**22. WIREFRAME ON F12.** `SceneDrawDebug::ToggleWireframe()` overrides
+`static_params.polygon_mode` to `eLine` for every graphics pipeline.
+- **It self-invalidates the pipeline cache for free:** `polygon_mode` is already part of
+  `GraphicsPipelineKey::static_params`, so flipping it produces a different key and the cache builds
+  a second permutation instead of serving the filled one. No generation counter needed - unlike the
+  shader probe, which had to add one.
+- `fillModeNonSolid` is already a required device feature (`vulkanWindow.cpp` enables it) and
+  `rasterizer.lineWidth` is already `1.0f`, so `eLine` needs nothing new from the device.
+- **It is global**, so the UI draws wireframe too and the menus become hard to read. Toggle off to
+  navigate.
+- **It will not help with the black round** - see point 18, the geometry is already proven correct.
+  It is the right tool for missing or mis-transformed geometry, which is not this bug.
+
 **METHOD NOTES WORTH KEEPING**
 - **"Occupancy is not correctness" has a twin: a UNORM store cannot tell 0 from 1e-19.** The first
   bisection concluded "v3 == 0, so the cndmask is broken" and was wrong for exactly that reason.

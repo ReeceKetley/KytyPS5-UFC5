@@ -120,14 +120,6 @@ public:
 	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
-	// "Never initialised by anything": no guest upload source, no buffer write, no GPU write.
-	// An image in this state keeps whatever its VkImage allocation happened to contain, so a
-	// shader that reads it reads undefined memory. See TextureCache::ZeroNewImages.
-	[[nodiscard]] bool IsUninitialized() const noexcept {
-		return !m_gpu_modified && !m_buffer_modified && !IsCpuDirty() && !m_zero_initialized;
-	}
-	void MarkZeroInitialized() noexcept { m_zero_initialized = true; }
-
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
@@ -176,7 +168,6 @@ private:
 	bool              m_maybe_hash_valid = false;
 	bool              m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
-	bool              m_zero_initialized = false;
 };
 
 namespace ImageOps {

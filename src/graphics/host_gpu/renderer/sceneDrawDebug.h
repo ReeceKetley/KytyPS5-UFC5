@@ -52,6 +52,21 @@ uint32_t NoteDraw(uint32_t frame_num, const Entry& entry);
 // HDR scene target).
 [[nodiscard]] uint64_t Target() noexcept;
 
+// --- wireframe ---------------------------------------------------------------------------
+// Global polygonMode override, toggled live on F12. Costs nothing when off.
+//
+// It self-invalidates the pipeline cache for free: polygon_mode is already part of
+// GraphicsPipelineKey::static_params, so flipping it produces a different key and the
+// cache builds a second permutation rather than serving the filled one.
+//
+// fillModeNonSolid is already a required device feature and lineWidth is already 1.0f,
+// so eLine needs nothing new from the device.
+//
+// CAVEAT: this is global. The UI is drawn with the same pipelines, so the menus go
+// wireframe too and become hard to read - toggle it off to navigate.
+[[nodiscard]] bool WireframeEnabled() noexcept;
+void               ToggleWireframe();
+
 // --- ui thread ---------------------------------------------------------------------------
 void Capture();        // arm a one-frame capture; call again to report
 void ReportCapture();  // print the most recent capture

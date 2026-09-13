@@ -331,21 +331,6 @@ void TextureCache::PinVideoOutFormat(ImageInfo& info) const {
 	}
 }
 
-// KYTY_CLEAR_UNINIT_MAX_BYTES: size cap for zero-initialising an image that has no
-// initialisation source. 0 disables the behaviour entirely and restores the old
-// undefined-contents path. Default 64 KiB - large enough for the lookup/1x1 class of
-// image whose contents are READ as data, small enough never to touch a render target.
-static uint64_t ClearUninitializedMaxBytes() {
-	static const uint64_t value = [] {
-		const char* env = std::getenv("KYTY_CLEAR_UNINIT_MAX_BYTES");
-		if (env == nullptr || env[0] == '\0') {
-			return uint64_t {64} * 1024;
-		}
-		return static_cast<uint64_t>(std::strtoull(env, nullptr, 0));
-	}();
-	return value;
-}
-
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	ImageInfo pinned = info;
 	PinVideoOutFormat(pinned);
@@ -355,12 +340,6 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	}
 	if (SeedNewImagesValue() != nullptr) {
 		m_pending_seed.push_back(id);
-	}
-	// A newly created image with no initialisation source keeps whatever its VkImage
-	// allocation happened to contain. Queue the small ones to be zeroed; see ZeroNewImages.
-	if (ClearUninitializedMaxBytes() != 0 && !pinned.data.Empty() &&
-	    pinned.data.size <= ClearUninitializedMaxBytes()) {
-		m_pending_zero_init.push_back(id);
 	}
 	return id;
 }
@@ -459,58 +438,6 @@ bool TextureCache::SeedImageWithNoise(Image& image) {
 	}
 	image.Upload(copies, stream.Handle(), offset, bytes);
 	return true;
-}
-
-// Zero a newly created image that nothing has initialised. Vulkan leaves a fresh image
-// undefined, so a shader that READS such an image reads undefined VRAM - which is
-// nondeterministic and, in UFC 5, catastrophic: the 1x1 R32_SFLOAT auto-exposure texture
-// shares a recycled transient address with a 54x600/54x30 reduction chain and a 134 KB
-// buffer, so it is never written through its own view. It read back 1.048e-19 and scaled
-// every colour in the game by ~1e-16. Zero is the defensible content: deterministic, what
-// PS5 memory reads before anything writes it, and what the game's own
-// "if (exposure == 0) exposure = 1.0" guard is written against.
-//
-// Only images that are STILL uninitialised when the sweep runs are touched, so a target that
-// was created and immediately rendered into is left alone. Size-capped by
-// KYTY_CLEAR_UNINIT_MAX_BYTES (0 disables) because a large render target is about to be
-// fully written anyway - this is for the lookup/1x1 class whose contents are read as DATA.
-uint32_t TextureCache::ZeroNewImages(CommandBuffer& command) {
-	if (ClearUninitializedMaxBytes() == 0) {
-		return 0;
-	}
-	std::scoped_lock lock {m_lock};
-	std::vector<ImageId> pending;
-	pending.swap(m_pending_zero_init);
-	uint32_t cleared = 0;
-	for (const auto id: pending) {
-		const auto owner = m_slot_images.try_get(id);
-		if (owner == nullptr || owner->info.IsDepth() || owner->backing.image == nullptr ||
-		    owner->info.samples > 1 || !owner->IsUninitialized()) {
-			continue;
-		}
-		vk::ImageSubresourceRange range {};
-		range.aspectMask     = vk::ImageAspectFlagBits::eColor;
-		range.baseMipLevel   = 0;
-		range.levelCount     = owner->backing.mip_levels;
-		range.baseArrayLayer = 0;
-		range.layerCount     = owner->backing.layers;
-		owner->MarkZeroInitialized();
-		ClearImage(command, id, range, vk::ClearValue {});
-		// ClearImage -> CommitGpuWrite marks the image GPU-modified, and the texture GC can
-		// never evict a GPU-modified tiled image (see the GC entry in the ledger). Leaving the
-		// flag set turned every zeroed image into a permanent resident: measured 82.7 -> 106.5
-		// us/draw with gc 2.7 -> 6.8. Zeroing creates nothing the guest needs read back, so
-		// hand ownership straight back; m_zero_initialized is what stops the sweep repeating.
-		owner->ClearGpuModified();
-		++cleared;
-		static std::atomic<uint32_t> logged {0};
-		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-			LOGF("ZeroNewImages: addr=0x%016" PRIx64 " bytes=%" PRIu64 " extent=%ux%u fmt=%d\n",
-			     owner->info.data.address, owner->info.data.size, owner->backing.extent.width,
-			     owner->backing.extent.height, static_cast<int>(owner->backing.format));
-		}
-	}
-	return cleared;
 }
 
 uint32_t TextureCache::SeedNewImages(CommandBuffer& command) {

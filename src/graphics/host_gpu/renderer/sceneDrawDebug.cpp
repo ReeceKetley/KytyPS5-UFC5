@@ -177,6 +177,19 @@ bool RequireCapture() {
 
 } // namespace
 
+namespace {
+std::atomic<bool> g_wireframe {false};
+} // namespace
+
+bool WireframeEnabled() noexcept { return g_wireframe.load(std::memory_order_relaxed); }
+
+void ToggleWireframe() {
+	const bool on = !g_wireframe.load(std::memory_order_relaxed);
+	g_wireframe.store(on, std::memory_order_relaxed);
+	LOGF("Wireframe: %s (F12). The UI draws through the same pipelines, so toggle it off "
+	     "to navigate menus.\n", on ? "ON" : "OFF");
+}
+
 void Capture() {
 	// Arm recording for one frame. The draw path stays lock-free until then; the list is
 	// published at the next frame boundary and ReportCapture() prints it.

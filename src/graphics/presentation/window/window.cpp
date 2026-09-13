@@ -297,6 +297,11 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 					ToggleDesktopFullscreen();
 				}
 				break;
+			case SDLK_F12:
+				if (!key.repeat) {
+					SceneDrawDebug::ToggleWireframe();
+				}
+				break;
 			case SDLK_RETURN:
 			case SDLK_KP_ENTER:
 				if (!key.repeat && (key.mod & KMOD_ALT) != 0) {
