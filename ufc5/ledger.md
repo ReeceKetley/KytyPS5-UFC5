@@ -1460,6 +1460,40 @@ sidesteps the `maybe-cpu-dirty` lifecycle that defeated all three attempts. The 
 - **It will not help with the black round** - see point 18, the geometry is already proven correct.
   It is the right tool for missing or mis-transformed geometry, which is not this bug.
 
+**23. WIREFRAME CONFIRMS IT AT THE TRIANGLE LEVEL: THE BLACK ROUND'S GEOMETRY IS SOUND.**
+F12 wireframe ON, in the round, captured through the tonemapper's `i0` and decoded offline
+(`dumps/round-wireframe-f929.png`). **The mat's triangle fan radiates cleanly from the centre, the
+cage is a regular mesh, both fighters and the referee are correctly posed and tessellated, and the
+crowd tiers are in place.** No stray vertices, no triangles reaching off-screen, no degenerate fans -
+and the mat fan is precisely where exploding geometry would show, so this is the strongest possible
+negative. **Exploding geometry is dead as a hypothesis.**
+This is a stronger result than point 18: not "the shaded image looks right" but "the triangles are
+right".
+
+**Why the live wireframe view showed almost nothing:** the scene is rasterised into the 1068x600 HDR
+buffer, which is destroyed downstream, so its wireframe is destroyed with it. What survives to the
+screen is only the fullscreen post-process triangles (the corner-to-corner white diagonal is one
+such triangle's hypotenuse - these passes are `DRAW indices=3 instances=1`) and the UI quads (visible
+as diagonals in the scorebar). **The technique that works is wireframe ON + capture `i0` + decode
+offline**, which sidesteps the broken post chain entirely.
+Also expected, not a bug: a GLOBAL wireframe leaves the depth prepass rasterising only edges, so
+every depth-sampling pass downstream produces the blocky garbage seen on screen.
+
+**24. THE SPECKLE IS ON THE SURFACES, NOT IN SCREEN SPACE.** At the exposure used for the wireframe
+capture, the stippling sits ON the fighters, the crowd and the cage - it follows the geometry. With
+point 19 (already in `i0`, ~5% of pixels at saturation, no lattice) this places issue 4b in shading
+or texture sampling **at the point the scene is drawn**, not in any post pass and not in the
+compositor. That is a much smaller search space than "somewhere in post".
+
+**TOOLING: `tools/decode_b10g11r11.py`.** Decodes a raw B10G11R11 capture, auto-exposes off the
+median, Reinhards and gammas it to a PNG:
+```
+python tools/decode_b10g11r11.py dumps/input-...-i0-...-fNNN.bin out.png
+```
+**Reach for this before theorising about what a buffer contains.** It cost a minute and settled two
+hypotheses that would otherwise have cost builds and navigations. Reference images kept:
+`dumps/round-scene-f1941.png` (shaded) and `dumps/round-wireframe-f929.png` (wireframe).
+
 **METHOD NOTES WORTH KEEPING**
 - **"Occupancy is not correctness" has a twin: a UNORM store cannot tell 0 from 1e-19.** The first
   bisection concluded "v3 == 0, so the cndmask is broken" and was wrong for exactly that reason.
