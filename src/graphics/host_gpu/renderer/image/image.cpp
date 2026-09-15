@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/mipTailDiagnostic.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
 
@@ -752,16 +753,17 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	backing.samples     = info.samples;
 	backing.flags       = ImageCreateFlags(graphics, info);
 	backing.usage       = ImageUsageFlags(graphics, info);
-	// Vulkan requires mipLevels <= floor(log2(max_dim)) + 1. UFC 5 over-declares some
-	// storage mip chains by one level (e.g. 0x123c370000: 512x512 asking for 11). The
-	// extra level has undefined contents and shows as RGB speckle when sampled, so
-	// clamp to the complete chain; FindView() folds any descriptor that still points
-	// at the dropped level back into the real range.
+	// Vulkan requires mipLevels <= floor(log2(max_dim)) + 1. Some titles declare one
+	// extra logical level beyond the complete chain (e.g. 256x256 with MaxMip=9 => 10
+	// levels). That extra level is still part of the guest mip-tail packing; clamping
+	// the Vulkan backing drops the host representation of those logical indices.
+	// FindView diagnostic mode does NOT fold descriptors that still request the dropped
+	// level - it fails loudly so the mismatch can be investigated.
 	const auto complete_levels = std::bit_width(
 	    std::max({backing.extent.width, backing.extent.height, backing.extent.depth}));
 	if (backing.mip_levels > complete_levels) {
 		static std::atomic<uint32_t> invalid_mip_logs = 0;
-		if (invalid_mip_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+		if (invalid_mip_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
 			LOGF("ImageMipTrace: addr=0x%016" PRIx64 " size=0x%" PRIx64
 			     " extent=%ux%ux%u levels=%u complete=%u layers=%u type=%u"
 			     " guest_format=%u host_format=%d tile=%u (clamped)\n",
@@ -769,6 +771,9 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 			     backing.extent.depth, backing.mip_levels, complete_levels, backing.layers,
 			     static_cast<uint32_t>(info.type), static_cast<uint32_t>(info.guest_format),
 			     static_cast<int>(backing.format), static_cast<uint32_t>(info.tile_mode));
+			LogGuestMipLayoutChain(info.data.address, info.guest_format, info.tile_mode,
+			                       info.extent.width, info.extent.height, info.extent.depth,
+			                       info.resources.levels, info.IsVolume());
 		}
 		backing.mip_levels = complete_levels;
 	}

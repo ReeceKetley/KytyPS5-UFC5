@@ -1,6 +1,13 @@
 # UFC 5 / KytyPS5 ledger
 
-Last updated: 2026-09-12 session 11 — **THE NaN COMES FIRST; BLOCK 4 BEING SKIPPED IS ITS EFFECT.**
+Last updated: 2026-09-15 session 12 — **GUEST MIP9 ON A 256² IMAGE IS A REAL MIP-TAIL SLOT, NOT A DECODE TYPO.**
+`MaxMip=9` means highest mip *index* 9 (`levels = MaxMip+1 = 10`). Kyty's Standard64KB tiler packs
+mip8 at tail_xy=(0,12) and mip9 at (0,8) inside the same 64KB mip-tail block (footprint stays
+`0xb0000`). Vulkan can only host complete levels 0..8, so `Image::` clamps host mips; the old
+`FindView` fold mapped both guest slots onto host mip8. That is an unintended alias of distinct
+guest subresources. Diagnostic-only: `mipTailDiagnostic.cpp`, no clamp restore. See session 12.
+
+Previously: 2026-09-12 session 11 — **THE NaN COMES FIRST; BLOCK 4 BEING SKIPPED IS ITS EFFECT.**
 Block 4 is entered on three `V_CMP_LT_F32` compares, and an ordered compare against NaN is FALSE, so
 a NaN colour clears EXEC and skips the block. The real per-pass history is **99.7% NaN** in the three
 channels that share the `v1` multiplier and **0% NaN** in the fourth; `v29`/`v30` are already NaN
@@ -632,6 +639,39 @@ Two known causes, both fixable: **the shader has two `IMAGE_STORE`s** (`0x16c4` 
 read; and **block 6 rewrites v29/v30 at `0x166c`/`0x1674` before the store**, so probing them there
 reads post-accumulate values, not the block-5 values. Fix: let the probe select a store index, and
 probe only registers block 6 does not overwrite.
+
+### SESSION 12 (2026-09-15) — MIP-TAIL DIAGNOSTICS FOR GUEST MIP9 ON 256² (`0x1237200000`)
+
+**No rendering fix.** Diagnostic imageView (no FindView fold) remains active. Added
+`mipTailDiagnostic.{h,cpp}`: dumps Kyty `TileGetTiledTextureLayout` when guest levels exceed the
+Vulkan complete chain; `GUEST_LOGICAL_GT_HOST_PHYSICAL` before FindView EXIT; per-prepare
+multi-mip correlation (`SAME_PREPARE_MULTI_MIP`).
+
+**MaxMip semantics (from Kyty code, not assumption):**
+`ShaderTextureResource::MaxMip()` is `(fields[5]>>4)&0xF`. ResolveTexture does
+`levels = max_mip + 1`. So `max=9` ⇒ **highest mip index = 9**, **level count = 10**.
+
+**Evidence from `KytyLog-PPSA03541-imageview-diag.txt`:** after CS `0x056cd586eca8fb63`, storage
+views of `0x1237200000` resolve as base/last = 0,1,2,…,8,9 with `max=9`, then host clamp
+`levels=10 complete=9`, then EXIT on view `mip=9+1` against `image_levels=9`.
+
+**Guest layout (Kyty tiler, format 69=`k16_16_16_16UInt`, tile 9=`kStandard64KB`):**
+`first_tail_level=2`, total `0xb0000` (matches ImageMipTrace). mip8 and mip9 are both 1×1 in the
+shared 64KB mip-tail block at **distinct** `tail_xy` `(0,12)` vs `(0,8)`. Footprint is identical
+for levels 8..11 once the tail exists — mip9 costs no extra guest bytes.
+
+**Host clamp location:** `Image::Image` ctor (`image.cpp`) sets
+`backing.mip_levels = bit_width(max_dim)` when guest asks for more. Required by Vulkan; not a
+descriptor decode bug. The *old* FindView fold onto `mip_levels-1` was the compatibility workaround
+that collapses distinct tail slots.
+
+**Would mapping mip9→mip8 alias?** Yes at the subresource level: two distinct guest mip-tail slots
+become one VkImage mip. Whether Frostbite READ8/WRITE9 in one dispatch still needs
+`SAME_PREPARE_MULTI_MIP` from the new binary at that load point (both traced views are
+`storage=1` / written).
+
+**Outcome:** **C** (extra logical mip is a mip-tail subresource with distinct guest storage) with
+**A** (Kyty lacks a host representation for that slot). Not B/D.
 
 ### SESSION 11 (2026-09-12) — THE NaN COMES FIRST AND BLOCK 4 SKIPPING IS ITS **EFFECT**. THE TWO PASSES ARE CHAINED.
 

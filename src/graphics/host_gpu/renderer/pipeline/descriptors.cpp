@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/mipTailDiagnostic.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -624,14 +625,25 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 
 	const bool    volume       = type == Prospero::ImageType::kColor3D;
-	if (!multisampled && levels > std::bit_width(std::max({width, height, volume ? depth : 1u}))) {
+	const auto complete_levels =
+	    std::bit_width(std::max({width, height, volume ? depth : 1u}));
+	if (!multisampled && levels > complete_levels) {
 		static std::atomic<uint32_t> invalid_mip_logs = 0;
-		if (invalid_mip_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+		if (invalid_mip_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
 			LOGF("TextureMipTrace: addr=0x%016" PRIx64 " base=%u last=%u max=%u r128=%d"
-			     " storage=%d dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-			     address, base_level, last_level, descriptor.MaxMip(), resource.r128, storage,
-			     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
-			     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+			     " storage=%d levels=%u complete=%u read=%d written=%d"
+			     " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			     address, base_level, last_level, descriptor.MaxMip(), resource.r128, storage, levels,
+			     complete_levels, resource.read, resource.written, descriptor.fields[0],
+			     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+			     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6],
+			     descriptor.fields[7]);
+			// max_mip is a highest mip *index*; guest level count is max_mip+1.
+			LOGF("MipTailDiag: MaxMip semantics check addr=0x%016" PRIx64
+			     " MaxMip()=%u => guest_levels=MaxMip+1=%u; Vulkan complete=bit_width(max_dim)=%u;"
+			     " view=[%u..%u] beyond_complete=%d\n",
+			     address, descriptor.MaxMip(), levels, complete_levels, base_level, view_last_level,
+			     base_level >= complete_levels || view_last_level >= complete_levels);
 		}
 	}
 	const bool    layered      = type == Prospero::ImageType::kColor1DArray ||
@@ -700,6 +712,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		desc.info.mip_layout[0] = {0, size.size, pitch, height};
 	} else {
 		PopulateTextureMipLayout(desc.info);
+	}
+	if (!multisampled && levels > complete_levels) {
+		LogGuestMipLayoutChain(address, format, tile, width, height, volume ? depth : 1u, levels,
+		                       volume);
 	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, shader_conversion, storage,
 	                                 view_levels, desc.info.resources.layers);
@@ -858,9 +874,25 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	prepared.images.reserve(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		const auto& resource = program.info.images[i];
+		const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[i]);
+		const auto guest_levels = binding.desc.info.resources.levels;
+		const auto complete =
+		    std::bit_width(std::max({binding.desc.info.extent.width, binding.desc.info.extent.height,
+		                             binding.desc.info.extent.depth}));
+		if (guest_levels > complete || binding.desc.view_info.base_level >= complete) {
+			NoteOverwideTextureResolve(
+			    static_cast<uint64_t>(m_context.DiagnosticFrameNum()), program.shader_hash,
+			    static_cast<uint32_t>(program.stage), i, resource.read, resource.written,
+			    resource.atomic, binding.desc.type == TextureCache::BindingType::Storage,
+			    resource.r128, static_cast<uint32_t>(resource.mip_mode), descriptor, guest_levels,
+			    complete, &binding.desc.info);
+		}
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		prepared.images.push_back(std::move(binding));
 	}
+	FlushOverwideTexturePrepare(static_cast<uint64_t>(m_context.DiagnosticFrameNum()),
+	                            program.shader_hash, static_cast<uint32_t>(program.stage));
 	const auto bp_t1 = Common::Timer::QueryPerformanceCounter();
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
