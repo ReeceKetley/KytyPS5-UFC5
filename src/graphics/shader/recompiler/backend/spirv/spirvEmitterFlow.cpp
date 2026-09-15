@@ -519,12 +519,48 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::Reference:
 		case IR::ValueOpcode::ReferenceU32:
 		case IR::ValueOpcode::ControlNop:
-		case IR::ValueOpcode::Waitcnt:
 		case IR::ValueOpcode::Sendmsg:
 		case IR::ValueOpcode::TtraceData:
 		case IR::ValueOpcode::InstPrefetch: return true;
+		case IR::ValueOpcode::Waitcnt: {
+			// Guest S_WAITCNT drains outstanding VMEM/LDS before later ops. Emitting nothing
+			// left IMAGE_STORE → waitcnt → IMAGE_LOAD / OpImageFetch feedback unordered on the
+			// host: sampled and storage descriptors of the same VkImage saw undefined visibility.
+			const bool image_writes = std::any_of(
+			    state.program.info.images.begin(), state.program.info.images.end(),
+			    [](const IR::ImageResource& image) { return image.written; });
+			const bool buffer_writes = std::any_of(
+			    state.program.info.buffers.begin(), state.program.info.buffers.end(),
+			    [](const IR::BufferResource& buffer) { return buffer.written || buffer.atomic; });
+			if (!image_writes && !buffer_writes) {
+				return true;
+			}
+			uint32_t semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+			if (image_writes) {
+				semantics |= MemorySemanticsImageMemory;
+			}
+			if (buffer_writes) {
+				semantics |= MemorySemanticsUniformMemory;
+			}
+			state.builder.AddFunction({OpMemoryBarrier, ConstantU32(state, ScopeWorkgroup),
+			                           ConstantU32(state, semantics)});
+			return true;
+		}
 		case IR::ValueOpcode::Barrier: {
-			const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+			// s_barrier always orders LDS. When the same program also writes images/buffers,
+			// tile phases commonly sandwich IMAGE_STORE/LOAD around the barrier; WorkgroupMemory
+			// alone does not make those image writes visible to later OpImageFetch.
+			uint32_t semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+			if (std::any_of(state.program.info.images.begin(), state.program.info.images.end(),
+			                [](const IR::ImageResource& image) { return image.written; })) {
+				semantics |= MemorySemanticsImageMemory;
+			}
+			if (std::any_of(state.program.info.buffers.begin(), state.program.info.buffers.end(),
+			                [](const IR::BufferResource& buffer) {
+				                return buffer.written || buffer.atomic;
+			                })) {
+				semantics |= MemorySemanticsUniformMemory;
+			}
 			state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
 			                           ConstantU32(state, ScopeWorkgroup),
 			                           ConstantU32(state, semantics)});
