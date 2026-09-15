@@ -183,6 +183,14 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	bool InitializeUfcTonemapperExposure(CommandBuffer& command,
+	                                     const PreparedBindings& bindings,
+	                                     uint64_t shader_hash);
+	void LogComputeImageBindingIdentity(uint64_t frame, uint64_t shader_hash, uint32_t slot,
+	                                    const ShaderRecompiler::IR::ImageResource& resource,
+	                                    const TextureBinding& binding);
+	void LogComputeAliasPairs(uint64_t frame, uint64_t shader_hash,
+	                          const PreparedBindings& bindings);
 	[[nodiscard]] GraphicsBindings PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	                                                       const ShaderStageRuntime& pixel,
 	                                                       bool                      pixel_active);

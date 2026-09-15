@@ -10,6 +10,11 @@
 #                                  # evaluators and compare. SLOW - correctness
 #                                  # check only, the fps from this run is
 #                                  # meaningless because it does the work twice.
+#   .\run_ufc5.ps1 -Panel          # enable the ImGui GPU inspector (diagnostics;
+#                                  # performance numbers are not comparable)
+#   .\run_ufc5.ps1 -NoStubImageClear
+#                                  # diagnostic A/B: skip the wave64 occlusion CS
+#                                  # without clearing its two storage images
 #
 # Reading the result: NEVER quote fps from a single FrameProfile line. Scenes
 # vary 2,400-4,100 draws/frame, so two runs of the "same" fight differ by 70%.
@@ -22,7 +27,10 @@ param(
     [switch] $Baseline,
     [switch] $Validate,
     [switch] $Verify,
+    [switch] $Panel,
     [switch] $Timestamps,
+    [switch] $NoStubImageClear,
+    [switch] $ExecuteHangCs,
     [string] $GameDir   = 'D:\PS5\Games\UFC5',
     [string] $BinDir    = 'D:\PS5\Emulators\KytyPS5-Bin',
     [string] $LogDir    = 'D:\PS5'
@@ -40,14 +48,32 @@ Get-Process kyty_emulator -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 2
 
 # --- The configuration -------------------------------------------------------
-# KYTY_SKIP_CS_HASH   REQUIRED to reach a fight at all. The Frostbite occlusion
-#                     compute shader is wave64 and TDRs on a wave32-only GPU
-#                     (RTX 3070). Skipping it is why the fight round renders
-#                     BLACK - that is expected, not a regression.
+# KYTY_SKIP_CS_HASH   REQUIRED to reach a fight at all (default). The Frostbite
+#                     occlusion CS is wave64 and TDRs on a wave32-only RTX 3070.
+#                     Its replacement clears storage images; not visually correct.
+#                     Pass -ExecuteHangCs to run it for real (expect TDR risk).
 # KYTY_SRT_LINEAR     Flat SRT evaluator. getprog -31%; does not show
 #                     end-to-end, but it is verified equivalent and free to run.
-$env:KYTY_SKIP_CS_HASH  = '0xea0aceac518ec52d'
+if ($ExecuteHangCs) {
+    Remove-Item Env:\KYTY_SKIP_CS_HASH -ErrorAction SilentlyContinue
+    $env:KYTY_EXECUTE_CS_HASH = '0xea0aceac518ec52d'
+    $Tag = "$Tag-hangcs-exec"
+} else {
+    $env:KYTY_SKIP_CS_HASH = '0xea0aceac518ec52d'
+    Remove-Item Env:\KYTY_EXECUTE_CS_HASH -ErrorAction SilentlyContinue
+}
 $env:KYTY_SRT_LINEAR     = '1'
+if ($NoStubImageClear) {
+    $env:KYTY_STUB_CLEAR_IMAGES = '0'
+    $Tag = "$Tag-no-stub-image-clear"
+} else {
+    Remove-Item Env:\KYTY_STUB_CLEAR_IMAGES -ErrorAction SilentlyContinue
+}
+if ($Panel) {
+    $env:KYTY_DEBUG_PANEL = '1'
+} else {
+    Remove-Item Env:\KYTY_DEBUG_PANEL -ErrorAction SilentlyContinue
+}
 # KYTY_GPU_TIMESTAMPS is NOT on by default. GpuTimestamps::Arm() resets the query pool from the
 # HOST while command buffers from the previous window can still be in flight, so a slot can be
 # written twice with only one intervening reset - Vulkan validation reports
@@ -93,14 +119,14 @@ if ($Validate) { $cliArgs += @('--shader-validation', 'true') }
 Write-Host ''
 Write-Host 'KytyPS5 / UFC 5 (PPSA03541)' -ForegroundColor Cyan
 Write-Host "  log      $log"
-foreach ($n in @('KYTY_SKIP_CS_HASH','KYTY_GPU_TIMESTAMPS','KYTY_SRT_LINEAR','KYTY_BUFGC_OWN_SHARE')) {
+foreach ($n in @('KYTY_SKIP_CS_HASH','KYTY_EXECUTE_CS_HASH','KYTY_STUB_CLEAR_IMAGES','KYTY_GPU_TIMESTAMPS','KYTY_SRT_LINEAR','KYTY_BUFGC_OWN_SHARE','KYTY_DEBUG_PANEL')) {
     $v = [Environment]::GetEnvironmentVariable($n)
     if ($v) { Write-Host ("  {0,-22} {1}" -f $n, $v) }
 }
 if ($Validate) { Write-Host '  --shader-validation    true' }
 Write-Host ''
 Write-Host 'Navigate into a fight, then let it run ~2 minutes for steady state.' -ForegroundColor Yellow
-Write-Host 'Expect ~5 fps in-fight. The round renders BLACK (occlusion CS skipped).'
+Write-Host 'Expect ~5 fps in-fight. The tonemapper exposure image is initialized automatically.'
 Write-Host ''
 Write-Host 'Median us/draw over the whole run:' -ForegroundColor Cyan
 Write-Host "  python `"$(Join-Path $PSScriptRoot 'frame_stats.py')`" `"$log`""

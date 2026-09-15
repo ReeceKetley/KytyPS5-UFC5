@@ -10,22 +10,23 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/dispatchInspector.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/renderer/debug.h"
-#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/sceneDrawDebug.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/frontend/translate/ProbeConfig.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
-#include "graphics/shader/recompiler/frontend/translate/ProbeConfig.h"
-#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
@@ -35,7 +36,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <unordered_set>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -46,11 +46,12 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
 constexpr uint64_t kUfcHangCsHash = 0xea0aceac518ec52dull;
-
+constexpr uint64_t kUfcTonemapperCsHash = 0x0c399ab0b1e7fa33ull;
 
 bool ParseHexU64(const char* text, uint64_t* out) {
 	if (text == nullptr || out == nullptr) {
@@ -77,16 +78,16 @@ bool ParseHexU64(const char* text, uint64_t* out) {
 bool EnvListContainsHash(const char* env_name, uint64_t hash) {
 	// getenv + parse once per env var; this is polled once per dispatch / shader compile.
 	struct ParsedList {
-		bool                          wildcard = false;
-		std::unordered_set<uint64_t>  hashes;
+		bool                         wildcard = false;
+		std::unordered_set<uint64_t> hashes;
 	};
-	static std::mutex                                    cache_mutex;
-	static std::unordered_map<std::string, ParsedList>   cache;
+	static std::mutex                                  cache_mutex;
+	static std::unordered_map<std::string, ParsedList> cache;
 
 	const ParsedList* list = nullptr;
 	{
 		std::scoped_lock lock {cache_mutex};
-		auto it = cache.find(env_name);
+		auto             it = cache.find(env_name);
 		if (it == cache.end()) {
 			ParsedList parsed;
 			if (const char* env = std::getenv(env_name); env != nullptr && env[0] != '\0') {
@@ -124,7 +125,147 @@ bool EnvListContainsHash(const char* env_name, uint64_t hash) {
 }
 
 bool ShouldSkipComputeHash(uint64_t hash) {
+	// KYTY_EXECUTE_CS_HASH forces real dispatch even when the hash is listed in
+	// KYTY_SKIP_CS_HASH. Experimental: keeps the stub path intact as the default.
+	if (EnvListContainsHash("KYTY_EXECUTE_CS_HASH", hash)) {
+		return false;
+	}
 	return EnvListContainsHash("KYTY_SKIP_CS_HASH", hash);
+}
+
+void RenderExecutor::LogComputeImageBindingIdentity(
+    uint64_t frame, uint64_t shader_hash, uint32_t slot,
+    const ShaderRecompiler::IR::ImageResource& resource, const TextureBinding& binding) {
+	auto& cache = m_context.GetTextureCache();
+	if (!binding.image_id) {
+		LOGF("CsImageIdentity: frame=%" PRIu64 " hash=0x%016" PRIx64
+		     " slot=%u addr=0x%016" PRIx64 " read=%d write=%d sampled=%d NO_IMAGE_ID\n",
+		     frame, shader_hash, slot, binding.desc.info.data.address, resource.read,
+		     resource.written,
+		     resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled);
+		return;
+	}
+	std::scoped_lock lock {cache.m_lock};
+	auto* image = cache.m_slot_images.try_get(binding.image_id);
+	if (image == nullptr) {
+		LOGF("CsImageIdentity: frame=%" PRIu64 " hash=0x%016" PRIx64
+		     " slot=%u addr=0x%016" PRIx64 " image_id=%u.%u MISSING_SLOT\n",
+		     frame, shader_hash, slot, binding.desc.info.data.address, binding.image_id.index,
+		     binding.image_id.generation);
+		return;
+	}
+	const auto view_it =
+	    std::ranges::find(image->views, binding.image_view, &CachedImageView::view);
+	const auto* view_info = view_it == image->views.end() ? nullptr : &view_it->info;
+	LOGF("CsImageIdentity: frame=%" PRIu64 " hash=0x%016" PRIx64
+	     " slot=%u read=%d write=%d sampled=%d guest_addr=0x%016" PRIx64
+	     " guest_bytes=0x%" PRIx64 " guest_fmt=%u guest_type=%u tile=%u "
+	     "desc_extent=%ux%ux%u desc_mip=%u+%u desc_layer=%u+%u desc_vk=%d "
+	     "image_id=%u.%u vk_image=0x%016" PRIx64 " vk_view=0x%016" PRIx64
+	     " host_type=%d host_extent=%ux%ux%u host_levels=%u host_layers=%u host_fmt=%d "
+	     "view_fmt=%d view_type=%d view_mip=%u+%u view_layer=%u+%u layout=%d "
+	     "cpu_dirty=%d gpu_mod=%d buf_mod=%d\n",
+	     frame, shader_hash, slot, resource.read, resource.written,
+	     resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled,
+	     binding.desc.info.data.address, binding.desc.info.data.size,
+	     static_cast<uint32_t>(binding.desc.info.guest_format),
+	     static_cast<uint32_t>(binding.desc.info.type),
+	     static_cast<uint32_t>(binding.desc.info.tile_mode), binding.desc.info.extent.width,
+	     binding.desc.info.extent.height, binding.desc.info.extent.depth,
+	     binding.desc.view_info.base_level, binding.desc.view_info.level_count,
+	     binding.desc.view_info.base_layer, binding.desc.view_info.layer_count,
+	     static_cast<int>(binding.desc.view_info.format), binding.image_id.index,
+	     binding.image_id.generation,
+	     reinterpret_cast<uintptr_t>(static_cast<VkImage>(image->backing.image)),
+	     reinterpret_cast<uintptr_t>(static_cast<VkImageView>(binding.image_view)),
+	     static_cast<int>(image->backing.image_type), image->backing.extent.width,
+	     image->backing.extent.height, image->backing.extent.depth, image->backing.mip_levels,
+	     image->backing.layers, static_cast<int>(image->backing.format),
+	     view_info ? static_cast<int>(view_info->format) : -1,
+	     view_info ? static_cast<int>(view_info->type) : -1,
+	     view_info ? view_info->base_level : 0, view_info ? view_info->level_count : 0,
+	     view_info ? view_info->base_layer : 0, view_info ? view_info->layer_count : 0,
+	     static_cast<int>(binding.layout), image->IsCpuDirty(), image->IsGpuModified(),
+	     image->IsBufferModified());
+}
+
+void RenderExecutor::LogComputeAliasPairs(uint64_t frame, uint64_t shader_hash,
+                                          const PreparedBindings& bindings) {
+	if (bindings.program == nullptr) {
+		return;
+	}
+	const auto& program = *bindings.program;
+	for (uint32_t i = 0; i < bindings.images.size(); ++i) {
+		for (uint32_t j = i + 1; j < bindings.images.size(); ++j) {
+			const auto& a = bindings.images[i];
+			const auto& b = bindings.images[j];
+			if (a.desc.info.data.address == 0 ||
+			    a.desc.info.data.address != b.desc.info.data.address) {
+				continue;
+			}
+			const bool same_id   = static_cast<bool>(a.image_id) && a.image_id == b.image_id;
+			const bool same_view = a.image_view == b.image_view && a.image_view != nullptr;
+			LOGF("CsAliasPair: frame=%" PRIu64 " hash=0x%016" PRIx64
+			     " addr=0x%016" PRIx64 " slotA=%u slotB=%u same_image_id=%d same_view=%d "
+			     "A_id=%u.%u B_id=%u.%u A_sampled=%d B_sampled=%d A_write=%d B_write=%d "
+			     "A_mip=%u+%u B_mip=%u+%u A_fmt=%d/%d B_fmt=%d/%d\n",
+			     frame, shader_hash, a.desc.info.data.address, i, j, same_id ? 1 : 0,
+			     same_view ? 1 : 0, a.image_id.index, a.image_id.generation, b.image_id.index,
+			     b.image_id.generation,
+			     program.info.images[i].resource_class ==
+			         ShaderRecompiler::IR::ImageResourceClass::Sampled,
+			     program.info.images[j].resource_class ==
+			         ShaderRecompiler::IR::ImageResourceClass::Sampled,
+			     program.info.images[i].written, program.info.images[j].written,
+			     a.desc.view_info.base_level, a.desc.view_info.level_count,
+			     b.desc.view_info.base_level, b.desc.view_info.level_count,
+			     static_cast<int>(a.desc.view_info.format),
+			     static_cast<int>(a.desc.info.pixel_format),
+			     static_cast<int>(b.desc.view_info.format),
+			     static_cast<int>(b.desc.info.pixel_format));
+		}
+	}
+}
+
+// UFC 5 binds a 1x1 R32 exposure image to its tonemapper without ever giving that image guest or
+// GPU ownership. Vulkan leaves a freshly-created image undefined, so the tonemapper can turn an
+// otherwise healthy HDR scene into a flat value and the temporal upscaler then amplifies it into
+// NaN history. Zero selects the shader's own neutral/fallback exposure path. Keep this narrowly
+// scoped to the measured shader, binding shape and genuinely uninitialized cache state; a real
+// producer, CPU upload or buffer alias always wins.
+bool RenderExecutor::InitializeUfcTonemapperExposure(CommandBuffer& command,
+                                                     const PreparedBindings& bindings,
+                                                     uint64_t shader_hash) {
+	constexpr uint32_t kExposureImage = 1;
+	if (shader_hash != kUfcTonemapperCsHash || bindings.program == nullptr ||
+	    bindings.program->info.images.size() <= kExposureImage ||
+	    bindings.images.size() <= kExposureImage) {
+		return false;
+	}
+	const auto& resource = bindings.program->info.images[kExposureImage];
+	const auto& binding  = bindings.images[kExposureImage];
+	if (!resource.read || resource.written || !binding.image_id) {
+		return false;
+	}
+
+	auto&            cache = m_context.GetTextureCache();
+	std::scoped_lock lock {cache.m_lock};
+	auto* image = cache.m_slot_images.try_get(binding.image_id);
+	if (image == nullptr || image->backing.image == nullptr || image->depth_id ||
+	    image->info.IsDepth() || image->backing.format != vk::Format::eR32Sfloat ||
+	    image->backing.extent.width != 1 || image->backing.extent.height != 1 ||
+	    image->backing.extent.depth != 1 || image->info.resources.levels != 1 ||
+	    image->backing.layers != 1 || image->IsGpuModified() || image->IsCpuDirty() ||
+	    image->IsBufferModified()) {
+		return false;
+	}
+
+	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	cache.ClearImage(command, binding.image_id, range, vk::ClearValue {});
+	LOGF("UfcTonemapper: initialized unowned exposure image addr=0x%016" PRIx64
+	     " image=%u.%u value=0\n",
+	     image->info.data.address, binding.image_id.index, binding.image_id.generation);
+	return true;
 }
 
 static bool TryParseEnvU32(const char* name, uint32_t& out) {
@@ -132,7 +273,7 @@ static bool TryParseEnvU32(const char* name, uint32_t& out) {
 	if (env == nullptr || env[0] == '\0') {
 		return false;
 	}
-	char*              end   = nullptr;
+	char*               end   = nullptr;
 	const unsigned long value = std::strtoul(env, &end, 0);
 	if (end == env || value > std::numeric_limits<uint32_t>::max()) {
 		return false;
@@ -176,9 +317,9 @@ static bool ReadGdsDwords(RenderContext& context, std::array<uint32_t, 8>& words
 	}
 	constexpr uint32_t kProbeDwords = 8;
 	const uint64_t     probe_bytes  = kProbeDwords * sizeof(uint32_t);
-	auto&              download     = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
-	auto&              scheduler    = context.GetCommandScheduler();
-	const auto [mapped, offset]     = download.Map(probe_bytes, 4);
+	auto&              download  = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
+	auto&              scheduler = context.GetCommandScheduler();
+	const auto [mapped, offset]  = download.Map(probe_bytes, 4);
 	if (mapped == nullptr) {
 		return false;
 	}
@@ -207,7 +348,7 @@ static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 }
 
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
-                                 GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
+                                GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
 		if (i == output_buffer) continue;
 		const auto source = DecodeNativeDescriptor<ShaderBufferResource>(sources[i]);
@@ -295,8 +436,9 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 }
 
 bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-                                                CommandBuffer& command, uint32_t group_x,
-                                                uint32_t group_y, uint32_t group_z, uint32_t mode) {
+                                                 CommandBuffer& command, uint32_t group_x,
+                                                 uint32_t group_y, uint32_t group_z,
+                                                 uint32_t mode) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
@@ -324,7 +466,8 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 			// final workgroup may extend beyond the selected image view.
 			if (threads == 0 || threads != fill.group_stride[axis] ||
 			    groups[axis] != (extents[axis] + threads - 1) / threads ||
-			    groups[axis] * threads > UINT32_MAX) return false;
+			    groups[axis] * threads > UINT32_MAX)
+				return false;
 		}
 		const auto  binding     = ResolveTexture(resource, resources.images[0]);
 		const auto& destination = binding.desc.info.data;
@@ -337,10 +480,11 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		    view.base_layer >= image.backing.layers || view.layer_count != extents[2] ||
 		    view.layer_count > image.backing.layers - view.base_layer ||
 		    std::max(1u, image.info.extent.width >> view.base_level) != extents[0] ||
-		    std::max(1u, image.info.extent.height >> view.base_level) != extents[1]) return false;
+		    std::max(1u, image.info.extent.height >> view.base_level) != extents[1])
+			return false;
 		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eStencil, view.base_level,
 		                                       1, view.base_layer, view.layer_count};
-		vk::ClearValue clear {};
+		vk::ClearValue                  clear {};
 		clear.depthStencil = vk::ClearDepthStencilValue {0.0f, fill.value};
 		cache.ClearImage(command, binding.image_id, range, clear);
 		return true;
@@ -431,14 +575,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& sh_regs = ctx.GetShaderRegisters();
 
 	ShaderComputeInputInfo input_info {};
-	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	const bool use_thread_dimensions      = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	if (use_thread_dimensions) {
-		input_info.dispatch_threads_num[0]    = thread_group_x;
-		input_info.dispatch_threads_num[1]    = thread_group_y;
-		input_info.dispatch_threads_num[2]    = thread_group_z;
+		input_info.dispatch_threads_num[0] = thread_group_x;
+		input_info.dispatch_threads_num[1] = thread_group_y;
+		input_info.dispatch_threads_num[2] = thread_group_z;
 	}
 
 	const uint32_t frame_num = static_cast<uint32_t>(m_context.DiagnosticFrameNum());
@@ -457,11 +601,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}();
 	if (ufc_ui_mask_fallback && !indirect && program.shader_hash == 0x5942a92ebef7b363ull &&
 	    !use_thread_dimensions && thread_group_x == 15 && thread_group_y == 135 &&
-	    thread_group_z == 1 && input_info.threads_num[0] == 32 &&
-	    input_info.threads_num[1] == 2 && input_info.threads_num[2] == 1 &&
-	    resources.buffers.size() == 3 && program.info.buffers.size() == 3 &&
-	    program.info.images.empty() && program.info.buffers[2].written &&
-	    !program.info.buffers[2].read) {
+	    thread_group_z == 1 && input_info.threads_num[0] == 32 && input_info.threads_num[1] == 2 &&
+	    input_info.threads_num[2] == 1 && resources.buffers.size() == 3 &&
+	    program.info.buffers.size() == 3 && program.info.images.empty() &&
+	    program.info.buffers[2].written && !program.info.buffers[2].read) {
 		const auto destination = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[2]);
 		if (destination.Base48() != 0 && (destination.Base48() & 3u) == 0 &&
 		    destination.Stride() == 4 && destination.NumRecords() == 4050 &&
@@ -469,8 +612,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			constexpr uint64_t byte_size = 4050 * sizeof(uint32_t);
 			buffer.EndRendering();
 			m_context.GetTextureCache().InvalidateMemoryFromGPU(destination.Base48(), byte_size);
-			auto [mask, offset] = m_context.GetBufferCache().ObtainBuffer(
-			    destination.Base48(), byte_size, true, true);
+			auto [mask, offset] = m_context.GetBufferCache().ObtainBuffer(destination.Base48(),
+			                                                              byte_size, true, true);
 			mask->Fill(offset, byte_size, UINT32_MAX);
 			static std::atomic<uint32_t> logged {0};
 			if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
@@ -485,8 +628,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
-	if (!indirect && TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
-	                                             thread_group_y, thread_group_z, mode)) {
+	if (!indirect && TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
+	                                             thread_group_z, mode)) {
 		ResetBindings();
 		return;
 	}
@@ -494,15 +637,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 		    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
 	    });
-	const bool                   has_sampler = !program.info.samplers.empty();
-	const bool                   fullscreen_cs =
+	const bool has_sampler = !program.info.samplers.empty();
+	const bool fullscreen_cs =
 	    !indirect && thread_group_x >= 200 && thread_group_y >= 100 && thread_group_z <= 1;
 	const uint64_t shader_hash = program.shader_hash;
-	bool           skip_cs     = ShouldSkipComputeHash(shader_hash);
+	// The scene allocation moves between runs. Learn its address from the one stable semantic
+	// edge in the frame graph: texture 0 of UFC 5's tonemapper is the pre-post HDR scene. The draw
+	// inspector and Ctrl+F11 presentation bypass then follow the correct target on the next frame.
+	if (shader_hash == 0x0c399ab0b1e7fa33ull && !resources.images.empty()) {
+		const auto scene = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[0]);
+		SceneDrawDebug::ObserveSceneTarget(scene.Base40());
+	}
+	bool skip_cs = ShouldSkipComputeHash(shader_hash);
 	std::shared_ptr<const ShaderRecompiler::Frontend::ProbeConfig> execution_probe;
-	bool     execute_probe_once    = false;
-	uint32_t execution_ordinal     = 0;
-	uint32_t execution_count_limit = 0;
+	bool                                                           execute_probe_once    = false;
+	uint32_t                                                       execution_ordinal     = 0;
+	uint32_t                                                       execution_count_limit = 0;
 	if (skip_cs) {
 		execution_probe = ShaderRecompiler::Frontend::GetProbeConfig();
 		if (execution_probe->execute_once && execution_probe->hash == shader_hash) {
@@ -525,9 +675,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 				    observed_generation == execution_probe->generation ? observed_count + 1u : 1u;
 				const uint64_t desired =
 				    (static_cast<uint64_t>(execution_probe->generation) << 32u) | claimed_count;
-				if (execution_state.compare_exchange_weak(observed, desired,
-				                                          std::memory_order_acq_rel,
-				                                          std::memory_order_acquire)) {
+				if (execution_state.compare_exchange_weak(
+				        observed, desired, std::memory_order_acq_rel, std::memory_order_acquire)) {
 					execute_probe_once = true;
 					execution_ordinal  = claimed_count;
 					break;
@@ -544,14 +693,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			}
 		}
 	}
-	const bool     watch_cs =
-	    shader_hash == kUfcHangCsHash || skip_cs ||
-	    EnvListContainsHash("KYTY_DUMP_SHADER_HASH", shader_hash);
+	const bool watch_cs = shader_hash == kUfcHangCsHash || skip_cs ||
+	                      EnvListContainsHash("KYTY_DUMP_SHADER_HASH", shader_hash);
 	static std::atomic<uint32_t> dispatch_log_count {0};
 	static std::atomic<uint32_t> buffer_content_count {0};
 	static std::atomic<uint32_t> fullscreen_log_count {0};
-	std::array<uint32_t, 8> gds_words {};
-	bool                    have_gds_words = false;
+	std::array<uint32_t, 8>      gds_words {};
+	bool                         have_gds_words = false;
 	if (shader_hash == kUfcHangCsHash && !skip_cs) {
 		have_gds_words = ReadGdsDwords(m_context, gds_words);
 		static std::atomic<uint32_t> gds_probe_count {0};
@@ -562,20 +710,20 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 				     shader_hash);
 			} else {
 				LOGF("GraphicsRenderDispatchDirect: GDS probe hash=0x%016" PRIx64
-				     " limit[0]=0x%08" PRIx32 " counter[1]=0x%08" PRIx32
-				     " dw=[0x%08" PRIx32 ",0x%08" PRIx32 ",0x%08" PRIx32 ",0x%08" PRIx32
-				     ",0x%08" PRIx32 ",0x%08" PRIx32 ",0x%08" PRIx32 ",0x%08" PRIx32 "]\n",
+				     " limit[0]=0x%08" PRIx32 " counter[1]=0x%08" PRIx32 " dw=[0x%08" PRIx32
+				     ",0x%08" PRIx32 ",0x%08" PRIx32 ",0x%08" PRIx32 ",0x%08" PRIx32 ",0x%08" PRIx32
+				     ",0x%08" PRIx32 ",0x%08" PRIx32 "]\n",
 				     shader_hash, gds_words[0], gds_words[1], gds_words[0], gds_words[1],
 				     gds_words[2], gds_words[3], gds_words[4], gds_words[5], gds_words[6],
 				     gds_words[7]);
 			}
 		}
 	}
-	uint32_t       work_limit     = have_gds_words ? gds_words[0] : 0;
-	const uint32_t original_limit = work_limit;
-	uint32_t       work_counter   = have_gds_words ? gds_words[1] : 0;
-	uint32_t       limit_cap      = 0;
-	const bool have_probe_limit = execute_probe_once && execution_probe->gds_limit_cap > 0;
+	uint32_t       work_limit       = have_gds_words ? gds_words[0] : 0;
+	const uint32_t original_limit   = work_limit;
+	uint32_t       work_counter     = have_gds_words ? gds_words[1] : 0;
+	uint32_t       limit_cap        = 0;
+	const bool     have_probe_limit = execute_probe_once && execution_probe->gds_limit_cap > 0;
 	if (have_probe_limit) {
 		limit_cap = execution_probe->gds_limit_cap;
 	}
@@ -592,11 +740,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (shader_hash == kUfcHangCsHash) {
 		TryParseEnvU32("KYTY_GDS_CHUNK", gds_chunk);
 	}
-	if (watch_cs || ((large_workgroup || has_sampler) &&
-	                 dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) ||
+	if (watch_cs ||
+	    ((large_workgroup || has_sampler) &&
+	     dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) ||
 	    (fullscreen_cs && fullscreen_log_count.fetch_add(1, std::memory_order_relaxed) < 32)) {
-		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
-		     " hash=0x%016" PRIx64 " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
+		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64 " hash=0x%016" PRIx64
+		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
 		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u%s\n",
 		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, shader_hash, thread_group_x,
 		     thread_group_y, thread_group_z, mode, input_info.threads_num[0],
@@ -611,8 +760,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// CS and for every skipped shader, and those ate the whole budget before the shader
 		// under study reached its first dispatch.
 		const bool dump_contents = DumpBufferDwords() > 0 &&
-		    EnvListContainsHash("KYTY_DUMP_SHADER_HASH", shader_hash) &&
-		    buffer_content_count.load(std::memory_order_relaxed) < 4;
+		                           EnvListContainsHash("KYTY_DUMP_SHADER_HASH", shader_hash) &&
+		                           buffer_content_count.load(std::memory_order_relaxed) < 4;
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& buffer = program.info.buffers[i];
 			const auto  r      = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
@@ -646,7 +795,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 				// A 1x1 texture has no tiling to unpick, so the guest dword IS the texel - as long
 				// as nothing on the GPU has written it since. Check the inspector coherency field
 				// before trusting this for a GPU-produced surface.
-				LOGF("  CS texture[%u] guest texel:%s\n", i, GuestDwordsText(r.Base40(), 1).c_str());
+				LOGF("  CS texture[%u] guest texel:%s\n", i,
+				     GuestDwordsText(r.Base40(), 1).c_str());
 			}
 		}
 		if (dump_contents) {
@@ -692,9 +842,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	uint32_t group_cap = execute_probe_once ? execution_probe->group_cap : 0;
 	if (!indirect && !skip_cs && shader_hash == kUfcHangCsHash &&
-	    ((execute_probe_once && group_cap > 0) || TryParseEnvU32("KYTY_GDS_GROUP_CAP", group_cap)) &&
-	    group_cap > 0 &&
-	    group_cap < thread_group_x) {
+	    ((execute_probe_once && group_cap > 0) ||
+	     TryParseEnvU32("KYTY_GDS_GROUP_CAP", group_cap)) &&
+	    group_cap > 0 && group_cap < thread_group_x) {
 		LOGF("GraphicsRenderDispatchDirect: GDS group cap hash=0x%016" PRIx64
 		     " groups_x=%u original=%u\n",
 		     shader_hash, group_cap, thread_group_x);
@@ -722,12 +872,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// work rather than an assumption. Per-frame totals, because the existing dispatch log is
 	// rate-limited and cannot give them.
 	{
-		const auto     wave = static_cast<uint32_t>(cs_regs.cs_regs.wave_size);
-		const uint64_t local =
-		    static_cast<uint64_t>(std::max(input_info.threads_num[0], 1u)) *
-		    std::max(input_info.threads_num[1], 1u) * std::max(input_info.threads_num[2], 1u);
-		const uint64_t invocations = static_cast<uint64_t>(thread_group_x) * thread_group_y *
-		                             thread_group_z * local;
+		const auto     wave  = static_cast<uint32_t>(cs_regs.cs_regs.wave_size);
+		const uint64_t local = static_cast<uint64_t>(std::max(input_info.threads_num[0], 1u)) *
+		                       std::max(input_info.threads_num[1], 1u) *
+		                       std::max(input_info.threads_num[2], 1u);
+		const uint64_t invocations =
+		    static_cast<uint64_t>(thread_group_x) * thread_group_y * thread_group_z * local;
 		static std::atomic<uint32_t> w64 {0}, w32 {0}, frames {0};
 		static std::atomic<uint64_t> inv64 {0}, inv32 {0};
 		static std::atomic<uint32_t> last_frame {UINT32_MAX};
@@ -740,8 +890,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		// 16 frames, not 64: in-fight frames take ~1s, so a 64-frame window is over a minute
 		// and the printed line lags a scene change badly enough to look like a stuck counter.
-		constexpr uint32_t kWindow = 16;
-		const auto previous = last_frame.exchange(frame_num, std::memory_order_relaxed);
+		constexpr uint32_t kWindow  = 16;
+		const auto         previous = last_frame.exchange(frame_num, std::memory_order_relaxed);
 		if (previous != frame_num && previous != UINT32_MAX &&
 		    (frames.fetch_add(1, std::memory_order_relaxed) % kWindow) == kWindow - 1) {
 			const auto d64   = w64.exchange(0);
@@ -764,12 +914,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// return made the operation invisible, which hid the most important edge in the UFC 5
 		// black-frame investigation.
 		InspectorOperation skipped_inspector_operation;
-		bool               skipped_inspector_capture = false;
-		bool               skipped_inspector_cap_in  = false;
-		bool               skipped_inspector_cap_out = false;
+		bool               skipped_inspector_capture  = false;
+		bool               skipped_inspector_cap_in   = false;
+		bool               skipped_inspector_cap_out  = false;
 		uint32_t           skipped_inspector_op_index = 0;
 		uint64_t           skipped_inspector_frame    = 0;
-		if (DispatchInspectorEnabled()) {
+		const bool         need_identity =
+		    shader_hash == kUfcHangCsHash || EnvListContainsHash("KYTY_CS_IDENTITY_HASH", shader_hash);
+		const bool         resolve_bindings = DispatchInspectorEnabled() || need_identity;
+		if (resolve_bindings) {
 			buffer.EndRendering();
 			auto bindings = PrepareBindings(input_info.stage);
 			FindBuffers(bindings);
@@ -778,32 +931,44 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			}
 			RebindBuffers(bindings);
 			RebindImages(bindings);
-
-			InspectorOperation operation;
-			operation.kind             = InspectorOperationKind::Dispatch;
-			operation.groups[0]        = thread_group_x;
-			operation.groups[1]        = thread_group_y;
-			operation.groups[2]        = thread_group_z;
-			operation.local[0]         = input_info.threads_num[0];
-			operation.local[1]         = input_info.threads_num[1];
-			operation.local[2]         = input_info.threads_num[2];
-			operation.indirect_address = indirect_args_addr;
-			operation.submit_id        = submit_id;
-			operation.submission_tick  = m_context.GetCommandScheduler().CurrentTick();
-			operation.stages.push_back(
-			    CaptureInspectorStage(bindings, m_context.GetTextureCache()));
-			skipped_inspector_frame = m_context.DiagnosticFrameNum();
-			skipped_inspector_op_index = PeekInspectorOperationIndex(skipped_inspector_frame);
-			skipped_inspector_capture =
-			    InspectorShouldCapture(operation, skipped_inspector_op_index,
-			                           &skipped_inspector_cap_in, &skipped_inspector_cap_out);
-			if (skipped_inspector_capture && skipped_inspector_cap_in) {
-				CaptureInspectorResources(buffer, m_context, operation,
-				                          skipped_inspector_op_index, skipped_inspector_frame, true,
-				                          false);
+			if (need_identity) {
+				static std::atomic<uint32_t> identity_logs {0};
+				if (identity_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+					for (uint32_t i = 0;
+					     i < bindings.images.size() && i < program.info.images.size(); ++i) {
+						LogComputeImageBindingIdentity(frame_num, shader_hash, i,
+						                               program.info.images[i], bindings.images[i]);
+					}
+					LogComputeAliasPairs(frame_num, shader_hash, bindings);
+				}
 			}
-			skipped_inspector_operation = operation;
-			RecordInspectorOperation(skipped_inspector_frame, std::move(operation));
+			if (DispatchInspectorEnabled()) {
+				InspectorOperation operation;
+				operation.kind             = InspectorOperationKind::Dispatch;
+				operation.groups[0]        = thread_group_x;
+				operation.groups[1]        = thread_group_y;
+				operation.groups[2]        = thread_group_z;
+				operation.local[0]         = input_info.threads_num[0];
+				operation.local[1]         = input_info.threads_num[1];
+				operation.local[2]         = input_info.threads_num[2];
+				operation.indirect_address = indirect_args_addr;
+				operation.submit_id        = submit_id;
+				operation.submission_tick  = m_context.GetCommandScheduler().CurrentTick();
+				operation.stages.push_back(
+				    CaptureInspectorStage(bindings, m_context.GetTextureCache()));
+				skipped_inspector_frame    = m_context.DiagnosticFrameNum();
+				skipped_inspector_op_index = PeekInspectorOperationIndex(skipped_inspector_frame);
+				skipped_inspector_capture =
+				    InspectorShouldCapture(operation, skipped_inspector_op_index,
+				                           &skipped_inspector_cap_in, &skipped_inspector_cap_out);
+				if (skipped_inspector_capture && skipped_inspector_cap_in) {
+					CaptureInspectorResources(buffer, m_context, operation,
+					                          skipped_inspector_op_index, skipped_inspector_frame,
+					                          true, false);
+				}
+				skipped_inspector_operation = operation;
+				RecordInspectorOperation(skipped_inspector_frame, std::move(operation));
+			}
 		}
 
 		// Experimental replacement: clear written images and leave buffers untouched.
@@ -811,13 +976,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// color and reads/writes packed data and linked entries in its buffers. This
 		// is not a proven "all visible" replacement for the complete shader.
 		for (uint32_t i = 0; i < program.info.buffers.size() && i < resources.buffers.size(); i++) {
-			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+			const auto descriptor =
+			    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 			const auto size = BufferDescriptorSize(descriptor);
 			if (TraceResourceAddress(descriptor.Base48(), size)) {
 				const auto& resource = program.info.buffers[i];
-				TraceResourceBinding(frame_num,
-				    fmt::format("skipped_hash=0x{:016x} buffer={} addr=0x{:x} bytes={} read={} write={}",
-				                shader_hash, i, descriptor.Base48(), size, resource.read, resource.written));
+				TraceResourceBinding(
+				    frame_num,
+				    fmt::format(
+				        "skipped_hash=0x{:016x} buffer={} addr=0x{:x} bytes={} read={} write={}",
+				        shader_hash, i, descriptor.Base48(), size, resource.read,
+				        resource.written));
 			}
 		}
 		// KYTY_STUB_CLEAR_BUFFERS=1: also zero the shader's written buffers, not just its
@@ -869,10 +1038,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			const char* env = std::getenv("KYTY_STUB_CLEAR_IMAGES");
 			return env == nullptr || std::strcmp(env, "0") != 0;
 		}();
-		auto&    cache        = buffer.GetContext().GetTextureCache();
-		uint32_t cleared      = 0;
-		for (uint32_t i = 0; clear_stub_images && i < program.info.images.size() &&
-		                     i < resources.images.size(); i++) {
+		auto&    cache   = buffer.GetContext().GetTextureCache();
+		uint32_t cleared = 0;
+		for (uint32_t i = 0;
+		     clear_stub_images && i < program.info.images.size() && i < resources.images.size();
+		     i++) {
 			const auto& resource = program.info.images[i];
 			if (!resource.written) {
 				continue;
@@ -887,7 +1057,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			    image.info.resources.levels == 0) {
 				continue;
 			}
-			const bool is_depth = image.info.IsDepth();
+			const bool                      is_depth = image.info.IsDepth();
 			const vk::ImageSubresourceRange range {
 			    is_depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor, 0,
 			    image.info.resources.levels, 0, image.backing.layers};
@@ -961,10 +1131,23 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		RebindBuffers(bindings);
 		RebindImages(bindings);
+		if (shader_hash == kUfcHangCsHash ||
+		    EnvListContainsHash("KYTY_CS_IDENTITY_HASH", shader_hash)) {
+			static std::atomic<uint32_t> exec_identity_logs {0};
+			if (exec_identity_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+				for (uint32_t i = 0; i < bindings.images.size() && i < program.info.images.size();
+				     ++i) {
+					LogComputeImageBindingIdentity(frame_num, shader_hash, i, program.info.images[i],
+					                               bindings.images[i]);
+				}
+				LogComputeAliasPairs(frame_num, shader_hash, bindings);
+			}
+		}
+		InitializeUfcTonemapperExposure(buffer, bindings, shader_hash);
 		InspectorOperation inspector_operation;
-		bool               inspector_capture = false;
-		bool               inspector_cap_in  = false;
-		bool               inspector_cap_out = false;
+		bool               inspector_capture  = false;
+		bool               inspector_cap_in   = false;
+		bool               inspector_cap_out  = false;
 		uint32_t           inspector_op_index = 0;
 		uint64_t           inspector_frame    = 0;
 		if (DispatchInspectorEnabled()) {
@@ -1001,8 +1184,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			// ordering while allowing the queue to execute asynchronously.
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
-		GpuTimestamps::Instance().BeginDispatch(
-		    vk_buffer, shader_hash, static_cast<uint32_t>(cs_regs.cs_regs.wave_size));
+		GpuTimestamps::Instance().BeginDispatch(vk_buffer, shader_hash,
+		                                        static_cast<uint32_t>(cs_regs.cs_regs.wave_size));
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		if (indirect) {
 			// The args were produced by GPU work whose ShaderAccessBarrier already makes
@@ -1037,14 +1220,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 	};
 
-	auto*      gds         = m_context.GetBufferCache().GetGdsBuffer();
+	auto* gds = m_context.GetBufferCache().GetGdsBuffer();
 	// Chunking rewrites the GDS work window per submit and needs host-side counts.
 	const bool chunk_queue = !indirect && shader_hash == kUfcHangCsHash && gds_chunk > 0 &&
 	                         work_limit > gds_chunk && gds != nullptr && gds->Handle() != nullptr;
 	if (chunk_queue) {
-		uint32_t start = work_counter < work_limit ? work_counter : 0;
-		const uint32_t chunk_count =
-		    (work_limit - start + gds_chunk - 1u) / gds_chunk;
+		uint32_t       start       = work_counter < work_limit ? work_counter : 0;
+		const uint32_t chunk_count = (work_limit - start + gds_chunk - 1u) / gds_chunk;
 		LOGF("GraphicsRenderDispatchDirect: GDS chunk begin hash=0x%016" PRIx64
 		     " items=%u start=%u chunk=%u submits=%u original_limit=%u\n",
 		     shader_hash, work_limit, start, gds_chunk, chunk_count, original_limit);
@@ -1076,7 +1258,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		if (limit_cap > 0) {
 			FillGdsDword(gds, 0, work_limit);
 		}
-		uint32_t sync_cap = 0;
+		uint32_t   sync_cap   = 0;
 		const bool probe_sync = execute_probe_once && execution_probe->sync_once;
 		const bool sync_capped_dispatch =
 		    !indirect && shader_hash == kUfcHangCsHash && limit_cap > 0 &&
