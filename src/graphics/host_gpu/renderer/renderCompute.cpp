@@ -497,11 +497,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		     " addr=0x%016" PRIx64 " mode=0x%08" PRIx32 "\n",
 		     shader_hash, sh_ctx.GetCs().cs_regs.data_addr, mode);
 	}
-	// wave32 lowering is now implemented in the shader compiler backend, so the
+		// wave32 lowering is now implemented in the shader compiler backend, so the
 	// captured UFC5 compute shader (the wave64/GDS dispatch from _Shaders/hang_cs)
 	// no longer TDRs on wave32-only hosts. Compute shaders run by default; only
 	// hashes explicitly listed via KYTY_SKIP_CS_HASH are skipped.
-	const bool skip_cs = ShouldSkipComputeHash(shader_hash);
+	// kUfcHangCsHash (0xea0aceac518ec52d) is the hair/muscle deformation CS with
+	// 6 nested loops driven by GDS PS5 hardware atomics that never satisfy exit
+	// conditions on PC. Skipping it is mandatory to enter a fight without GPU hang.
+	const bool skip_cs = shader_hash == kUfcHangCsHash || ShouldSkipComputeHash(shader_hash);
 	const bool watch_cs =
 	    shader_hash == kUfcHangCsHash || shader_hash == kUfcMenuHangCsHash || skip_cs ||
 	    EnvListContainsHash("KYTY_DUMP_SHADER_HASH", shader_hash);

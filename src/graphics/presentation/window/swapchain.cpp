@@ -76,6 +76,16 @@ bool PackedFormatsBitCompatible(vk::Format src, vk::Format dst) {
 	return src == dst || (IsPacked10Unorm(src) && IsPacked10Unorm(dst));
 }
 
+// HUD overlay (Problem 3: 3D scene hidden under cleared HUD)
+//
+// UFC 5 renders the live 3D fight scene into an image, then renders the HUD
+// (menus, stats, etc.) into a separate overlay image. The emulator's VideoOut
+// flip points at the HUD image, which is opaque, so only the HUD is visible
+// and the scene is lost.
+//
+// Phase 1 (implemented below in PrepareFrame): The consider() chain searches for the 3D scene image at kUfcSceneAddress (0x1162c00000), kUfcRealSceneAddress (0x116d300000) and kUfcFightAddress as a present source with allow_scanout_addr = true. When found, the scene replaces the HUD as 'source', so CopyFrom/Clear blits the actual 3D frame to the swapchain instead of the empty HUD buffer.
+// Phase 2 (alpha compositing): When both scene and HUD images are present, we want to blit the scene first, then composite the HUD on top with alpha blending (src*alpha + dst*(1-alpha)). This requires a dedicated graphics pipeline with a fullscreen quad + sampled texture.
+
 [[nodiscard]] uint8_t Unorm10To8(uint32_t value) {
 	return static_cast<uint8_t>((value * 255u + 511u) / 1023u);
 }
@@ -805,7 +815,9 @@ void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout
 }
 
 void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
-	command_buffer.EndRendering();
+	if (command_buffer.IsRenderingActive()) {
+		command_buffer.EndRendering();
+	}
 	auto command = command_buffer.Handle();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
@@ -845,7 +857,9 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 }
 
 void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColorValue& color) {
-	command_buffer.EndRendering();
+	if (command_buffer.IsRenderingActive()) {
+		command_buffer.EndRendering();
+	}
 	auto command = command_buffer.Handle();
 	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
 	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
@@ -864,11 +878,13 @@ public:
 	void                 Create();
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] Status AcquireNextImage();
-	[[nodiscard]] bool   PrepareSystemOverlay();
+		[[nodiscard]] bool   PrepareSystemOverlay();
 	void                 RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
 	                                           bool draw_system_overlay);
 	uint64_t             Submit(CommandScheduler& scheduler);
 	[[nodiscard]] Status Present();
+	void                 SetHudOverlay(Image* hud_image, vk::ImageView image_view,
+	                                   vk::Extent2D extent, vk::Format format);
 
 	[[nodiscard]] uint32_t ImageCount() const noexcept {
 		return static_cast<uint32_t>(m_images.size());
@@ -889,6 +905,13 @@ private:
 	std::unique_ptr<SystemOverlay> m_system_overlay;
 	uint32_t                    m_image_index = static_cast<uint32_t>(-1);
 	uint32_t                    m_frame_index = 0;
+	// HUD overlay (Problem 3): the game's 3D scene is behind a transparent HUD.
+	// When a scene source is found, the HUD scanout image is registered here so
+	// RecordPresentCommands can transition it and SystemOverlay can sample it.
+	Image*                      m_hud_image      = nullptr;
+	vk::ImageView               m_hud_image_view = nullptr;
+	vk::Extent2D                m_hud_extent     = {};
+	vk::Format                  m_hud_format     = vk::Format::eUndefined;
 };
 
 struct Presenter::Impl {
@@ -1152,10 +1175,31 @@ Swapchain::Status Swapchain::AcquireNextImage() {
 }
 
 bool Swapchain::PrepareSystemOverlay() {
+	bool overlay_created = false;
 	if (m_system_overlay == nullptr) {
 		m_system_overlay = std::make_unique<SystemOverlay>(m_window.graphic_ctx);
+		overlay_created = true;
 	}
-	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount());
+	// Forward any pending HUD overlay info to SystemOverlay. When the overlay
+	// was just created, the info must be set before PrepareFrame so ImGui_ImplVulkan_AddTexture
+	// can register the descriptor set. On subsequent frames, SystemOverlay::SetHudOverlay
+	// is idempotent (it no-ops when the view handle hasn't changed).
+	if (overlay_created && m_hud_image_view != nullptr) {
+		m_system_overlay->SetHudOverlay(m_hud_image_view, m_hud_extent, m_hud_format);
+	}
+		return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount());
+}
+
+void Swapchain::SetHudOverlay(Image* hud_image, vk::ImageView image_view,
+                              vk::Extent2D extent, vk::Format format) {
+	m_hud_image      = hud_image;
+	m_hud_image_view = image_view;
+	m_hud_extent     = extent;
+	m_hud_format     = format;
+	// If the overlay already exists, forward the update immediately (idempotent in SystemOverlay).
+	if (m_system_overlay != nullptr) {
+		m_system_overlay->SetHudOverlay(image_view, extent, format);
+	}
 }
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
@@ -1252,7 +1296,40 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	    draw_system_overlay ? vk::PipelineStageFlagBits::eColorAttachmentOutput
 	                        : vk::PipelineStageFlagBits::eAllCommands,
 	    vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1, &to_present);
-	if (draw_system_overlay && m_system_overlay != nullptr) {
+		if (draw_system_overlay && m_system_overlay != nullptr) {
+		// Transition the HUD overlay image to SHADER_READ_ONLY_OPTIMAL so ImGui's
+		// Vulkan backend can sample it as a texture. This barrier is recorded on
+		// the present command buffer (vk_command), not via Image::Transit (which
+		// would target the render-context's scheduler).
+		if (m_hud_image != nullptr && m_hud_image->backing.image != nullptr) {
+			auto&       hud_state = m_hud_image->backing.state;
+			const bool needs_transition =
+			    hud_state.layout != vk::ImageLayout::eShaderReadOnlyOptimal;
+			if (needs_transition) {
+				vk::ImageMemoryBarrier2 hud_barrier {};
+				hud_barrier.srcStageMask            = hud_state.pl_stage;
+				hud_barrier.srcAccessMask           = hud_state.access_mask;
+				hud_barrier.dstStageMask            = vk::PipelineStageFlagBits2::eFragmentShader;
+				hud_barrier.dstAccessMask           = vk::AccessFlagBits2::eShaderRead;
+				hud_barrier.oldLayout               = hud_state.layout;
+				hud_barrier.newLayout               = vk::ImageLayout::eShaderReadOnlyOptimal;
+				hud_barrier.srcQueueFamilyIndex     = VK_QUEUE_FAMILY_IGNORED;
+				hud_barrier.dstQueueFamilyIndex     = VK_QUEUE_FAMILY_IGNORED;
+				hud_barrier.image                   = m_hud_image->backing.image;
+				hud_barrier.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
+				hud_barrier.subresourceRange.baseMipLevel   = 0;
+				hud_barrier.subresourceRange.levelCount     = 1;
+				hud_barrier.subresourceRange.baseArrayLayer = 0;
+				hud_barrier.subresourceRange.layerCount     = 1;
+				vk::DependencyInfo hud_dep {};
+				hud_dep.imageMemoryBarrierCount = 1;
+				hud_dep.pImageMemoryBarriers    = &hud_barrier;
+				vk_command.pipelineBarrier2(hud_dep);
+				hud_state.layout      = vk::ImageLayout::eShaderReadOnlyOptimal;
+				hud_state.access_mask = vk::AccessFlagBits2::eShaderRead;
+				hud_state.pl_stage    = vk::PipelineStageFlagBits2::eFragmentShader;
+			}
+		}
 		m_system_overlay->Record(vk_command, m_image_views[m_image_index]);
 		to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
 		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
@@ -1428,12 +1505,17 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		return env == nullptr || std::strcmp(env, "0") != 0;
 	}();
 	if (hud_scanout) {
+		// allow_scanout_addr = true: when the game's VideoOut register points
+		// at the scene address (kUfcSceneAddress == info.data.address), the scene
+		// image would be rejected by the "!allow_scanout_addr" guard in consider()
+		// because candidate.info.data.address == info.data.address. The scene IS
+		// a valid present source, so allow it to pass through.
 		consider(cache.FindImageFromRange(kUfcRealSceneAddress, 0x0000000002000000ull, false),
-		         "real fight scene under HUD", false);
+		         "real fight scene under HUD", true);
 		consider(cache.FindImageFromRange(kUfcFightAddress, 0x0000000002000000ull, false),
-		         "fight scene under HUD", false);
+		         "fight scene under HUD", true);
 		consider(cache.FindImageFromRange(kUfcSceneAddress, 0x0000000000870000ull, false),
-		         "scene under HUD", false);
+		         "scene under HUD", true);
 	}
 	if (!native_scanout || hud_scanout || force_scene) {
 		consider(cache.FindImageFromRange(info.data.address, 0x0000000000870000ull, false),
@@ -1447,11 +1529,11 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 			// Per ledger.md, the real 1600x900 scene is at 0x116d300000, not at the
 			// recycled scratch address 0x1162c00000. Search the real scene first.
 			consider(cache.FindImageFromRange(kUfcRealSceneAddress, 0x0000000002000000ull, false),
-			         "real fight scene fallback", false);
+			         "real fight scene fallback", true);
 			consider(cache.FindImageFromRange(kUfcFightAddress, 0x0000000002000000ull, false),
-			         "fight scene fallback", false);
+			         "fight scene fallback", true);
 			consider(cache.FindImageFromRange(kUfcSceneAddress, 0x0000000000870000ull, false),
-			         "compositor color", false);
+			         "compositor color", true);
 		}
 	}
 	// Test hook: if the HUD was still selected as the source (no 3D scene found),
@@ -1463,6 +1545,27 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		if (suppress_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
 			LOGF("UFC 5 TEST: HUD scanout suppressed — no 3D scene found, clearing to marker\n");
 		}
+		}
+	// ── HUD overlay wiring (Problem 3) ──────────────────────────────
+	// When a 3D scene was found (source differs from the HUD scanout),
+	// register the HUD scanout image as an overlay so SystemOverlay can
+	// alpha-composite it on top of the scene via ImGui during
+	// RecordPresentCommands. If no scene was found or the HUD is
+	// suppressed, clear any previously registered overlay.
+	if (source != &scanout && !suppress_hud) {
+		ImageViewInfo hud_view_info {};
+		hud_view_info.format = scanout.backing.format;
+		hud_view_info.type   = vk::ImageViewType::e2D;
+		hud_view_info.aspect  = vk::ImageAspectFlagBits::eColor;
+		hud_view_info.usage   = vk::ImageUsageFlagBits::eSampled;
+		auto hud_view = scanout.FindView(hud_view_info);
+		m_impl->swapchain.SetHudOverlay(
+		    &scanout, hud_view,
+		    {scanout.backing.extent.width, scanout.backing.extent.height},
+		    scanout.backing.format);
+	} else {
+		// No scene found or HUD suppressed — clear any previous overlay
+		m_impl->swapchain.SetHudOverlay(nullptr, nullptr, {}, vk::Format::eUndefined);
 	}
 	auto& image = *source;
 	if (image.backing.format == vk::Format::eUndefined) {
