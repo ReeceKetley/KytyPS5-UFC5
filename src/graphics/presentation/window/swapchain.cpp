@@ -83,7 +83,7 @@ bool PackedFormatsBitCompatible(vk::Format src, vk::Format dst) {
 // flip points at the HUD image, which is opaque, so only the HUD is visible
 // and the scene is lost.
 //
-// Phase 1 (implemented below in PrepareFrame): The consider() chain searches for the 3D scene image at kUfcSceneAddress (0x1162c00000), kUfcRealSceneAddress (0x116d300000) and kUfcFightAddress as a present source with allow_scanout_addr = true. When found, the scene replaces the HUD as 'source', so CopyFrom/Clear blits the actual 3D frame to the swapchain instead of the empty HUD buffer.
+// Phase 1 (implemented below in PrepareFrame): The consider() chain searches for the 3D scene image at kUfcRealSceneAddress (0x116d300000), kUfcRealSceneAddress (0x116d300000) and kUfcFightAddress as a present source with allow_scanout_addr = true. When found, the scene replaces the HUD as 'source', so CopyFrom/Clear blits the actual 3D frame to the swapchain instead of the empty HUD buffer.
 // Phase 2 (alpha compositing): When both scene and HUD images are present, we want to blit the scene first, then composite the HUD on top with alpha blending (src*alpha + dst*(1-alpha)). This requires a dedicated graphics pipeline with a fullscreen quad + sampled texture.
 
 [[nodiscard]] uint8_t Unorm10To8(uint32_t value) {
@@ -440,7 +440,7 @@ void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCac
 	DumpGpuImage(command, renderer, scanout, "display", scanout_address, true);
 	DumpGpuImage(command, renderer, presented, "present", presented.info.data.address, true);
 	// Surfaces to dump. The hardcoded list below was captured from an earlier scene and misses
-	// the in-fight scene targets entirely: in a round the only two it finds are 0x1162c00000 at
+	// the in-fight scene targets entirely: in a round the only two it finds are 0x116d300000 at
 	// 400x225 and 0x1169860000 at 96x54, both empty, which made it look like nothing was drawn.
 	// The game actually renders at 1600x900 (14,409 occurrences in one in-fight log, vs a
 	// 1920x1080 present), so 400x225 is just a quarter-res buffer that happens to reuse that
@@ -589,12 +589,7 @@ struct Presenter::Frame {
 	VulkanImage image;
 	uint64_t    present_tick = 0;
 	bool        busy         = false;
-	bool        reusing_last = false;
-	// When a 3D scene (HDR composite format, addr == kUfcSceneAddress) is selected as
-	// the present source, this points at the scene Image so RecordPresentCommands can
-	// blit directly from the scene backing (format 122) into the swapchain with
-	// VK_FILTER_LINEAR, bypassing the intermediate frame.image. nullptr ⇒ use frame.image.
-	Image* scene_image = nullptr;
+		bool        reusing_last = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -712,7 +707,6 @@ public:
 		}
 		frame->busy         = false;
 		frame->reusing_last = false;
-		frame->scene_image  = nullptr;
 		if (make_last) {
 			m_last_frame = frame;
 		}
@@ -1216,6 +1210,22 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	// would block present and produce a black screen. Instead, transition with
 	// vkCmdPipelineBarrier2 using the real backing.layout/format already baked
 	// into the VkImage at creation time by Frame::Configure.
+	// Determine the correct image aspect from the source format.
+	// Depth/stencil formats require VK_IMAGE_ASPECT_DEPTH_BIT (or eStencil),
+	// not eColor — using eColor on a D32_SFLOAT source triggers a fatal
+	// validation error in vkCmdPipelineBarrier2.
+	const auto source_aspect = [](vk::Format format) {
+		if (format == vk::Format::eD32Sfloat || format == vk::Format::eD16Unorm ||
+		    format == vk::Format::eD32SfloatS8Uint) {
+			return vk::ImageAspectFlagBits::eDepth;
+		}
+		if (format == vk::Format::eD24UnormS8Uint) {
+			return vk::ImageAspectFlagBits::eDepth;
+		}
+		return vk::ImageAspectFlagBits::eColor;
+	};
+	const auto src_aspect = source_aspect(source.format);
+
 	auto vk_command = command.Handle();
 	if (source.state.layout != vk::ImageLayout::eTransferSrcOptimal) {
 		vk::ImageMemoryBarrier2 src_barrier {};
@@ -1228,7 +1238,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 		src_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		src_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		src_barrier.image             = source.image;
-		src_barrier.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
+		src_barrier.subresourceRange.aspectMask     = src_aspect;
 		src_barrier.subresourceRange.baseMipLevel   = 0;
 		src_barrier.subresourceRange.levelCount     = 1;
 		src_barrier.subresourceRange.baseArrayLayer = 0;
@@ -1262,7 +1272,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	                           nullptr, 0, nullptr, 1, &to_transfer);
 
 	vk::ImageBlit region {};
-	region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
+	region.srcSubresource.aspectMask     = src_aspect;
 	region.srcSubresource.mipLevel       = 0;
 	region.srcSubresource.baseArrayLayer = 0;
 	region.srcSubresource.layerCount     = 1;
@@ -1405,9 +1415,13 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 
 	auto&  cache  = m_impl->renderer.GetTextureCache();
 	Image* source = &scanout;
-	constexpr uint64_t kUfcFightAddress = 0x0000001168360000ull;
-	constexpr uint64_t kUfcSceneAddress = 0x0000001162c00000ull;
+	constexpr uint64_t kUfcFightAddress     = 0x0000001168360000ull;
 	constexpr uint64_t kUfcRealSceneAddress = 0x000000116d300000ull;
+	// NOTE: kUfcSceneAddress (0x1162c00000) intentionally REMOVED.
+	// Log line 787 shows fmt=22 (D32_SFLOAT) at that address — it is a depth
+	// buffer, not a colour scene. Presenting it with eColor aspect crashes
+	// vkCmdPipelineBarrier2. The true HDR colour scenes are at the addresses
+	// below (see ledger.md).
 	static std::atomic<uint32_t> ufc_present_logs = 0;
 	// Composite / HDR formats that indicate a final 3D or compositor colour
 	// target rather than a raw RGBA8 HUD layer. These always take priority
@@ -1420,20 +1434,32 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	// scene is the actual frame content (fighters, octagon, arena), while the
 	// HUD layer is transparent and only carries the 2D interface. When the
 	// game registers an SDR scanout (attribute=58), the backing scene at
-	// kUfcSceneAddress (0x1162c00000) or kUfcRealSceneAddress (0x116d300000)
+	// kUfcRealSceneAddress (0x116d300000) or kUfcFightAddress (0x1168360000)
 	// is the true present source. kUfcRealSceneAddress is searched first in
 	// the consider() chain, so "keep the first scene" preserves that ranking.
 	const auto is_scene_address = [](uint64_t addr) {
-		return addr == kUfcSceneAddress || addr == kUfcRealSceneAddress ||
-		       addr == kUfcFightAddress;
+		return addr == kUfcRealSceneAddress || addr == kUfcFightAddress;
 	};
 
+		// Ни при каких условиях не выбирать буфер глубины для презентации!
+		const auto is_depth_format = [](vk::Format format) {
+		return format == vk::Format::eD32Sfloat ||
+		       format == vk::Format::eD16Unorm ||
+		       format == vk::Format::eD24UnormS8Uint ||
+		       format == vk::Format::eD32SfloatS8Uint;
+	};
 	const auto consider = [&](ImageId id, const char* tag, bool allow_scanout_addr) {
 		if (!id) {
 			return;
 		}
 		auto& candidate = cache.GetImage(id);
 		if (&candidate == &scanout) {
+			return;
+		}
+		// Depth/stencil buffers must NEVER be presented as color sources —
+		// doing so triggers VK_VALIDATION_ERROR in vkCmdPipelineBarrier2
+		// (depth format + eColor aspect mismatch).
+		if (is_depth_format(candidate.backing.format)) {
 			return;
 		}
 		if (!allow_scanout_addr && (candidate.info.data.address == info.data.address ||
@@ -1512,7 +1538,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	}();
 	if (hud_scanout) {
 		// allow_scanout_addr = true: when the game's VideoOut register points
-		// at the scene address (kUfcSceneAddress == info.data.address), the scene
+		// at the scene address (kUfcRealSceneAddress == info.data.address), the scene
 		// image would be rejected by the "!allow_scanout_addr" guard in consider()
 		// because candidate.info.data.address == info.data.address. The scene IS
 		// a valid present source, so allow it to pass through.
@@ -1520,8 +1546,6 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		         "real fight scene under HUD", true);
 		consider(cache.FindImageFromRange(kUfcFightAddress, 0x0000000002000000ull, false),
 		         "fight scene under HUD", true);
-		consider(cache.FindImageFromRange(kUfcSceneAddress, 0x0000000000870000ull, false),
-		         "scene under HUD", true);
 	}
 	if (!native_scanout || hud_scanout || force_scene) {
 		consider(cache.FindImageFromRange(info.data.address, 0x0000000000870000ull, false),
@@ -1533,13 +1557,11 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 			// descriptor's tile mode does not match the one the scene target was rendered
 			// with), the game's own scene target is the most recent complete frame.
 			// Per ledger.md, the real 1600x900 scene is at 0x116d300000, not at the
-			// recycled scratch address 0x1162c00000. Search the real scene first.
+			// recycled scratch address 0x116d300000. Search the real scene first.
 			consider(cache.FindImageFromRange(kUfcRealSceneAddress, 0x0000000002000000ull, false),
 			         "real fight scene fallback", true);
 			consider(cache.FindImageFromRange(kUfcFightAddress, 0x0000000002000000ull, false),
 			         "fight scene fallback", true);
-			consider(cache.FindImageFromRange(kUfcSceneAddress, 0x0000000000870000ull, false),
-			         "compositor color", true);
 		}
 	}
 	// Test hook: if the HUD was still selected as the source (no 3D scene found),
@@ -1605,28 +1627,19 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 			     PackedFormatsBitCompatible(info.pixel_format, image.backing.format) ? "copy" : "blit");
 		}
 	}
-	// ── Direct 3D scene blit (Problem 2) ──────────────────────────────
-	// When a 3D scene was selected as the source (source != &scanout), blit the
-	// scene image directly into the swapchain in RecordPresentCommands with
-	// VK_FILTER_LINEAR, bypassing the intermediate frame.image. This avoids a
-	// double-blit (scene→frame.image→swapchain) and guarantees the HDR scene
-	// (format 122, B10G11R11) reaches the 8-bit swapchain through a single
-	// hardware colour-space-converting vkCmdBlitImage.
-	frame->scene_image = (source != &scanout) ? source : nullptr;
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	{
 		static std::atomic<uint32_t> present_logs = 0;
 		if (present_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
 			LOGF("VideoOut present: addr=0x%016" PRIx64 " attr=%d backing=%d gpu_mod=%d cpu=%d "
-			     "maybe=%d buf=%d rt=%d storage=%d vo=%d extent=%ux%u direct=%d\n",
+			     "maybe=%d buf=%d rt=%d storage=%d vo=%d extent=%ux%u\n",
 			     info.data.address, static_cast<int>(info.pixel_format),
 			     static_cast<int>(image.backing.format), image.IsGpuModified() ? 1 : 0,
 			     image.IsDefinitelyCpuDirty() ? 1 : 0, image.IsMaybeCpuDirty() ? 1 : 0,
 			     image.IsBufferModified() ? 1 : 0, image.usage.render_target ? 1 : 0,
 			     image.usage.storage ? 1 : 0, image.usage.video_out ? 1 : 0,
-			     image.backing.extent.width, image.backing.extent.height,
-			     frame->scene_image != nullptr ? 1 : 0);
+			     image.backing.extent.width, image.backing.extent.height);
 		}
 	}
 	if (suppress_hud || !image.IsGpuModified()) {
@@ -1635,7 +1648,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		marker.float32[2] = 1.0f;
 		marker.float32[3] = 1.0f;
 		frame->Clear(buffer, marker);
-	} else if (frame->scene_image == nullptr) {
+	} else {
 		// No direct scene path: copy the (HUD / fallback) source into frame.image.
 		frame->CopyFrom(buffer, image);
 	}
@@ -1699,11 +1712,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 				Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 				auto&             command          = m_impl->present_scheduler.BeginCommand();
 				const bool        draw_system_overlay = swapchain.PrepareSystemOverlay();
-				// Direct 3D scene blit (Problem 2): blit scene backing (HDR 122) straight
-				// into the swapchain with VK_FILTER_LINEAR, bypassing frame.image.
-				auto&             present_source       =
-				    (frame.scene_image != nullptr) ? frame.scene_image->backing : frame.image;
-				swapchain.RecordPresentCommands(command, present_source, draw_system_overlay);
+				swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
 				frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 			}
 			status = swapchain.Present();
