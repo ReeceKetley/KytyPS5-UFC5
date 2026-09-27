@@ -590,6 +590,11 @@ struct Presenter::Frame {
 	uint64_t    present_tick = 0;
 	bool        busy         = false;
 	bool        reusing_last = false;
+	// When a 3D scene (HDR composite format, addr == kUfcSceneAddress) is selected as
+	// the present source, this points at the scene Image so RecordPresentCommands can
+	// blit directly from the scene backing (format 122) into the swapchain with
+	// VK_FILTER_LINEAR, bypassing the intermediate frame.image. nullptr ⇒ use frame.image.
+	Image* scene_image = nullptr;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -707,6 +712,7 @@ public:
 		}
 		frame->busy         = false;
 		frame->reusing_last = false;
+		frame->scene_image  = nullptr;
 		if (make_last) {
 			m_last_frame = frame;
 		}
@@ -1599,19 +1605,28 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 			     PackedFormatsBitCompatible(info.pixel_format, image.backing.format) ? "copy" : "blit");
 		}
 	}
+	// ── Direct 3D scene blit (Problem 2) ──────────────────────────────
+	// When a 3D scene was selected as the source (source != &scanout), blit the
+	// scene image directly into the swapchain in RecordPresentCommands with
+	// VK_FILTER_LINEAR, bypassing the intermediate frame.image. This avoids a
+	// double-blit (scene→frame.image→swapchain) and guarantees the HDR scene
+	// (format 122, B10G11R11) reaches the 8-bit swapchain through a single
+	// hardware colour-space-converting vkCmdBlitImage.
+	frame->scene_image = (source != &scanout) ? source : nullptr;
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	{
 		static std::atomic<uint32_t> present_logs = 0;
 		if (present_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
 			LOGF("VideoOut present: addr=0x%016" PRIx64 " attr=%d backing=%d gpu_mod=%d cpu=%d "
-			     "maybe=%d buf=%d rt=%d storage=%d vo=%d extent=%ux%u\n",
+			     "maybe=%d buf=%d rt=%d storage=%d vo=%d extent=%ux%u direct=%d\n",
 			     info.data.address, static_cast<int>(info.pixel_format),
 			     static_cast<int>(image.backing.format), image.IsGpuModified() ? 1 : 0,
 			     image.IsDefinitelyCpuDirty() ? 1 : 0, image.IsMaybeCpuDirty() ? 1 : 0,
 			     image.IsBufferModified() ? 1 : 0, image.usage.render_target ? 1 : 0,
 			     image.usage.storage ? 1 : 0, image.usage.video_out ? 1 : 0,
-			     image.backing.extent.width, image.backing.extent.height);
+			     image.backing.extent.width, image.backing.extent.height,
+			     frame->scene_image != nullptr ? 1 : 0);
 		}
 	}
 	if (suppress_hud || !image.IsGpuModified()) {
@@ -1620,7 +1635,8 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		marker.float32[2] = 1.0f;
 		marker.float32[3] = 1.0f;
 		frame->Clear(buffer, marker);
-	} else {
+	} else if (frame->scene_image == nullptr) {
+		// No direct scene path: copy the (HUD / fallback) source into frame.image.
 		frame->CopyFrom(buffer, image);
 	}
 	DumpUfcSurfaces(buffer, m_impl->renderer, cache, scanout, image, info.data.address);
@@ -1683,7 +1699,11 @@ void Presenter::Present(Frame& frame, bool reuse) {
 				Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 				auto&             command          = m_impl->present_scheduler.BeginCommand();
 				const bool        draw_system_overlay = swapchain.PrepareSystemOverlay();
-				swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
+				// Direct 3D scene blit (Problem 2): blit scene backing (HDR 122) straight
+				// into the swapchain with VK_FILTER_LINEAR, bypassing frame.image.
+				auto&             present_source       =
+				    (frame.scene_image != nullptr) ? frame.scene_image->backing : frame.image;
+				swapchain.RecordPresentCommands(command, present_source, draw_system_overlay);
 				frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 			}
 			status = swapchain.Present();
