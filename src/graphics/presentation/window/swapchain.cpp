@@ -1448,6 +1448,21 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		       format == vk::Format::eD24UnormS8Uint ||
 		       format == vk::Format::eD32SfloatS8Uint;
 	};
+	const auto is_color_format = [](vk::Format format) {
+		switch (format) {
+			case vk::Format::eR8G8B8A8Unorm:
+			case vk::Format::eR8G8B8A8Srgb:
+			case vk::Format::eB8G8R8A8Unorm:
+			case vk::Format::eB8G8R8A8Srgb:
+			case vk::Format::eA2B10G10R10UnormPack32:
+			case vk::Format::eA2R10G10B10UnormPack32:
+			case vk::Format::eB10G11R11UfloatPack32:
+			case vk::Format::eR16G16B16A16Sfloat:
+			case vk::Format::eR16G16B16A16Unorm:
+			case vk::Format::eR32G32B32A32Sfloat: return true;
+			default: return false;
+		}
+	};
 	const auto consider = [&](ImageId id, const char* tag, bool allow_scanout_addr) {
 		if (!id) {
 			return;
@@ -1459,7 +1474,8 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		// Depth/stencil buffers must NEVER be presented as color sources —
 		// doing so triggers VK_VALIDATION_ERROR in vkCmdPipelineBarrier2
 		// (depth format + eColor aspect mismatch).
-		if (is_depth_format(candidate.backing.format)) {
+		if (candidate.info.IsDepth() || candidate.usage.depth_target ||
+		    is_depth_format(candidate.backing.format) || !is_color_format(candidate.backing.format)) {
 			return;
 		}
 		if (!allow_scanout_addr && (candidate.info.data.address == info.data.address ||

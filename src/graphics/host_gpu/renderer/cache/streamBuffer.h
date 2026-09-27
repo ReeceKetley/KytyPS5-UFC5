@@ -10,8 +10,7 @@
 #include <span>
 #include <utility>
 #include <vector>
-
-VK_DEFINE_HANDLE(VmaAllocation)
+#include <vk_mem_alloc.h>
 
 namespace Libs::Graphics {
 
@@ -56,11 +55,8 @@ public:
 	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept;
 	void               IncreaseStreamScore(int score) noexcept { stream_score += score; }
 	[[nodiscard]] int  StreamScore() const noexcept { return stream_score; }
-	// Marks this buffer as pending deferred destruction so that ~Buffer()
-	// skips the immediate vmaDestroyBuffer call. The VkBuffer/VmaAllocation
-	// pair is extracted and queued for physical destruction only after the
-	// GPU has finished all submissions that reference it (see BufferCache
-	// m_deferred_buffers_to_destroy + DrainDeferredBufferDestroys).
+	// Marks this buffer as already queued by an owning cache.  The destructor
+	// otherwise submits the pair to CommandScheduler's global deferred queue.
 	void               SetDeferredDestroy() noexcept { m_deferred_destroy = true; }
 	void               Write(uint64_t offset, const void* source, uint64_t size);
 	void               Flush(uint64_t offset, uint64_t size);

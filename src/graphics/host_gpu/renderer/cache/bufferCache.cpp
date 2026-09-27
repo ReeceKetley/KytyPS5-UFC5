@@ -124,33 +124,13 @@ void BufferCache::DrainDeferredReadbacks(bool force) {
 }
 
 void BufferCache::QueueDeferredBufferDestroy(vk::Buffer buffer, VmaAllocation allocation) {
-	if (buffer != nullptr) {
-		m_deferred_buffers_to_destroy.push_back(
-		    {buffer, allocation, m_scheduler.CurrentTick()});
-	}
+	m_scheduler.QueueDeferredBufferDestroy(buffer, allocation);
 }
 
 void BufferCache::DrainDeferredBufferDestroys() {
-	if (m_deferred_buffers_to_destroy.empty()) {
-		return;
-	}
-	std::vector<DeferredBuffer> still_pending;
-	for (auto& entry: m_deferred_buffers_to_destroy) {
-		// Physical destruction requires a 2-frame safety margin: the submitting
-		// tick may still be executing command buffers that reference the buffer
-		// (vkCmdDraw / vkCmdBindVertexBuffers). Destroying at submission_tick or
-		// submission_tick+1 risks an MMU page fault on in-flight draws -> DeviceLost.
-		// Only vmaDestroyBuffer once the GPU has retired the tick with at least 2
-		// frames of slack (tick + 2).
-		if (!m_scheduler.IsFree(entry.submission_tick + 2)) {
-			still_pending.push_back(std::move(entry));
-			continue;
-		}
-		if (entry.buffer != nullptr) {
-			vmaDestroyBuffer(m_graphics.allocator, entry.buffer, entry.allocation);
-		}
-	}
-	m_deferred_buffers_to_destroy = std::move(still_pending);
+	// Called by the resource GC at the frame boundary.  The scheduler owns the
+	// queue so scratch buffers and cache buffers obey the same two-tick margin.
+	m_scheduler.DrainDeferredBufferDestroys();
 }
 
 void BufferCache::EnsureCurrentForCpu(uint64_t vaddr, uint64_t size) {
@@ -238,10 +218,9 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	if (buffer == nullptr || buffer->is_deleted) {
 		return;
 	}
-	// Extract the VkBuffer/VmaAllocation before destroying the Buffer object.
-	// ~Buffer() will skip vmaDestroyBuffer because m_deferred_destroy is set —
-	// physical destruction is deferred until the GPU tick that may still
-	// reference the buffer has completed (see DrainDeferredBufferDestroys).
+	// Extract the VkBuffer/VmaAllocation before retiring the Buffer object.
+	// ~Buffer() skips the pair because this cache has already queued it in the
+	// scheduler-owned global deferred-destruction queue.
 	buffer->is_deleted = true;
 	buffer->SetDeferredDestroy();
 	QueueDeferredBufferDestroy(buffer->Handle(), buffer->Allocation());
@@ -254,8 +233,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	// when the GPU executes them. Destroying at submission_tick or tick+1 causes an
 	// MMU page fault on in-flight draws -> vkQueueSubmit returns ErrorDeviceLost (-4).
 	// Physical destruction is deferred via QueueDeferredBufferDestroy, which records
-	// submission_tick = CurrentTick(); DrainDeferredBufferDestroys() only frees when
-	// the GPU has retired submission_tick + 2 (a 2-frame safety margin). The single
+	// the current scheduler tick; the global queue only frees at tick + 2. The
 	// per-frame drain is invoked at the frame boundary in RunGarbageCollector(),
 	// after the frame's command buffers have been submitted.
 	if (m_scheduler.Active()) {
@@ -1284,16 +1262,15 @@ void BufferCache::RunGarbageCollector() {
 		buffer.is_deleted = true;
 		buffer.SetDeferredDestroy();
 		// Extract the VkBuffer/VmaAllocation for deferred destruction. ~Buffer() will
-		// skip vmaDestroyBuffer because m_deferred_destroy is set — the physical
-		// vmaDestroyBuffer is deferred until the GPU tick that may still reference
-		// these buffers (from DownloadBufferMemory's GPU->staging copies recorded
-		// into the still-recording command buffer) has completed.
+		// skip the pair because it is already owned by the scheduler queue; physical
+		// destruction waits until the GPU tick that may still reference these buffers
+		// (including DownloadBufferMemory copies) has completed.
 		QueueDeferredBufferDestroy(buffer.Handle(), buffer.Allocation());
 		Unregister(id);
 		// NOTE: DrainDeferredBufferDestroys() is not called here — the same
 		// mid-frame premature-drain hazard applies (see DeleteBuffer). The deferred
-		// vmaDestroyBuffer is scheduled via QueueDeferredBufferDestroy (tick + 2
-		// margin); the per-frame drain handles physical destruction.
+		// the scheduler queue (tick + 2 margin); the per-frame drain handles physical
+		// destruction.
 		if (m_scheduler.Active()) {
 			m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
 		} else {

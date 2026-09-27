@@ -106,9 +106,10 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 }
 
 void TileManager::DeferDestroy(Scratch scratch) {
-	auto allocator = m_graphics.allocator;
-	m_scheduler.DeferOperation(
-	    [allocator, scratch] { vmaDestroyBuffer(allocator, scratch.buffer, scratch.allocation); });
+	// Tile conversion scratch buffers are ordinary GPU resources.  Do not release
+	// them from a completion callback: the command buffer may still contain later
+	// copy/draw uses of the same buffer.  Route them through the global queue.
+	m_scheduler.QueueDeferredBufferDestroy(scratch.buffer, scratch.allocation);
 }
 
 void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,

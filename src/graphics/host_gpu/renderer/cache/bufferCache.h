@@ -48,11 +48,8 @@ public:
 	// Apply 1-frame-latency staging->guest writebacks whose GPU tick has retired
 	// (force = wait + apply all). Must be called before a guest range is unmapped.
 	void                   DrainDeferredReadbacks(bool force);
-	// Deferred VkBuffer destruction: queues a VkBuffer + VmaAllocation pair for
-	// physical destruction via vmaDestroyBuffer, but only once the GPU tick that
-	// was active when the buffer was retired has completed. This prevents
-	// use-after-free where vkCmdDraw/vkCmdBindVertexBuffers references buffers
-	// destroyed mid-frame (UFC 5 fighter-loading crash -> DeviceLost).
+	// Compatibility wrappers around CommandScheduler's global deferred buffer
+	// destruction queue.  All VkBuffer/VmaAllocation pairs share one owner.
 	void                   QueueDeferredBufferDestroy(vk::Buffer buffer, VmaAllocation allocation);
 	void                   DrainDeferredBufferDestroys();
 	// Force [vaddr,size) fully current for an immediate CPU read (indirect draw /
@@ -154,18 +151,6 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	std::vector<DeferredReadback>                     m_deferred_readbacks;
-	// Deferred VkBuffer destruction queue. Buffers are enqueued here with the
-	// GPU tick they were retired at, and physically destroyed via vmaDestroyBuffer
-	// only once master.IsFree(tick) confirms the GPU has finished referencing them.
-	// This prevents use-after-free when the GC or DeleteBuffer retires a buffer
-	// whose VkBuffer is still bound to a command buffer that has been submitted
-	// but not yet completed.
-	struct DeferredBuffer {
-		vk::Buffer    buffer;
-		VmaAllocation allocation;
-		uint64_t      submission_tick;
-	};
-	std::vector<DeferredBuffer>                     m_deferred_buffers_to_destroy;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
