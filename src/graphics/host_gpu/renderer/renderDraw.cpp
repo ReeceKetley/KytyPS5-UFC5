@@ -704,6 +704,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
 		auto& attachment        = state.color_attachments[i];
 		attachment.image_view   = image_view;
+		attachment.extent       = {std::max(image.backing.extent.width >> view.base_level, 1u),
+		                           std::max(image.backing.extent.height >> view.base_level, 1u)};
 		attachment.image_layout = layout;
 	}
 	if (depth.image_id) {
@@ -779,6 +781,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;
 		attachment.image_view     = image_view;
+		attachment.extent         = {std::max(image.backing.extent.width >> view.base_level, 1u),
+		                             std::max(image.backing.extent.height >> view.base_level, 1u)};
 		attachment.image_layout   = layout;
 		attachment.clear_value[0] = std::bit_cast<uint32_t>(depth.depth_clear_value);
 		attachment.clear_value[1] = depth.stencil_clear_value;
