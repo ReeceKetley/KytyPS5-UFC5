@@ -818,14 +818,26 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	if (command_buffer.IsRenderingActive()) {
 		command_buffer.EndRendering();
 	}
+	if (source.backing.image_type != vk::ImageType::e2D || image.image_type != vk::ImageType::e2D ||
+	    source.backing.mip_levels == 0 || image.mip_levels == 0 ||
+	    source.backing.extent.depth != 1 || image.extent.depth != 1 ||
+	    source.backing.layers == 0 || image.layers == 0) {
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "Presenter: skipping invalid vkCmdCopyImage source/destination geometry\n");
+		return;
+	}
+	const auto width  = std::min(source.backing.extent.width, image.extent.width);
+	const auto height = std::min(source.backing.extent.height, image.extent.height);
+	const auto layers = std::min(source.backing.layers, image.layers);
+	if (width == 0 || height == 0 || layers == 0) {
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "Presenter: skipping empty vkCmdCopyImage region\n");
+		return;
+	}
 	auto command = command_buffer.Handle();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
-	const auto width  = std::min(source.backing.extent.width, image.extent.width);
-	const auto height = std::min(source.backing.extent.height, image.extent.height);
-	const auto layers = std::min(source.backing.layers, image.layers);
-	EXIT_IF(layers == 0);
 	// Packed 10-bit VideoOut is an interpretation of the guest bits, regardless of
 	// which compatible storage view/backing wrote them. A blit converts colours and
 	// would undo that interpretation. Vulkan permits a bit copy between this pair.

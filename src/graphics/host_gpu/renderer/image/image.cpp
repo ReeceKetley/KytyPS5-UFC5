@@ -317,35 +317,117 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	command.pipelineBarrier2(dependency);
 }
 
-std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
-                                                        const Image& destination, uint32_t depth) {
-	const auto source_type        = source.backing.image_type;
-	const auto destination_type   = destination.backing.image_type;
-	uint32_t   source_layers      = source.backing.layers;
-	uint32_t   destination_layers = destination.backing.layers;
-	if (source_type == vk::ImageType::e3D) {
-		source_layers = 1;
+namespace {
+
+bool SanitizeCopyRegion(const VulkanImage& source, const VulkanImage& destination,
+                        vk::ImageCopy& region, const char* operation) {
+	const auto warn = [&](const char* reason) {
+		static std::atomic<uint32_t> invalid_copy_logs = 0;
+		if (invalid_copy_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "Image: skipping invalid vkCmdCopyImage region (%s): %s "
+			           "src_type=%u dst_type=%u src_mip=%u dst_mip=%u\n",
+			           operation, reason, static_cast<uint32_t>(source.image_type),
+			           static_cast<uint32_t>(destination.image_type), region.srcSubresource.mipLevel,
+			           region.dstSubresource.mipLevel);
+		}
+	};
+
+	// A direct image copy cannot reinterpret the dimensionality of an image. In particular,
+	// a flat 2D LUT must not be presented as sixteen array layers or sixteen slices of a 3D
+	// image. The buffer path is the only safe conversion path for such data.
+	if (source.image_type != destination.image_type) {
+		warn("image types differ");
+		return false;
 	}
-	if (destination_type == vk::ImageType::e3D) {
-		destination_layers = 1;
+	if (region.srcSubresource.mipLevel >= source.mip_levels ||
+	    region.dstSubresource.mipLevel >= destination.mip_levels) {
+		warn("mip level is out of range");
+		return false;
 	}
-	if (source_type == destination_type) {
-		source_layers = destination_layers = std::min(source_layers, destination_layers);
-	} else if (source_type == vk::ImageType::e2D && destination_type == vk::ImageType::e3D) {
-		source_layers = depth;
-	} else if (source_type == vk::ImageType::e3D && destination_type == vk::ImageType::e2D) {
-		destination_layers = depth;
+	if (region.srcOffset.x < 0 || region.srcOffset.y < 0 || region.srcOffset.z < 0 ||
+	    region.dstOffset.x < 0 || region.dstOffset.y < 0 || region.dstOffset.z < 0) {
+		warn("negative image offset");
+		return false;
 	}
-	return {source_layers, destination_layers};
+
+	const auto source_width = std::max(source.extent.width >> region.srcSubresource.mipLevel, 1u);
+	const auto source_height = std::max(source.extent.height >> region.srcSubresource.mipLevel, 1u);
+	const auto source_depth = source.image_type == vk::ImageType::e3D
+	                              ? std::max(source.extent.depth >> region.srcSubresource.mipLevel, 1u)
+	                              : 1u;
+	const auto destination_width =
+	    std::max(destination.extent.width >> region.dstSubresource.mipLevel, 1u);
+	const auto destination_height =
+	    std::max(destination.extent.height >> region.dstSubresource.mipLevel, 1u);
+	const auto destination_depth = destination.image_type == vk::ImageType::e3D
+	                                   ? std::max(destination.extent.depth >>
+	                                                  region.dstSubresource.mipLevel,
+	                                              1u)
+	                                   : 1u;
+
+	const auto src_x = static_cast<uint32_t>(region.srcOffset.x);
+	const auto src_y = static_cast<uint32_t>(region.srcOffset.y);
+	const auto src_z = static_cast<uint32_t>(region.srcOffset.z);
+	const auto dst_x = static_cast<uint32_t>(region.dstOffset.x);
+	const auto dst_y = static_cast<uint32_t>(region.dstOffset.y);
+	const auto dst_z = static_cast<uint32_t>(region.dstOffset.z);
+	if (src_x > source_width || src_y > source_height || src_z > source_depth ||
+	    dst_x > destination_width || dst_y > destination_height || dst_z > destination_depth) {
+		warn("image offset is outside the mip level");
+		return false;
+	}
+
+	const auto source_layers = source.image_type == vk::ImageType::e3D ? 1u : source.layers;
+	const auto destination_layers =
+	    destination.image_type == vk::ImageType::e3D ? 1u : destination.layers;
+	if (region.srcSubresource.baseArrayLayer >= source_layers ||
+	    region.dstSubresource.baseArrayLayer >= destination_layers) {
+		warn("array-layer base is out of range");
+		return false;
+	}
+	if ((source.image_type == vk::ImageType::e3D &&
+	     (region.srcSubresource.baseArrayLayer != 0 || region.srcSubresource.layerCount != 1)) ||
+	    (destination.image_type == vk::ImageType::e3D &&
+	     (region.dstSubresource.baseArrayLayer != 0 || region.dstSubresource.layerCount != 1))) {
+		warn("3D image requires baseArrayLayer=0 and layerCount=1");
+		return false;
+	}
+
+	const auto source_available_layers = source_layers - region.srcSubresource.baseArrayLayer;
+	const auto destination_available_layers =
+	    destination_layers - region.dstSubresource.baseArrayLayer;
+	const auto clamped_source_layers =
+	    std::min(region.srcSubresource.layerCount, source_available_layers);
+	const auto clamped_destination_layers =
+	    std::min(region.dstSubresource.layerCount, destination_available_layers);
+	const auto layers = std::min(clamped_source_layers, clamped_destination_layers);
+	if (layers == 0) {
+		warn("no array layers remain after clamping");
+		return false;
+	}
+	region.srcSubresource.layerCount = layers;
+	region.dstSubresource.layerCount = layers;
+
+	region.extent.width = std::min({region.extent.width, source_width - src_x,
+	                               destination_width - dst_x});
+	region.extent.height = std::min({region.extent.height, source_height - src_y,
+	                                destination_height - dst_y});
+	region.extent.depth = std::min({region.extent.depth, source_depth - src_z,
+	                               destination_depth - dst_z});
+	if (region.extent.width == 0 || region.extent.height == 0 || region.extent.depth == 0) {
+		warn("extent is empty after clamping");
+		return false;
+	}
+	return true;
 }
+
+} // namespace
 
 void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
-	const uint32_t base_depth = backing.image_type == vk::ImageType::e3D
-	                                ? backing.extent.depth
-	                                : source.backing.extent.depth;
 	const auto     source_aspect =
 	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	const auto destination_aspect =
@@ -355,41 +437,16 @@ void Image::CopyImage(Image& source) {
 	for (uint32_t level = 0; level < levels; level++) {
 		const auto width  = std::max(source.backing.extent.width >> level, 1u);
 		const auto height = std::max(source.backing.extent.height >> level, 1u);
-		const auto depth  = std::max(base_depth >> level, 1u);
-		const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
 		vk::ImageCopy copy {};
-		copy.srcSubresource = {source_aspect, level, 0, 1};
-		copy.dstSubresource = {destination_aspect, level, 0, 1};
-		if (source.backing.image_type == backing.image_type) {
-			if (source.backing.image_type == vk::ImageType::e3D) {
-				copy.extent = {width, height, depth};
-			} else if (source.backing.image_type == vk::ImageType::e1D) {
-				copy.srcSubresource.layerCount = std::min(source_layers, destination_layers);
-				copy.dstSubresource.layerCount = copy.srcSubresource.layerCount;
-				copy.extent                    = {width, 1, 1};
-			} else {
-				copy.srcSubresource.layerCount = std::min(source_layers, destination_layers);
-				copy.dstSubresource.layerCount = copy.srcSubresource.layerCount;
-				copy.extent                    = {width, height, 1};
-			}
-		} else if (source.backing.image_type == vk::ImageType::e2D &&
-		           backing.image_type == vk::ImageType::e1D) {
-			copy.srcSubresource.layerCount = 1;
-			copy.dstSubresource.layerCount = 1;
-			copy.extent                    = {std::min(width, backing.extent.width), 1, 1};
-		} else if (source.backing.image_type == vk::ImageType::e1D &&
-		           backing.image_type == vk::ImageType::e2D) {
-			copy.srcSubresource.layerCount = 1;
-			copy.dstSubresource.layerCount = 1;
-			copy.extent                    = {std::min(width, backing.extent.width), 1, 1};
-		} else if (source.backing.image_type == vk::ImageType::e2D) {
-			copy.srcSubresource.layerCount = source_layers;
-			copy.extent                    = {width, height, source_layers};
-		} else {
-			copy.dstSubresource.layerCount = destination_layers;
-			copy.extent                    = {width, height, destination_layers};
+		copy.srcSubresource = {source_aspect, level, 0, source.backing.layers};
+		copy.dstSubresource = {destination_aspect, level, 0, backing.layers};
+		copy.extent         = {width, height,
+		                       source.backing.image_type == vk::ImageType::e3D
+		                           ? std::max(source.backing.extent.depth >> level, 1u)
+		                           : 1u};
+		if (SanitizeCopyRegion(source.backing, backing, copy, "CopyImage")) {
+			copies.push_back(copy);
 		}
-		copies.push_back(copy);
 	}
 	if (copies.empty()) {
 		return;
@@ -489,8 +546,10 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
-		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
-		                  vk::ImageLayout::eTransferDstOptimal, region);
+		if (SanitizeCopyRegion(source.backing, backing, region, "Resolve")) {
+			command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
+			                  vk::ImageLayout::eTransferDstOptimal, region);
+		}
 	} else {
 		vk::ImageResolve region {};
 		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, resolved_source_range.base_level,
@@ -612,8 +671,7 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	const auto height = std::max(backing.extent.height >> mip, 1u);
 	const auto depth  = std::max(backing.extent.depth >> mip, 1u);
 	EXIT_IF(width != source.backing.extent.width || height != source.backing.extent.height);
-	const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
-	const auto aspects                             = FullAspectMask(source.backing.format);
+	const auto aspects = FullAspectMask(source.backing.format);
 	EXIT_IF(aspects != FullAspectMask(backing.format));
 	std::array<vk::ImageCopy, 2> copies {};
 	uint32_t                     copy_count = 0;
@@ -623,16 +681,25 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 			continue;
 		}
 		auto& copy          = copies[copy_count++];
-		copy.srcSubresource = {aspect, 0, 0, source_layers};
-		copy.dstSubresource = {aspect, mip, layer, destination_layers};
+		copy.srcSubresource = {aspect, 0, 0, source.backing.layers};
+		copy.dstSubresource = {aspect, mip, layer, backing.layers - layer};
 		copy.extent         = {width, height, depth};
+	}
+	uint32_t valid_count = 0;
+	for (uint32_t index = 0; index < copy_count; index++) {
+		if (SanitizeCopyRegion(source.backing, backing, copies[index], "CopyMip")) {
+			copies[valid_count++] = copies[index];
+		}
+	}
+	if (valid_count == 0) {
+		return;
 	}
 	auto command = m_scheduler.Current().Handle();
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
-	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
+	                  vk::ImageLayout::eTransferDstOptimal, valid_count, copies.data());
 	source.Transit(vk::ImageLayout::eGeneral, kRestoredImageAccess, {}, command);
 	Transit(vk::ImageLayout::eGeneral, kRestoredImageAccess, {}, command);
 }
