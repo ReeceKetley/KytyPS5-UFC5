@@ -850,8 +850,10 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 		copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, layers};
 		copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, layers};
 		copy.extent         = {width, height, 1};
-		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
-		                  vk::ImageLayout::eTransferDstOptimal, copy);
+		if (ImageOps::SanitizeCopyRegion(source.backing, image, copy, "Presenter::CopyFrom")) {
+			command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+			                  image.image, vk::ImageLayout::eTransferDstOptimal, copy);
+		}
 	} else {
 		// vkCmdBlitImage with VK_FILTER_LINEAR performs hardware colour-space
 		// and type conversion (e.g. B10G11R11 float → B8G8R8A8 UNORM). This

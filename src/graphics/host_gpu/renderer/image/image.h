@@ -170,6 +170,8 @@ private:
 
 namespace ImageOps {
 
+[[nodiscard]] bool SanitizeCopyRegion(const VulkanImage& source, const VulkanImage& destination,
+                                      vk::ImageCopy& region, const char* operation);
 void                                 Validate(const ImageInfo& info);
 [[nodiscard]] Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element);
 

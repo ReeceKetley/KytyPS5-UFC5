@@ -26514,12 +26514,30 @@ void CheckShaderRecompilerFatalContracts() {
           ShaderRecompiler::IR::Value(descriptor.dwords[dword]);
     }
     program.srt_plan_complete = true;
-    auto plan = ShaderRecompiler::IR::ExtractResourcePlan(program);
-    ShaderRecompiler::IR::ResourceSnapshot snapshot;
-    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    static_assert(static_cast<uint32_t>(Prospero::BufferFormat::k32SInt) == 21u);
+    const auto materialize_format = [&](Prospero::BufferFormat format,
+                                        ShaderRecompiler::IR::ResourceSnapshot& snapshot,
+                                        ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+      program.descriptor_sources[0].dwords[1] =
+          ShaderRecompiler::IR::Value(static_cast<uint32_t>(format) << 20u);
+      const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(program);
+      return ShaderRecompiler::IR::MaterializeResources(plan, {}, snapshot, specialization);
+    };
+    ShaderRecompiler::IR::ResourceSnapshot signed_snapshot;
+    ShaderRecompiler::IR::ResourceSpecialization signed_specialization;
+    Require("SignedAtomicImageAcceptance", "resource materialization",
+            materialize_format(Prospero::BufferFormat::k32SInt, signed_snapshot,
+                               signed_specialization) &&
+                signed_specialization.images.size() == 1 &&
+                signed_specialization.images[0].numeric_class ==
+                    Prospero::TextureNumericClass::Uint,
+            "32-bit signed atomic image descriptor was rejected");
+
+    ShaderRecompiler::IR::ResourceSnapshot packed_snapshot;
+    ShaderRecompiler::IR::ResourceSpecialization packed_specialization;
     Require("PackedAtomicImageRejection", "resource materialization",
-            !ShaderRecompiler::IR::MaterializeResources(
-                plan, {}, snapshot, specialization),
+            !materialize_format(Prospero::BufferFormat::k11_11_10UInt, packed_snapshot,
+                                packed_specialization),
             "packed atomic image descriptor was accepted");
   }
 }

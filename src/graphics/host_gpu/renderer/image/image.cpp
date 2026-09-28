@@ -317,7 +317,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	command.pipelineBarrier2(dependency);
 }
 
-namespace {
+namespace ImageOps {
 
 bool SanitizeCopyRegion(const VulkanImage& source, const VulkanImage& destination,
                         vk::ImageCopy& region, const char* operation) {
@@ -422,7 +422,7 @@ bool SanitizeCopyRegion(const VulkanImage& source, const VulkanImage& destinatio
 	return true;
 }
 
-} // namespace
+} // namespace ImageOps
 
 void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
@@ -444,7 +444,7 @@ void Image::CopyImage(Image& source) {
 		                       source.backing.image_type == vk::ImageType::e3D
 		                           ? std::max(source.backing.extent.depth >> level, 1u)
 		                           : 1u};
-		if (SanitizeCopyRegion(source.backing, backing, copy, "CopyImage")) {
+		if (ImageOps::SanitizeCopyRegion(source.backing, backing, copy, "CopyImage")) {
 			copies.push_back(copy);
 		}
 	}
@@ -546,7 +546,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
-		if (SanitizeCopyRegion(source.backing, backing, region, "Resolve")) {
+		if (ImageOps::SanitizeCopyRegion(source.backing, backing, region, "Resolve")) {
 			command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 			                  vk::ImageLayout::eTransferDstOptimal, region);
 		}
@@ -687,7 +687,7 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	}
 	uint32_t valid_count = 0;
 	for (uint32_t index = 0; index < copy_count; index++) {
-		if (SanitizeCopyRegion(source.backing, backing, copies[index], "CopyMip")) {
+		if (ImageOps::SanitizeCopyRegion(source.backing, backing, copies[index], "CopyMip")) {
 			copies[valid_count++] = copies[index];
 		}
 	}

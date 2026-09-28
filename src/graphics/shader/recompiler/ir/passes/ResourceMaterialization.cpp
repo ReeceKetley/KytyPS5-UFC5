@@ -42,6 +42,15 @@ bool SpecializationFail(std::string_view message) {
 	return false;
 }
 
+[[nodiscard]] constexpr bool IsSupportedAtomicImageFormat(
+    Prospero::BufferFormat format) noexcept {
+	// Image atomics are emitted as uint32 operations. A signed 32-bit guest image
+	// therefore uses the same R32_UINT storage representation as k32UInt; k32Float
+	// remains R32_SFLOAT for non-atomic images and is not a legal atomic format.
+	return format == Prospero::BufferFormat::k32UInt ||
+	       format == Prospero::BufferFormat::k32SInt;
+}
+
 Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
                                             Decoder::ImageDimension requested) {
 	const bool is_array = requested == Decoder::ImageDimension::Dim1DArray ||
@@ -532,7 +541,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		image.cube      = DescriptorIsCube(descriptor);
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-		if (base.atomic && format != Prospero::BufferFormat::k32UInt) {
+		const bool atomic_uint_32 = base.atomic && IsSupportedAtomicImageFormat(format);
+		if (base.atomic && !IsSupportedAtomicImageFormat(format)) {
 			return SpecializationFail(
 			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
@@ -553,7 +563,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		}
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
 		                              base.written && !base.read && !base.atomic;
-		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
+		image.numeric_class = atomic_uint_32 ? Prospero::TextureNumericClass::Uint
+		                                      : Prospero::SampledTextureNumericClass(format);
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
 			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {
