@@ -657,12 +657,55 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
+		// Clear alpha to 0 for UI/HUD surfaces to prevent text ghosting caused by
+		// stale pixel accumulation across frames. The PS5 compositor blends with
+		// premultiplied alpha, and a non-zero alpha from a previous frame bleeds
+		// into the next, leaving trailing ghosts on text and HUD elements.
+		// Surface detection is format-based (RGBA8) rather than hardcoded addresses:
+		// any RGBA8 color target without a depth buffer is treated as a HUD layer.
+		if (depth.desc.info.data.Empty() &&
+		    (image.backing.format == vk::Format::eR8G8B8A8Unorm ||
+		     image.backing.format == vk::Format::eR8G8B8A8Srgb ||
+		     image.backing.format == vk::Format::eB8G8R8A8Unorm ||
+		     image.backing.format == vk::Format::eB8G8R8A8Srgb)) {
+
+			// Clear UI/HUD surfaces only once per frame. AcquireRenderTargets is
+			// called for every draw pass; without this guard each pass re-clears
+			// the buffer to transparent, erasing all prior passes' UI (e.g.
+			// only the last icon survives). Track cleared addresses per-frame.
+			const uint32_t current_frame = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+			if (current_frame != m_cleared_ui_frame) {
+				m_cleared_ui_addresses.clear();
+				m_cleared_ui_frame = current_frame;
+			}
+			const uint64_t target_addr = target.desc.info.data.address;
+			if (m_cleared_ui_addresses.insert(target_addr).second) {
+				const ImageSubresourceRange ui_clear_range {
+				    view.base_level, view.level_count, view.base_layer, view.layer_count};
+				image.Transit(vk::ImageLayout::eTransferDstOptimal,
+				              vk::AccessFlagBits2::eTransferWrite, ui_clear_range,
+				              buffer.Handle());
+				const vk::ImageSubresourceRange vk_clear_range {
+				    vk::ImageAspectFlagBits::eColor, ui_clear_range.base_level,
+				    ui_clear_range.level_count, ui_clear_range.base_layer,
+				    ui_clear_range.layer_count};
+				vk::ClearColorValue ui_clear_value {};
+				ui_clear_value.float32[3] = 0.0f;
+				buffer.Handle().clearColorImage(image.backing.image,
+				                                vk::ImageLayout::eTransferDstOptimal,
+				                                &ui_clear_value, 1, &vk_clear_range);
+				image.Transit(layout, image.binding.attachment_access, ui_clear_range,
+				              buffer.Handle());
+			}
+		}
 		const auto extent       = target.Extent();
 		state.width             = std::min(state.width, extent.width);
 		state.height            = std::min(state.height, extent.height);
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
 		auto& attachment        = state.color_attachments[i];
 		attachment.image_view   = image_view;
+		attachment.extent       = {std::max(image.backing.extent.width >> view.base_level, 1u),
+		                           std::max(image.backing.extent.height >> view.base_level, 1u)};
 		attachment.image_layout = layout;
 	}
 	if (depth.image_id) {
@@ -738,6 +781,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;
 		attachment.image_view     = image_view;
+		attachment.extent         = {std::max(image.backing.extent.width >> view.base_level, 1u),
+		                             std::max(image.backing.extent.height >> view.base_level, 1u)};
 		attachment.image_layout   = layout;
 		attachment.clear_value[0] = std::bit_cast<uint32_t>(depth.depth_clear_value);
 		attachment.clear_value[1] = depth.stencil_clear_value;

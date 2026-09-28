@@ -808,6 +808,13 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 #endif
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl = subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
+	// Enable computeFullSubgroups so lowered wave32 compute shaders can set
+	// eRequireFullSubgroups, padding the final partial subgroup to a full
+	// 32-lane group so ReadLane/WriteLane never index an absent lane.
+	graphics.compute_full_subgroups =
+	    supported_features13.computeFullSubgroups == VK_TRUE;
+	features13.computeFullSubgroups =
+	    graphics.compute_full_subgroups ? VK_TRUE : VK_FALSE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",

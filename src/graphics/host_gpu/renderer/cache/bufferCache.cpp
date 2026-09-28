@@ -123,6 +123,16 @@ void BufferCache::DrainDeferredReadbacks(bool force) {
 	m_deferred_readbacks = std::move(still_pending);
 }
 
+void BufferCache::QueueDeferredBufferDestroy(vk::Buffer buffer, VmaAllocation allocation) {
+	m_scheduler.QueueDeferredBufferDestroy(buffer, allocation);
+}
+
+void BufferCache::DrainDeferredBufferDestroys() {
+	// Called by the resource GC at the frame boundary.  The scheduler owns the
+	// queue so scratch buffers and cache buffers obey the same two-tick margin.
+	m_scheduler.DrainDeferredBufferDestroys();
+}
+
 void BufferCache::EnsureCurrentForCpu(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0 || size == 0) {
 		return;
@@ -208,7 +218,24 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	if (buffer == nullptr || buffer->is_deleted) {
 		return;
 	}
+	// Extract the VkBuffer/VmaAllocation before retiring the Buffer object.
+	// ~Buffer() skips the pair because this cache has already queued it in the
+	// scheduler-owned global deferred-destruction queue.
+	buffer->is_deleted = true;
+	buffer->SetDeferredDestroy();
+	QueueDeferredBufferDestroy(buffer->Handle(), buffer->Allocation());
 	Unregister(id);
+	// NOTE: DrainDeferredBufferDestroys() is intentionally NOT called or deferred
+	// here. Deferring it runs the drain at the *current* or *next* GPU tick (the
+	// DeferOperation lambda fires on the scheduler's callback drain right after the
+	// current submission retires), which is far too early — pending draw/dispatch
+	// commands recorded into the same command buffer may still reference the buffer
+	// when the GPU executes them. Destroying at submission_tick or tick+1 causes an
+	// MMU page fault on in-flight draws -> vkQueueSubmit returns ErrorDeviceLost (-4).
+	// Physical destruction is deferred via QueueDeferredBufferDestroy, which records
+	// the current scheduler tick; the global queue only frees at tick + 2. The
+	// per-frame drain is invoked at the frame boundary in RunGarbageCollector(),
+	// after the frame's command buffers have been submitted.
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
 	} else {
@@ -1086,6 +1113,13 @@ void BufferCache::RunGarbageCollector() {
 	// Land any deferred readback whose tick has retired so guest memory does not lag
 	// when downloads pause (menus, load screens).
 	DrainDeferredReadbacks(false);
+	// Physical VkBuffer destruction for buffers queued via QueueDeferredBufferDestroy.
+	// This runs once per frame at the frame boundary (invoked from GuestGpu::Process
+	// after BufferFlush, when the current frame's command buffers have already been
+	// submitted and only earlier ticks remain in-flight). DrainDeferredBufferDestroys
+	// skips any entry whose submission_tick + 2 has not yet retired, so in-use
+	// vertex/index/argument buffers survive until the GPU is guaranteed clear of them.
+	DrainDeferredBufferDestroys();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
@@ -1225,13 +1259,18 @@ void BufferCache::RunGarbageCollector() {
 			EXIT("BufferCache: garbage collection retained GPU ownership\n");
 		}
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		buffer.is_deleted = true;
+		buffer.SetDeferredDestroy();
+		// Extract the VkBuffer/VmaAllocation for deferred destruction. ~Buffer() will
+		// skip the pair because it is already owned by the scheduler queue; physical
+		// destruction waits until the GPU tick that may still reference these buffers
+		// (including DownloadBufferMemory copies) has completed.
+		QueueDeferredBufferDestroy(buffer.Handle(), buffer.Allocation());
 		Unregister(id);
-		// DownloadBufferMemory() above recorded GPU->staging copies against these very
-		// buffers into the command buffer that is still recording, and the deferred
-		// readback path does not Finish() before returning. Destroying the VkBuffer here
-		// invalidates that command buffer ("VkBuffer ... was destroyed" /
-		// VUID-vkCmdPipelineBarrier-commandBuffer-recording) and loses the device. Retire
-		// on tick completion instead, exactly as DeleteBuffer() does.
+		// NOTE: DrainDeferredBufferDestroys() is not called here — the same
+		// mid-frame premature-drain hazard applies (see DeleteBuffer). The deferred
+		// the scheduler queue (tick + 2 margin); the per-frame drain handles physical
+		// destruction.
 		if (m_scheduler.Active()) {
 			m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
 		} else {

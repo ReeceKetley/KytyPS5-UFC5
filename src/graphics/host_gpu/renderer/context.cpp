@@ -30,7 +30,9 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 }
 
 void CommandBuffer::Begin() {
-	EXIT_IF(m_rendering || IsInvalid());
+	if (m_rendering || IsInvalid()) {
+		return;
+	}
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
@@ -104,8 +106,24 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	stencil.storeOp                         = vk::AttachmentStoreOp::eStore;
 	stencil.clearValue.depthStencil.stencil = depth_stencil.clear_value[1];
 
+	vk::Extent2D render_extent {state.width, state.height};
+	const auto clamp_render_extent = [&render_extent](const RenderAttachment& attachment) {
+		if (attachment.image_view == nullptr) {
+			return;
+		}
+		EXIT_IF(attachment.extent.width == 0 || attachment.extent.height == 0);
+		render_extent.width  = std::min(render_extent.width, attachment.extent.width);
+		render_extent.height = std::min(render_extent.height, attachment.extent.height);
+	};
+	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
+		clamp_render_extent(state.color_attachments[i]);
+	}
+	if (depth_stencil.has_depth || depth_stencil.has_stencil) {
+		clamp_render_extent(depth_stencil);
+	}
+
 	vk::RenderingInfo rendering {};
-	rendering.renderArea.extent    = {state.width, state.height};
+	rendering.renderArea.extent    = render_extent;
 	rendering.layerCount           = state.num_layers;
 	rendering.colorAttachmentCount = state.num_color_attachments;
 	rendering.pColorAttachments    = colors.data();

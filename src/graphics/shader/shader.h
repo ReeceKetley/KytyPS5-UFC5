@@ -67,7 +67,7 @@ struct ShaderWorkgroupInputInfo {
 	uint32_t threads_num[3]      = {0, 0, 0};
 	uint32_t lds_size_dwords     = 0;
 	uint32_t scratch_size_dwords = 0;
-	uint32_t host_subgroup_size  = 64;
+	uint32_t host_subgroup_size  = 32;
 	uint32_t wave_size           = 64;
 };
 

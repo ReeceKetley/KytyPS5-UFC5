@@ -322,10 +322,18 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	state.stage     = program.stage;
 	state.wave_size = program.wave_size;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
-	state.lane_count =
-	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
-	        ? 2u
-	        : 1u;
+	// Wave32 never uses dual-lane emulation — lane_count is always 1.
+	// The dual-lane path (lane_count=2) is only reachable when the guest shader
+	// is native wave64 on a wave32 host, which the ShaderRecompiler lowering
+	// should have already converted.
+	if (program.wave_size == 32u) {
+		state.lane_count = 1u;
+	} else {
+		state.lane_count =
+		    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
+		        ? 2u
+		        : 1u;
+	}
 	state.inputs.reserve(program.info.inputs.size());
 	state.outputs.reserve(program.info.outputs.size());
 	state.interface_variables.reserve(program.info.inputs.size() + program.info.outputs.size());

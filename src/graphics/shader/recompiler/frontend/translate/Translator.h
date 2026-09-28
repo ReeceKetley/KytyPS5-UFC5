@@ -12,7 +12,6 @@ public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit, uint32_t wave_size)
 	    : program(program), ir(block), current_vector_limit(vector_limit),
 	      current_wave_size(wave_size) {}
-
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);

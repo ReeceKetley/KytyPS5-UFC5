@@ -41,6 +41,11 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 	return vk::blockSize(a) == vk::blockSize(b);
 }
 
+[[nodiscard]] bool IsPackedFloatFormat(vk::Format format) noexcept {
+	return format == vk::Format::eB10G11R11UfloatPack32 ||
+	       format == vk::Format::eE5B9G9R9UfloatPack32;
+}
+
 [[nodiscard]] bool IsPresentableColorFormat(vk::Format format) noexcept {
 	switch (format) {
 		case vk::Format::eR8G8B8A8Unorm:
@@ -55,6 +60,40 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 		case vk::Format::eR32G32B32A32Sfloat: return true;
 		default: return false;
 	}
+}
+
+[[nodiscard]] bool AreColorTileModesCompatible(Prospero::TileMode a,
+                                               Prospero::TileMode b) noexcept {
+	// Both modes resolve to the thin 64KB-page colour block family with the same
+	// mip-tail raster, so the guest byte layout is identical: a surface written
+	// with one mode can be read with the other.
+	const auto is_64kb_color = [](Prospero::TileMode mode) {
+		return mode == Prospero::TileMode::kStandard64KB ||
+		       mode == Prospero::TileMode::kRenderTarget;
+	};
+	return is_64kb_color(a) && is_64kb_color(b);
+}
+
+// SameGuestLayout without the tile-mode equality requirement, for aliases whose
+// tile modes are layout-equivalent (see AreColorTileModesCompatible).
+[[nodiscard]] bool SameGuestLayoutExceptTileMode(const ImageInfo& cached,
+                                                 const ImageInfo& requested) noexcept {
+	return cached.data.address == requested.data.address &&
+	       cached.data.size == requested.data.size && cached.extent == requested.extent &&
+	       cached.samples == requested.samples &&
+	       cached.bytes_per_block == requested.bytes_per_block &&
+	       cached.resources == requested.resources &&
+	       (cached.type == requested.type || requested.extent == vk::Extent3D {1, 1, 1});
+}
+
+// KYTY_NO_RT_COLOR_ALIAS=1 restores the old discard-and-recreate behaviour for the
+// cross-tile-mode colour alias below.
+[[nodiscard]] bool ColorTileAliasReuseEnabled() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_NO_RT_COLOR_ALIAS");
+		return env == nullptr || env[0] != '1' || env[1] != '\0';
+	}();
+	return enabled;
 }
 
 [[nodiscard]] bool DecodeDccClear(const TextureCache::ImageDesc& desc, vk::Format format,
@@ -968,6 +1007,45 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (requested.tile_mode != cached.info.tile_mode ||
 		    (requested.resources == cached.info.resources &&
 		     requested.mip_layout != cached.info.mip_layout)) {
+			// UFC 5: the game renders the 3D scene into a 1-mip render target and then
+			// binds the same address as a multi-mip texture for bloom/exposure compute.
+			// If tile modes differ but the cached image holds GPU-written content and the
+			// request adds mip levels, preserve the data via ExpandImage instead of
+			// discarding it — otherwise the compute pass reads a cleared (black) buffer.
+			if (cached.IsGpuModified() && cached.usage.render_target &&
+			    requested.resources.levels > cached.info.resources.levels &&
+			    requested.extent.width == cached.info.extent.width &&
+			    requested.extent.height == cached.info.extent.height &&
+			    ImageViewOps::FormatsCompatible(cached.info.pixel_format,
+			                                    requested.pixel_format)) {
+				return {ExpandImage(requested, cached_id)};
+			}
+			// UFC 5: the composite pass samples the HDR scene target it just rendered.
+			// A texture descriptor cannot encode TileMode::kRenderTarget, so the game
+			// binds the same address as kStandard64KB. Both modes share the thin 64KB
+			// colour block layout and the Vulkan backing is eOptimal tiling either way,
+			// so the GPU-written contents are already the correct source: reuse them
+			// instead of discarding the image and letting the composite shader read a
+			// cleared (black) replacement.
+			if (requested.tile_mode != cached.info.tile_mode &&
+			    AreColorTileModesCompatible(requested.tile_mode, cached.info.tile_mode) &&
+			    cached.IsGpuModified() && cached.usage.render_target &&
+			    SameGuestLayoutExceptTileMode(cached.info, requested) &&
+			    ColorTileAliasReuseEnabled() &&
+			    ImageViewOps::FormatsCompatible(cached.info.pixel_format,
+			                                    requested.pixel_format)) {
+				static std::atomic<uint32_t> color_alias_logs = 0;
+				if (color_alias_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF("TextureCache: reusing GPU-written colour target across tile modes "
+					     "%u -> %u addr=0x%016" PRIx64 " extent=%ux%u fmt=%d -> %d\n",
+					     static_cast<uint32_t>(cached.info.tile_mode),
+					     static_cast<uint32_t>(requested.tile_mode), requested.data.address,
+					     requested.extent.width, requested.extent.height,
+					     static_cast<int>(cached.info.pixel_format),
+					     static_cast<int>(requested.pixel_format));
+				}
+				return {cached_id};
+			}
 			if (safe_to_delete) {
 				FreeImage(cached_id);
 			}
@@ -1405,7 +1483,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (!same_layout && !format_alias) {
 				continue;
 			}
-			if (desc.type == BindingType::Texture && image.IsGpuModified() &&
+			if (same_layout && desc.type == BindingType::Texture && image.IsGpuModified() &&
 			    image.backing.format != vk::Format::eUndefined &&
 			    image.info.bytes_per_block == desc.info.bytes_per_block &&
 			    SameTexelBlockSize(image.backing.format, desc.view_info.format) &&
@@ -1417,7 +1495,27 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 			if (SameBacking(image.info, desc.info, exact_format) &&
 			    ImageViewOps::ViewCompatible(image.backing, desc.view_info)) {
-				result = id;
+				if (!result) {
+					result = id;
+				} else {
+					// One guest address can hold several images that all match the
+					// descriptor: a format-compatible re-declaration plus a
+					// stale/empty duplicate. Plain "last match wins" depended on
+					// page-table iteration order and let the empty duplicate
+					// displace the render target that had just produced the scene,
+					// which is the black-composite fault (Colour Pass #18 / EID
+					// 7952). Rank the candidates instead: a GPU-written render
+					// target beats a GPU-written image, which beats a render
+					// target without GPU contents, which beats a stale duplicate.
+					const auto&    existing        = m_slot_images[result];
+					const uint32_t candidate_rank    = (image.IsGpuModified() ? 2u : 0u) +
+					                                   (image.usage.render_target ? 1u : 0u);
+					const uint32_t existing_rank     = (existing.IsGpuModified() ? 2u : 0u) +
+					                                   (existing.usage.render_target ? 1u : 0u);
+					if (candidate_rank > existing_rank) {
+						result = id;
+					}
+				}
 			}
 		}
 
@@ -1583,30 +1681,51 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		}
 		matches.push_back(id);
 	}
+	// Descriptor-exact resolution (see ledger.md:586-589): replace the
+	// heuristics-based scoring with a strict, ordered preference that resolves
+	// the image alias at 0x1162c00000 unambiguously.
 	ImageId selected {};
-	int     best_score = -1;
 	for (const auto id: matches) {
 		const auto& image = m_slot_images[id];
-		int         score = 0;
-		if (image.info.data.size == size) {
-			score += 4;
+		const bool  size_ok          = image.info.data.size == size;
+		const bool  extent_ok        = image.info.extent.width > 0 && image.info.extent.height > 0;
+		const bool  gpu_modified     = image.IsGpuModified();
+		const bool  render_target    = image.usage.render_target;
+		const bool  valid_format     = image.backing.format != vk::Format::eUndefined;
+		const bool  render_tile      = image.info.tile_mode == Prospero::TileMode::kRenderTarget;
+		// Priority 1: exact descriptor match
+		if (size_ok && extent_ok && gpu_modified && render_target && valid_format && render_tile) {
+			selected = id;
+			break;
 		}
-		if (image.IsGpuModified()) {
-			score += 8;
+		// Priority 2: same but accepting any tile mode
+		if (size_ok && extent_ok && gpu_modified && render_target && valid_format && !render_tile &&
+		    selected == ImageId {}) {
+			selected = id;
 		}
-		if (image.usage.render_target) {
-			score += 16;
+		// Priority 3: size + extent only, with ranking
+		if (size_ok && extent_ok && !selected) {
+			selected = id;
+		} else if (size_ok && extent_ok) {
+			const auto&    current        = m_slot_images[selected];
+			const uint32_t candidate_rank = (gpu_modified ? 2u : 0u) + (render_target ? 1u : 0u);
+			const uint32_t current_rank   = (current.IsGpuModified() ? 2u : 0u) +
+			                                (current.usage.render_target ? 1u : 0u);
+			if (candidate_rank > current_rank) {
+				selected = id;
+			}
 		}
-		switch (image.backing.format) {
-			case vk::Format::eR8G8B8A8Unorm:
-			case vk::Format::eR8G8B8A8Srgb:
-			case vk::Format::eB8G8R8A8Unorm:
-			case vk::Format::eB8G8R8A8Srgb: score += 32; break;
-			default: break;
 		}
-		if (score > best_score) {
-			best_score = score;
-			selected   = id;
+	// Priority 4: if nothing matched on size, fall back to any GPU-modified image
+	// with a non-zero extent so the presenter still has *something* to show.
+	if (!selected) {
+		for (const auto id: matches) {
+			const auto& image = m_slot_images[id];
+			if (image.info.extent.width > 0 && image.info.extent.height > 0 &&
+			    image.IsGpuModified()) {
+				selected = id;
+				break;
+			}
 		}
 	}
 	if (selected && ensure_valid) {
@@ -1627,7 +1746,7 @@ void TextureCache::NotePresentableColor(const Image& image) {
 	if (address == 0x000000111a800000ull || address == 0x000000111b800000ull) {
 		return;
 	}
-	if (image.backing.extent.width < 1280u || image.backing.extent.height < 720u) {
+	if (image.backing.extent.width < 512u || image.backing.extent.height < 288u) {
 		return;
 	}
 	if (!IsPresentableColorFormat(image.backing.format) || address == 0 ||
@@ -1685,35 +1804,16 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	if (desc.type == BindingType::Texture && image.backing.format != vk::Format::eUndefined &&
 	    view_info.format != vk::Format::eUndefined &&
 	    !ImageViewOps::ViewEncodingCompatible(image.backing.format, view_info.format) &&
-	    SameTexelBlockSize(image.backing.format, view_info.format)) {
-		const auto is_packed_float = [](vk::Format f) {
-			return f == vk::Format::eB10G11R11UfloatPack32 || f == vk::Format::eE5B9G9R9UfloatPack32;
-		};
-		// When the GPU wrote a packed-float (HDR) surface but the shader binds it through a
-		// normalized / signed descriptor, sampling the raw bits as packed-float is nonsense
-		// (rainbow marbling on skin, garbage HUD panels). Serve a true bitcast reinterpret
-		// view in the descriptor's format instead - legal because images are created
-		// VK_IMAGE_CREATE_MUTABLE_FORMAT and both formats are in the 32-bit compatibility
-		// class. Keep the old "sample the backing encoding" path for the other direction
-		// (e.g. UFC's RGBA8 title compositor bound with an 11-11-10 descriptor).
-		static const bool alias_reinterpret_disabled =
-		    std::getenv("KYTY_NO_ALIAS_REINTERPRET") != nullptr;
-		const bool reinterpret = is_packed_float(image.backing.format) &&
-		                         !is_packed_float(view_info.format) &&
-		                         ImageViewOps::FormatsCompatible(image.backing.format,
-		                                                         view_info.format) &&
-		                         !alias_reinterpret_disabled;
+	    SameTexelBlockSize(image.backing.format, view_info.format) &&
+	    !IsPackedFloatFormat(view_info.format) && !IsPackedFloatFormat(image.backing.format)) {
 		static std::atomic<uint32_t> encoding_logs = 0;
 		if (encoding_logs.fetch_add(1, std::memory_order_relaxed) < 24) {
-			LOGF("TextureCache: %s: backing format %d vs descriptor format %d addr=0x%016" PRIx64
+			LOGF("TextureCache: sampling backing encoding: backing format %d vs descriptor format %d addr=0x%016" PRIx64
 			     "\n",
-			     reinterpret ? "reinterpret packed-float alias" : "sampling backing encoding",
 			     static_cast<int>(image.backing.format), static_cast<int>(view_info.format),
 			     image.info.data.address);
 		}
-		if (!reinterpret) {
-			view_info.format = image.backing.format;
-		}
+		view_info.format = image.backing.format;
 	}
 	const auto view = image.FindView(view_info);
 	NameImageBinding(m_graphics, image, view, desc.type, view_info);
@@ -2352,7 +2452,7 @@ void TextureCache::RunGarbageCollector() {
 		//                           original `160` may be deliberate anti-thrash.
 		static const bool fix_budget = [] {
 			const char* env = std::getenv("KYTY_TEXGC_BUDGET_FIX");
-			return env != nullptr && env[0] == '1';
+			return env == nullptr || env[0] != '0';
 		}();
 		static const bool fix_age_order = [] {
 			const char* env = std::getenv("KYTY_TEXGC_AGE_FIX");

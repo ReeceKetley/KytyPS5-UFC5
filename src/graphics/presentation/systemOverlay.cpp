@@ -972,11 +972,36 @@ struct SystemOverlay::Impl {
 		                     : std::clamp(std::chrono::duration<float>(now - last_frame).count(),
 		                                  1.0f / 1000.0f, 0.1f);
 		last_frame     = now;
-		ImGui_ImplVulkan_NewFrame();
+				ImGui_ImplVulkan_NewFrame();
+		// HUD overlay: register the HUD texture with ImGui's Vulkan backend so
+		// we can draw it as a fullscreen image via AddImage below.
+		if (has_hud_overlay && hud_image_view != nullptr) {
+			if (hud_texture_id == VK_NULL_HANDLE) {
+				ImGui::SetCurrentContext(imgui_context);
+				hud_texture_id = ImGui_ImplVulkan_AddTexture(
+				    static_cast<VkImageView>(hud_image_view),
+				    static_cast<VkImageLayout>(vk::ImageLayout::eShaderReadOnlyOptimal));
+			}
+		}
 		ImGui::NewFrame();
 		if (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session) {
+			// Cleanup HUD texture descriptor set if present.
+			if (hud_texture_id != VK_NULL_HANDLE) {
+				ImGui::SetCurrentContext(imgui_context);
+				ImGui_ImplVulkan_RemoveTexture(hud_texture_id);
+				hud_texture_id = VK_NULL_HANDLE;
+			}
 			ImGui::EndFrame();
 			return false;
+		}
+		// Draw HUD overlay on the background draw list (behind any ImGui windows).
+		if (hud_texture_id != VK_NULL_HANDLE && hud_image_view != nullptr) {
+			const ImVec2 display(static_cast<float>(frame_extent.width),
+			                     static_cast<float>(frame_extent.height));
+			const ImU64  col = IM_COL32(255, 255, 255, 255);
+			ImGui::GetBackgroundDrawList()->AddImage(
+			    reinterpret_cast<ImTextureID>(reinterpret_cast<uintptr_t>(hud_texture_id)),
+			    {0.0f, 0.0f}, display, {0.0f, 1.0f}, {1.0f, 0.0f}, col);
 		}
 		if (snapshot.session.kind == OverlayKind::Error) {
 			DrawError(snapshot.error, frame_extent);
@@ -1019,6 +1044,29 @@ struct SystemOverlay::Impl {
 		vulkan_initialized = false;
 	}
 
+		void SetHudOverlay(vk::ImageView image_view, vk::Extent2D extent, vk::Format format) {
+		// Idempotent: only reset the descriptor set when the view handle changes.
+		// This prevents descriptor-set leaks when SetHudOverlay is called every
+		// frame with the same view (FindView returns the same cached handle).
+		const bool view_changed = (hud_image_view != image_view);
+		if (view_changed && hud_texture_id != VK_NULL_HANDLE && imgui_context != nullptr) {
+			ImGui::SetCurrentContext(imgui_context);
+			ImGui_ImplVulkan_RemoveTexture(hud_texture_id);
+			hud_texture_id = VK_NULL_HANDLE;
+		}
+		has_hud_overlay  = image_view != nullptr;
+		hud_image_view   = image_view;
+		hud_extent       = extent;
+		hud_format       = format;
+		if (view_changed) {
+			hud_texture_id   = {};  // Forces re-registration in PrepareFrame
+		}
+	}
+
+	bool HasHudOverlay() const noexcept {
+		return has_hud_overlay;
+	}
+
 	GraphicContext&                       graphics;
 	ImGuiContext*                         imgui_context      = nullptr;
 	bool                                  vulkan_initialized = false;
@@ -1029,12 +1077,19 @@ struct SystemOverlay::Impl {
 	float                                 button_height      = 42.0f;
 	ImVec2                                panel_offset {};
 	ImVec2                                right_stick {};
-	OverlaySession                        session;
+		OverlaySession                        session;
 	vk::Extent2D                          extent {};
 	std::chrono::steady_clock::time_point last_frame;
+
+	// HUD overlay (Problem 3)
+	bool                                  has_hud_overlay     = false;
+	vk::ImageView                         hud_image_view      = nullptr;
+	vk::Extent2D                          hud_extent           = {};
+	vk::Format                            hud_format           = vk::Format::eR8G8B8A8Unorm;
+	VkDescriptorSet                       hud_texture_id       = {};
 };
 
-SystemOverlay::SystemOverlay(GraphicContext& graphics): m_impl(std::make_unique<Impl>(graphics)) {}
+	SystemOverlay::SystemOverlay(GraphicContext& graphics): m_impl(std::make_unique<Impl>(graphics)) {}
 
 SystemOverlay::~SystemOverlay() = default;
 
@@ -1044,6 +1099,14 @@ bool SystemOverlay::PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_
 
 void SystemOverlay::Record(vk::CommandBuffer command, vk::ImageView target) {
 	m_impl->Record(command, target);
+}
+
+void SystemOverlay::SetHudOverlay(vk::ImageView image_view, vk::Extent2D extent, vk::Format format) {
+	m_impl->SetHudOverlay(image_view, extent, format);
+}
+
+bool SystemOverlay::HasHudOverlay() const noexcept {
+	return m_impl->HasHudOverlay();
 }
 
 void SystemOverlay::ReleaseVulkan() {

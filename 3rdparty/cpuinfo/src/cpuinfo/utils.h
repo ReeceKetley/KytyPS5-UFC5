@@ -1,6 +1,9 @@
 #pragma once
 
 #include <stdint.h>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 
 inline static uint32_t bit_length(uint32_t n) {

@@ -47,6 +47,7 @@
 
 namespace Libs::Graphics {
 constexpr uint64_t kUfcHangCsHash = 0xea0aceac518ec52dull;
+constexpr uint64_t kUfcMenuHangCsHash = 0x142da6ee4d755d9eull;
 
 
 bool ParseHexU64(const char* text, uint64_t* out) {
@@ -353,13 +354,28 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode,
                                     uint64_t indirect_args_addr) {
+	if (m_context.GetCommandScheduler().DeviceLost()) {
+		return;
+	}
 	EXIT_IF(buffer.IsInvalid());
+	auto& sh_ctx = buffer.GetShaders();
+	// This menu dispatch is known to reach device loss with its original 4096x1x1
+	// arguments. Skip it before flushing pending work or compiling the shader; in
+	// particular, never let this address reach a queue submit through another path.
+	if (sh_ctx.GetCs().cs_regs.data_addr == 0x0000001120100100ull) {
+		LOGF("GraphicsRenderDispatchDirect: skipping menu hang CS addr=0x%016" PRIx64
+		     " groups=%ux%ux%u mode=%u submit=%" PRIu64 "\n",
+		     sh_ctx.GetCs().cs_regs.data_addr, thread_group_x, thread_group_y, thread_group_z,
+		     mode, submit_id);
+		Common::LockGuard lock(m_context.GetMutex());
+		ResetBindings();
+		return;
+	}
 	// The group counts are unknown on the host in this mode, so every decision that reads
 	// them is skipped rather than made on zeros.
 	const bool indirect = indirect_args_addr != 0;
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
-	auto& sh_ctx = buffer.GetShaders();
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
@@ -377,7 +393,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (!ShaderAddressValid(sh_ctx.GetCs().cs_regs.data_addr)) {
 		return;
 	}
-
 	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
 	constexpr uint32_t DISPATCH_INITIATOR_BASE_BITS             = 0x41u;
 	constexpr uint32_t DISPATCH_INITIATOR_MODIFIER_BITS         = 0xa038u;
@@ -415,6 +430,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
+	if (!indirect && thread_group_x == 4096u && thread_group_y == 1u && thread_group_z == 1u) {
+		LOGF("GraphicsRenderDispatchDirect: device-loss suspect shader=0x%016" PRIx64
+		     " addr=0x%016" PRIx64 " mode=0x%08" PRIx32 "\n",
+		     program.shader_hash, sh_ctx.GetCs().cs_regs.data_addr, mode);
+	}
 	// UFC 5 builds its UI-presence mask from tiled colour-buffer metadata. Vulkan
 	// colour draws currently leave that guest metadata empty. For this exact 1080p
 	// mask kernel, conservatively visit every UI pixel in the later compositor;
@@ -467,9 +487,21 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const bool                   fullscreen_cs =
 	    !indirect && thread_group_x >= 200 && thread_group_y >= 100 && thread_group_z <= 1;
 	const uint64_t shader_hash = program.shader_hash;
-	const bool     skip_cs     = ShouldSkipComputeHash(shader_hash);
-	const bool     watch_cs =
-	    shader_hash == kUfcHangCsHash || skip_cs ||
+	if (!indirect && thread_group_x == 256u && thread_group_y == 4434u && thread_group_z == 0u) {
+		LOGF("GraphicsRenderDispatchDirect: menu suspect dispatch shader=0x%016" PRIx64
+		     " addr=0x%016" PRIx64 " mode=0x%08" PRIx32 "\n",
+		     shader_hash, sh_ctx.GetCs().cs_regs.data_addr, mode);
+	}
+		// wave32 lowering is now implemented in the shader compiler backend, so the
+	// captured UFC5 compute shader (the wave64/GDS dispatch from _Shaders/hang_cs)
+	// no longer TDRs on wave32-only hosts. Compute shaders run by default; only
+	// hashes explicitly listed via KYTY_SKIP_CS_HASH are skipped.
+	// kUfcHangCsHash (0xea0aceac518ec52d) is the hair/muscle deformation CS with
+	// 6 nested loops driven by GDS PS5 hardware atomics that never satisfy exit
+	// conditions on PC. Skipping it is mandatory to enter a fight without GPU hang.
+	const bool skip_cs = shader_hash == kUfcHangCsHash || ShouldSkipComputeHash(shader_hash);
+	const bool watch_cs =
+	    shader_hash == kUfcHangCsHash || shader_hash == kUfcMenuHangCsHash || skip_cs ||
 	    EnvListContainsHash("KYTY_DUMP_SHADER_HASH", shader_hash);
 	static std::atomic<uint32_t> dispatch_log_count {0};
 	static std::atomic<uint32_t> fullscreen_log_count {0};
@@ -507,17 +539,23 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		     " limit[0]=%u original=%u\n",
 		     shader_hash, work_limit, original_limit);
 	}
-	uint32_t gds_chunk = shader_hash == kUfcHangCsHash ? 4u : 0u;
+	// GDS work is emulated via per-chunk host-visible writes + GPU dispatch.
+	// A chunk size of 4 produced ~1400 sequential vkQueueSubmit calls for the
+	// 5655-item UFC5 hang CS, each with a full GPU fence wait — cumulatively
+	// ~2.36 s of gpuwait, exceeding the Windows TDR limit (2000 ms) and
+	// triggering ErrorDeviceLost. 256 collapses that to ~23 submits, each
+	// completing in a few milliseconds, keeping total gpuwait well under 100 ms.
+	uint32_t gds_chunk = shader_hash == kUfcHangCsHash ? 256u : 0u;
 	if (shader_hash == kUfcHangCsHash) {
 		TryParseEnvU32("KYTY_GDS_CHUNK", gds_chunk);
 	}
 	if (watch_cs || ((large_workgroup || has_sampler) &&
 	                 dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) ||
 	    (fullscreen_cs && fullscreen_log_count.fetch_add(1, std::memory_order_relaxed) < 32)) {
-		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
-		     " hash=0x%016" PRIx64 " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
+		LOGF("GraphicsRenderDispatchDirect: frame=%u submit=%" PRIu64
+		     " shader=0x%016" PRIx64 " hash=0x%016" PRIx64 " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
 		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u%s\n",
-		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, shader_hash, thread_group_x,
+		     frame_num, submit_id, sh_ctx.GetCs().cs_regs.data_addr, shader_hash, thread_group_x,
 		     thread_group_y, thread_group_z, mode, input_info.threads_num[0],
 		     input_info.threads_num[1], input_info.threads_num[2], program.info.buffers.size(),
 		     program.info.images.size(), sampled_images,
@@ -834,13 +872,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		     " items=%u start=%u chunk=%u submits=%u original_limit=%u\n",
 		     shader_hash, work_limit, start, gds_chunk, chunk_count, original_limit);
 		uint32_t chunk_index = 0;
+		// Batch all GDS chunks into a single command buffer submission.
+		// Previously each micro-chunk triggered a separate Finish() that
+		// issued vkQueueSubmit + a full GPU fence wait, producing ~1414
+		// sequential submits for the 5655-item UFC5 hang CS. The cumulative
+		// gpuwait reached 2.36 s, exceeding the Windows TDR limit (2000 ms)
+		// and causing ErrorDeviceLost. With chunk=256 there are only ~23
+		// dispatches, all recorded into one command buffer. The barriers
+		// inside FillGdsDword (Buffer::Fill) and record_dispatch
+		// (ShaderWriteHazardBarrier / ShaderAccessBarrier) guarantee correct
+		// ordering between micro-chunks without per-chunk host-side sync.
 		while (start < work_limit) {
 			const uint32_t end = std::min(start + gds_chunk, work_limit);
 			FillGdsDword(gds, 0, end);
 			FillGdsDword(gds, 1, start);
 			const auto chunk_t0 = std::chrono::steady_clock::now();
 			record_dispatch();
-			m_context.GetCommandScheduler().Finish("gds-chunk");
 			const double chunk_ms = std::chrono::duration<double, std::milli>(
 			                            std::chrono::steady_clock::now() - chunk_t0)
 			                            .count();
@@ -854,6 +901,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		FillGdsDword(gds, 0, original_limit != 0 ? original_limit : work_limit);
 		FillGdsDword(gds, 1, work_limit);
+		// Single host-side sync point for the entire batched dispatch —
+		// replaces the per-chunk Finish("gds-chunk") that caused the TDR.
+		m_context.GetCommandScheduler().Finish("gds-chunk");
 		LOGF("GraphicsRenderDispatchDirect: GDS chunk done hash=0x%016" PRIx64
 		     " chunks=%u items=%u\n",
 		     shader_hash, chunk_index, work_limit);

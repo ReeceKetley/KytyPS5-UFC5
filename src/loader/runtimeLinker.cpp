@@ -24,6 +24,7 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -137,6 +138,18 @@ static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
 static constexpr uint64_t               UNRESOLVED_STUB_PAGE_SIZE      = 4096;
+
+static uint64_t g_dummy_dialog_context = 0;
+
+static KYTY_SYSV_ABI uint64_t DummyDialogContext() {
+	if (g_dummy_dialog_context == 0) {
+		g_dummy_dialog_context = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+		    0, 0x200, Common::VirtualMemory::Mode::ReadWrite, "dummy_player_invitation_dialog");
+		EXIT_NOT_IMPLEMENTED(g_dummy_dialog_context == 0);
+		std::memset(reinterpret_cast<void*>(g_dummy_dialog_context), 0, 0x200);
+	}
+	return g_dummy_dialog_context;
+}
 
 static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id);
 
@@ -320,12 +333,25 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 
 			return resolved.vaddr;
 		}
+
+		// UFC asks for a Net_v1.1 context helper that is absent from the current
+		// network shim. The unresolved thunk treats a nonzero return as a function
+		// address, so returning a negative SCE error here would jump to 0xffffffff...
+		// and crash. Return a small ABI-compatible function that provides a stable
+		// dummy context instead.
+		if (nid == "zJGf8xjFnQE") {
+			return reinterpret_cast<uint64_t>(DummyDialogContext);
+		}
+		if (nid == "Zo52g0A1XDw" || nid == "gDm5a6GSE94") {
+			return reinterpret_cast<uint64_t>(DummyDialogContext);
+		}
 	}
 
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
 			const auto& record = g_stubbed_imports[record_id];
+			LOGF("Unresolved import return=0 symbol=%s\n", record.name.c_str());
 			printf("Unresolved import stub called: %s\n", record.name.c_str());
 			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
 			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",

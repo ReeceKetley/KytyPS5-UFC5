@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <atomic>
 #include <mutex>
 
 #include <functional>
@@ -15,6 +16,7 @@
 
 #include <thread>
 #include <vector>
+#include <vk_mem_alloc.h>
 
 namespace Libs::Graphics {
 
@@ -44,8 +46,17 @@ public:
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+	// Every VMA-backed buffer is retired through this queue.  The queue is drained
+	// only at a frame boundary and keeps the resource alive for two scheduler ticks
+	// after the tick in which it was retired.
+	void                      QueueDeferredBufferDestroy(vk::Buffer buffer,
+	                                                     VmaAllocation allocation);
+	void                      DrainDeferredBufferDestroys(bool force = false);
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
+	[[nodiscard]] bool DeviceLost() const noexcept {
+		return m_device_lost.load(std::memory_order_acquire);
+	}
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
@@ -100,6 +111,12 @@ private:
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
+	struct DeferredBuffer {
+		vk::Buffer    buffer     = nullptr;
+		VmaAllocation allocation = nullptr;
+		uint64_t      retire_tick = 0;
+	};
+
 	// Command buffers + timeline for the transfer queue. Separate from m_command_pool,
 	// which is tied to the graphics family.
 	class TransferPool {
@@ -135,9 +152,12 @@ private:
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
+	std::mutex                   m_deferred_buffer_mutex;
+	std::vector<DeferredBuffer>  m_deferred_buffers;
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	std::atomic_bool              m_device_lost {false};
 };
 
 } // namespace Libs::Graphics

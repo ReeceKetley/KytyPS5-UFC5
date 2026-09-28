@@ -7667,6 +7667,114 @@ public:
                   !boundary_buffer_cache.HasGpuDirtyBytes(final_word_address, sizeof(uint32_t)),
               "a final-byte CPU read did not publish the GPU-owned final word");
 
+      // UFC 5 black-composite fix (Colour Pass #18 / EID 7952): a scene-sized
+      // render target address is reused as a Texture binding while two aliasing
+      // images of identical format/size/extent share that address — the
+      // freshly GPU-written render target and a stale/empty duplicate. FindImage
+      // must resolve to the GPU-written image, not the empty duplicate.
+      constexpr uint64_t alias_gpu_offset = 0x3f0000;
+      constexpr uint64_t alias_gpu_size   = 8 * 1024; // large enough for a real format
+      constexpr uint32_t alias_ext_width  = 64;
+      constexpr uint32_t alias_ext_height = 64;
+      constexpr uint32_t alias_bpp        = 4;
+      const uint32_t alias_pitch =
+          TileGetRenderTargetPitch(alias_ext_width, alias_bpp, 0);
+      TileSizeAlign alias_layout{};
+      uint64_t alias_real_size = 0;
+      Require(name, "alias render-target layout",
+              alias_pitch != 0 &&
+                  TileGetRenderTargetSize(alias_ext_width, alias_ext_height, alias_pitch,
+                                        alias_bpp, alias_layout, 0),
+              "alias render-target tile layout is unavailable");
+      alias_real_size = alias_layout.size;
+      Require(name, "alias render-target fits",
+              alias_real_size <= alias_gpu_size,
+              "alias render-target layout exceeds the reserved alias region");
+      std::memset(memory + alias_gpu_offset, 0, static_cast<size_t>(alias_real_size));
+      auto alias_gpu_desc = MakeLinearDesc(
+          base + alias_gpu_offset, alias_real_size, vk::Format::eR8G8B8A8Unorm,
+          Prospero::BufferFormat::k8_8_8_8UNorm, Prospero::ImageType::kColor2D,
+          {alias_ext_width, alias_ext_height, 1}, 1, 4, 1);
+      alias_gpu_desc.type = BindingType::RenderTarget;
+      alias_gpu_desc.info.tile_mode = Prospero::TileMode::kRenderTarget;
+      alias_gpu_desc.info.pitch = alias_pitch;
+      alias_gpu_desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+      const auto alias_gpu_image = texture_cache.FindImage(alias_gpu_desc);
+      (void)texture_cache.FindRenderTarget(alias_gpu_image, alias_gpu_desc);
+      texture_cache.MarkGpuWritten(alias_gpu_image);
+      Require(name, "alias gpu target ownership",
+              texture_cache.GetImage(alias_gpu_image).IsGpuModified(),
+              "alias render-target write did not claim GPU ownership");
+      // Create a stale/empty duplicate at the *same* address with the same format/size/extent.
+      auto alias_stale_desc = alias_gpu_desc;
+      const auto alias_stale_image = texture_cache.FindImage(alias_stale_desc, true);
+      Require(name, "alias empty duplicate distinct",
+              alias_stale_image != alias_gpu_image,
+              "alias duplicate was not a separate image");
+      // MarkGpuWritten must NOT have been called on the stale duplicate, so it
+      // remains a stale/empty image.
+      Require(name, "alias empty duplicate is stale",
+              !texture_cache.GetImage(alias_stale_image).IsGpuModified(),
+              "alias duplicate was unexpectedly marked GPU-written");
+      // Now re-resolve through the Texture path — the GPU-written render target
+      // must win over the stale duplicate.
+      auto alias_texture_desc = alias_gpu_desc;
+      alias_texture_desc.type = BindingType::Texture;
+      alias_texture_desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto alias_resolved = texture_cache.FindImage(alias_texture_desc);
+      Require(name, "GPU-written alias preferred over stale",
+              alias_resolved == alias_gpu_image,
+              "FindImage resolved to the stale/empty alias instead of the GPU-written render target");
+      Require(name, "GPU-written alias retained ownership",
+              texture_cache.GetImage(alias_resolved).IsGpuModified() &&
+                  texture_cache.GetImage(alias_resolved).usage.render_target,
+              "GPU-written alias lost render-target ownership during resolution");
+
+      // Priority 4 fallback test: when no descriptor-exact match exists at
+      // a given address (size mismatch), FindImageFromRange must still return
+      // a GPU-modified image with a valid non-zero extent.
+      constexpr uint64_t p4_gpu_offset = 0x3f8000;
+      constexpr uint64_t p4_gpu_size   = 64 * 64 * 4;
+      constexpr uint32_t p4_ext_width  = 64;
+      constexpr uint32_t p4_ext_height = 64;
+      constexpr uint32_t p4_bpp        = 4;
+      const uint32_t p4_pitch =
+          TileGetRenderTargetPitch(p4_ext_width, p4_bpp, 0);
+      TileSizeAlign p4_layout{};
+      Require(name, "Priority 4 render-target layout",
+              p4_pitch != 0 &&
+                  TileGetRenderTargetSize(p4_ext_width, p4_ext_height, p4_pitch,
+                                          p4_bpp, p4_layout, 0) &&
+                  p4_layout.size <= p4_gpu_size,
+              "Priority 4 render-target tile layout is unavailable");
+      std::memset(memory + p4_gpu_offset, 0, static_cast<size_t>(p4_layout.size));
+      auto p4_gpu_desc = MakeLinearDesc(
+          base + p4_gpu_offset, p4_layout.size, vk::Format::eR8G8B8A8Unorm,
+          Prospero::BufferFormat::k8_8_8_8UNorm, Prospero::ImageType::kColor2D,
+          {p4_ext_width, p4_ext_height, 1}, 1, 4, 1);
+      p4_gpu_desc.type = BindingType::RenderTarget;
+      p4_gpu_desc.info.tile_mode = Prospero::TileMode::kRenderTarget;
+      p4_gpu_desc.info.pitch = p4_pitch;
+      p4_gpu_desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+      const auto p4_gpu_image = texture_cache.FindImage(p4_gpu_desc);
+      (void)texture_cache.FindRenderTarget(p4_gpu_image, p4_gpu_desc);
+      texture_cache.MarkGpuWritten(p4_gpu_image);
+      Require(name, "Priority 4 GPU-modified image ownership",
+              texture_cache.GetImage(p4_gpu_image).IsGpuModified(),
+              "Priority 4 render-target write did not claim GPU ownership");
+      // Query with a *smaller* size than the actual image extent so that the
+      // size-based priorities (1/2/3) will all be skipped -- leaving Priority 4
+      // (GPU-modified fallback with non-zero extent) as the only candidate.
+      const auto p4_fallback = texture_cache.FindImageFromRange(
+          base + p4_gpu_offset, p4_layout.size / 4, true);
+      Require(name, "Priority 4 GPU-modified fallback",
+              p4_fallback == p4_gpu_image &&
+                  texture_cache.GetImage(p4_fallback).IsGpuModified() &&
+                  texture_cache.GetImage(p4_fallback).info.extent.width > 0 &&
+                  texture_cache.GetImage(p4_fallback).info.extent.height > 0,
+              "Priority 4 fallback did not resolve to the GPU-modified image "
+              "with a valid non-zero extent");
+
       resources.SetGpu(nullptr);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
@@ -26406,12 +26514,30 @@ void CheckShaderRecompilerFatalContracts() {
           ShaderRecompiler::IR::Value(descriptor.dwords[dword]);
     }
     program.srt_plan_complete = true;
-    auto plan = ShaderRecompiler::IR::ExtractResourcePlan(program);
-    ShaderRecompiler::IR::ResourceSnapshot snapshot;
-    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    static_assert(static_cast<uint32_t>(Prospero::BufferFormat::k32SInt) == 21u);
+    const auto materialize_format = [&](Prospero::BufferFormat format,
+                                        ShaderRecompiler::IR::ResourceSnapshot& snapshot,
+                                        ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+      program.descriptor_sources[0].dwords[1] =
+          ShaderRecompiler::IR::Value(static_cast<uint32_t>(format) << 20u);
+      const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(program);
+      return ShaderRecompiler::IR::MaterializeResources(plan, {}, snapshot, specialization);
+    };
+    ShaderRecompiler::IR::ResourceSnapshot signed_snapshot;
+    ShaderRecompiler::IR::ResourceSpecialization signed_specialization;
+    Require("SignedAtomicImageAcceptance", "resource materialization",
+            materialize_format(Prospero::BufferFormat::k32SInt, signed_snapshot,
+                               signed_specialization) &&
+                signed_specialization.images.size() == 1 &&
+                signed_specialization.images[0].numeric_class ==
+                    Prospero::TextureNumericClass::Uint,
+            "32-bit signed atomic image descriptor was rejected");
+
+    ShaderRecompiler::IR::ResourceSnapshot packed_snapshot;
+    ShaderRecompiler::IR::ResourceSpecialization packed_specialization;
     Require("PackedAtomicImageRejection", "resource materialization",
-            !ShaderRecompiler::IR::MaterializeResources(
-                plan, {}, snapshot, specialization),
+            !materialize_format(Prospero::BufferFormat::k11_11_10UInt, packed_snapshot,
+                                packed_specialization),
             "packed atomic image descriptor was accepted");
   }
 }

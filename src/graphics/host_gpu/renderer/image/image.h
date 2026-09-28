@@ -157,8 +157,6 @@ private:
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,
 	                                                   uint64_t capacity) noexcept;
-	[[nodiscard]] static std::pair<uint32_t, uint32_t>
-	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
@@ -172,6 +170,8 @@ private:
 
 namespace ImageOps {
 
+[[nodiscard]] bool SanitizeCopyRegion(const VulkanImage& source, const VulkanImage& destination,
+                                      vk::ImageCopy& region, const char* operation);
 void                                 Validate(const ImageInfo& info);
 [[nodiscard]] Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element);
 

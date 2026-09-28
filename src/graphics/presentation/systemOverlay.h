@@ -32,6 +32,13 @@ public:
 	void               Record(vk::CommandBuffer command, vk::ImageView target);
 	void               ReleaseVulkan();
 
+	// HUD overlay support (Problem 3: 3D scene under HUD).
+	// Call before PrepareFrame to register a HUD texture for alpha compositing
+	// on top of the 3D scene. The image must be in VK_IMAGE_LAYOUT_SHADER_READ_ONLY
+	// and have a view with the given format. Pass {} to clear the overlay.
+	void               SetHudOverlay(vk::ImageView image_view, vk::Extent2D extent, vk::Format format);
+	bool               HasHudOverlay() const noexcept;
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

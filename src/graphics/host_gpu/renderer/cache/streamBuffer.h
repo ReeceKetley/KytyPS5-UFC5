@@ -10,8 +10,7 @@
 #include <span>
 #include <utility>
 #include <vector>
-
-VK_DEFINE_HANDLE(VmaAllocation)
+#include <vk_mem_alloc.h>
 
 namespace Libs::Graphics {
 
@@ -48,13 +47,17 @@ public:
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
-	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
+		[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
+	[[nodiscard]] VmaAllocation     Allocation() const noexcept { return m_allocation; }
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
 	}
 	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept;
 	void               IncreaseStreamScore(int score) noexcept { stream_score += score; }
 	[[nodiscard]] int  StreamScore() const noexcept { return stream_score; }
+	// Marks this buffer as already queued by an owning cache.  The destructor
+	// otherwise submits the pair to CommandScheduler's global deferred queue.
+	void               SetDeferredDestroy() noexcept { m_deferred_destroy = true; }
 	void               Write(uint64_t offset, const void* source, uint64_t size);
 	void               Flush(uint64_t offset, uint64_t size);
 	void               Invalidate(uint64_t offset, uint64_t size);
@@ -103,6 +106,7 @@ private:
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;
+	bool                          m_deferred_destroy = false;
 };
 
 class StreamBuffer final: public Buffer {

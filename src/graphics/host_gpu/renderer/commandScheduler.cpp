@@ -145,6 +145,10 @@ void CommandScheduler::Shutdown() {
 	m_master.Wait(CurrentTick() - 1);
 	PopPendingOperations();
 	DrainPriorityOperations();
+	// Resource owners are destroyed after GpuResourceManager's shutdown path has
+	// submitted all work.  At this point it is safe to release the remaining
+	// deferred buffers regardless of their two-tick normal retirement margin.
+	DrainDeferredBufferDestroys(true);
 	m_priority_thread.request_stop();
 	m_operation_available.notify_all();
 	if (m_priority_thread.joinable()) {
@@ -157,6 +161,55 @@ void CommandScheduler::Shutdown() {
 		m_operation_state = OperationState::Closed;
 	}
 	m_operation_available.notify_all();
+}
+
+void CommandScheduler::QueueDeferredBufferDestroy(vk::Buffer buffer, VmaAllocation allocation) {
+	if (buffer == nullptr) {
+		return;
+	}
+	bool destroy_now = false;
+	{
+		std::lock_guard lock(m_operation_mutex);
+		// RenderContext destroys GpuResourceManager after its destructor body has
+		// already closed the scheduler.  All GPU work has been waited out there,
+		// so late resource destructors may release their buffers directly without
+		// violating the normal two-tick rule.
+		destroy_now = m_operation_state == OperationState::Closed;
+	}
+	if (destroy_now) {
+		vmaDestroyBuffer(m_graphics.allocator, buffer, allocation);
+		return;
+	}
+	std::lock_guard lock(m_deferred_buffer_mutex);
+	m_deferred_buffers.push_back({buffer, allocation, CurrentTick()});
+}
+
+void CommandScheduler::DrainDeferredBufferDestroys(bool force) {
+	std::vector<DeferredBuffer> pending;
+	{
+		std::lock_guard lock(m_deferred_buffer_mutex);
+		pending.swap(m_deferred_buffers);
+	}
+	if (pending.empty()) {
+		return;
+	}
+
+	std::vector<DeferredBuffer> still_pending;
+	still_pending.reserve(pending.size());
+	for (auto& entry: pending) {
+		const bool margin_elapsed =
+		    entry.retire_tick <= UINT64_MAX - 2 && IsFree(entry.retire_tick + 2);
+		if (!force && !margin_elapsed) {
+			still_pending.push_back(entry);
+			continue;
+		}
+		vmaDestroyBuffer(m_graphics.allocator, entry.buffer, entry.allocation);
+	}
+	if (!still_pending.empty()) {
+		std::lock_guard lock(m_deferred_buffer_mutex);
+		m_deferred_buffers.insert(m_deferred_buffers.end(), still_pending.begin(),
+		                           still_pending.end());
+	}
 }
 
 void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config,
@@ -473,6 +526,10 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	FrameWorkScope frame_work(FrameWorkKind::Submit);
 	EXIT_IF(m_command.IsInvalid());
+	if (DeviceLost()) {
+		m_command.m_buffer = nullptr;
+		return m_master.CurrentTick();
+	}
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
@@ -512,8 +569,14 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
 		                  m_command.m_debug_arg4);
+		if (result == vk::Result::eErrorDeviceLost || result == vk::Result::eTimeout) {
+			m_device_lost.store(true, std::memory_order_release);
+			LOGF("vkQueueSubmit recovery: dropping failed command after %s\n",
+			     vk::to_string(result).c_str());
+		}
+		m_command.m_buffer = nullptr;
+		return tick;
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_command.m_buffer = nullptr;
 	return tick;
@@ -646,7 +709,13 @@ bool CommandScheduler::SubmitTransferReadback(
 
 	{
 		Common::LockGuard queue_lock(m_graphics.transfer_queue_mutex);
-		if (m_graphics.transfer_queue.submit(1, &submit, nullptr) != vk::Result::eSuccess) {
+		const auto result = m_graphics.transfer_queue.submit(1, &submit, nullptr);
+		if (result != vk::Result::eSuccess) {
+			ReportVulkanFatal("vkQueueSubmit[transfer]", result, transfer_tick, 0, 0, 0, 0, 0, 0,
+			                  producer_tick);
+			if (result == vk::Result::eErrorDeviceLost || result == vk::Result::eTimeout) {
+				m_device_lost.store(true, std::memory_order_release);
+			}
 			return false;
 		}
 	}

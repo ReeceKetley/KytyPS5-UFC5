@@ -986,6 +986,25 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .compute             = compute,
 	    .embedded_fetch      = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
+	// Lower wave64 compute shaders to wave32 when the host's physical subgroup
+	// size is 32.  On hosts like the RTX 4070 the physical subgroup is always 32
+	// even when VK_EXT_subgroup_size_control is available, and the dual-lane
+	// (lane_count=2) wave64 emulation causes TDR timeouts.  Lowering to a native
+	// wave32 avoids the split without changing semantics.
+	//
+	// The host subgroup size is carried by the compute input info when available;
+	// when it is not (compute == nullptr), fall back to the CompileOptions-level
+	// field that is set from the GPU context's physical subgroup_size.
+	if (options.wave_size == 64u && options.stage == ShaderType::Compute) {
+		const uint32_t host_size =
+		    compute != nullptr ? compute->host_subgroup_size
+		                        : options.host_subgroup_size;
+		if (host_size != 64u) {
+			LOGF("%s wave32 lowering: lowering wave64 CS 0x%016" PRIx64 " to wave32\n",
+			     GetDumpLabel(options), options.shader_hash);
+			translate_options.wave_size = 32u;
+		}
+	}
 	const auto finish_value_ir = [&](IR::Program& ir) {
 		IR::RewriteToSsa(ir.blocks);
 		IR::ConstantPropagationPass(ir.blocks);

@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 namespace Libs::Graphics {
@@ -26,7 +27,14 @@ MasterSemaphore::~MasterSemaphore() {
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		LOGF("MasterSemaphore: vkGetSemaphoreCounterValue failed: %s (%d)\n",
+		     vk::to_string(result).c_str(), static_cast<int>(result));
+		// Do not spin or abort while the device is being torn down. No future tick can
+		// be observed after a lost device, so release all scheduler waiters.
+		m_gpu_tick.store(UINT64_MAX, std::memory_order_release);
+		return;
+	}
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
 	while (known < counter &&
@@ -49,8 +57,14 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	constexpr uint64_t kWaitTimeoutNs = 5'000'000'000ull;
+	const auto result = m_graphics.device.waitSemaphores(&wait_info, kWaitTimeoutNs);
+	if (result != vk::Result::eSuccess) {
+		LOGF("MasterSemaphore: vkWaitSemaphores failed: %s (%d), tick=%" PRIu64 "\n",
+		     vk::to_string(result).c_str(), static_cast<int>(result), tick);
+		m_gpu_tick.store(UINT64_MAX, std::memory_order_release);
+		return;
+	}
 	Refresh();
 }
 

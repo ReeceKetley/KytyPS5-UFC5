@@ -529,6 +529,12 @@ bool ViewCompatible(const VulkanImage& image, ImageViewInfo view) noexcept {
 		view.format = image.format;
 		view.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
+	if (image_aspect & (vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil) &&
+	    view.aspect == vk::ImageAspectFlagBits::eColor &&
+	    !FormatsCompatible(image.format, view.format) && !is_storage) {
+		view.format = image.format;
+		view.aspect = vk::ImageAspectFlagBits::eDepth;
+	}
 	view.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
 	if (view.format == vk::Format::eUndefined || !FormatsCompatible(image.format, view.format)) {
 		return false;
@@ -591,6 +597,12 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	    IsStencilViewFormat(normalized.format)) {
 		normalized.format = image.format;
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
+	}
+	if (image_aspect & (vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil) &&
+	    normalized.aspect == vk::ImageAspectFlagBits::eColor &&
+	    !ImageViewOps::FormatsCompatible(image.format, normalized.format) && !is_storage) {
+		normalized.format = image.format;
+		normalized.aspect = vk::ImageAspectFlagBits::eDepth;
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
 	// A guest descriptor may reference a mip level that was clamped away when the image

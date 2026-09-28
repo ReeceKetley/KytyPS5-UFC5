@@ -30,6 +30,7 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               rt_extensions_enabled                 = false;
 	bool                               compute_subgroup_size_control_enabled = false;
+	bool                               compute_full_subgroups                = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               supports_block_texel_view              = false;

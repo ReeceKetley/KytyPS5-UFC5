@@ -421,6 +421,7 @@ struct PipelineCache::ProgramCache {
 			}
 		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			options.wave_size = input_info.wave_size;
+			options.host_subgroup_size = input_info.host_subgroup_size;
 		}
 		const auto compile_start = Common::Timer::QueryPerformanceCounter();
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
@@ -437,28 +438,6 @@ struct PipelineCache::ProgramCache {
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
-
-		std::array<size_t, static_cast<size_t>(ShaderType::Mesh) + 1> counts {};
-		for (const auto& [key, source]: programs) {
-			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
-		}
-		const char* stage_tag = "??";
-		switch (stage) {
-			case ShaderType::Vertex: stage_tag = "VS"; break;
-			case ShaderType::Mesh: stage_tag = "GS"; break;
-			case ShaderType::Pixel: stage_tag = "PS"; break;
-			case ShaderType::Compute: stage_tag = "CS"; break;
-			default: break;
-		}
-		// Guest geometry shaders are compiled through the host mesh stage.
-		PipelineCacheLog(
-		    "ShaderCompile: {} id={} hash=0x{:016x} addr=0x{:016x} words={} ms={:.1f} | "
-		    "VS {} | PS {} | CS {} | GS {}",
-		    stage_tag, permutation.handle.id, params.hash, params.Base(), params.code.size(),
-		    compile_us / 1000.0, counts[static_cast<size_t>(ShaderType::Vertex)],
-		    counts[static_cast<size_t>(ShaderType::Pixel)],
-		    counts[static_cast<size_t>(ShaderType::Compute)],
-		    counts[static_cast<size_t>(ShaderType::Mesh)]);
 		return permutation.handle;
 	}
 
@@ -715,7 +694,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
-	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+	input_info.host_subgroup_size = m_graphics.subgroup_size;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor = 0;
@@ -884,21 +863,8 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
 	                       vertex_program, ps_input_info, pixel_program, static_params,
 	                       m_driver_cache);
-	const auto pipeline_us =
-	    NoteCompileTime(g_pipeline_create_count, g_pipeline_create_us, pipeline_start);
+	NoteCompileTime(g_pipeline_create_count, g_pipeline_create_us, pipeline_start);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
-	const auto vs_hash = vs_input_info.stage.program != nullptr
-	                         ? vs_input_info.stage.program->shader_hash
-	                         : vertex_program.hash;
-	const auto ps_hash = ps_active && ps_input_info->stage.program != nullptr
-	                         ? ps_input_info->stage.program->shader_hash
-	                         : pixel_program.hash;
-	PipelineCacheLog(
-	    "GfxPipeline: vs_id={} ps_id={} vs_hash=0x{:016x} vs_addr=0x{:016x} "
-	    "ps_hash=0x{:016x} ps_addr=0x{:016x} colors={} samples={} ms={:.1f}",
-	    vs_id, ps_id, vs_hash, vertex_program.addr, ps_hash, pixel_program.addr, color_count,
-	    attachment_samples, pipeline_us / 1000.0);
-
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 

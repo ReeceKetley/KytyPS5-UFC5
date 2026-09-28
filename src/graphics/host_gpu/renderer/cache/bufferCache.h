@@ -48,6 +48,10 @@ public:
 	// Apply 1-frame-latency staging->guest writebacks whose GPU tick has retired
 	// (force = wait + apply all). Must be called before a guest range is unmapped.
 	void                   DrainDeferredReadbacks(bool force);
+	// Compatibility wrappers around CommandScheduler's global deferred buffer
+	// destruction queue.  All VkBuffer/VmaAllocation pairs share one owner.
+	void                   QueueDeferredBufferDestroy(vk::Buffer buffer, VmaAllocation allocation);
+	void                   DrainDeferredBufferDestroys();
 	// Force [vaddr,size) fully current for an immediate CPU read (indirect draw /
 	// dispatch args, count buffers): download any GPU-dirty part and land every
 	// deferred writeback. Never leaves this range on the 1-frame-latency path.

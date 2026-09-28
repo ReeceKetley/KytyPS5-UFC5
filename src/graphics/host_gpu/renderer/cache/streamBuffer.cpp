@@ -123,8 +123,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 }
 
 Buffer::~Buffer() {
-	if (m_buffer != nullptr) {
-		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
+	if (m_buffer != nullptr && !m_deferred_destroy) {
+		m_scheduler->QueueDeferredBufferDestroy(m_buffer, m_allocation);
 	}
 }
 
