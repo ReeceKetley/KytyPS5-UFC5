@@ -55,14 +55,6 @@ void BufferCache::Unregister(BufferId id) {
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	auto& buffer = m_slot_buffers[id];
-	// Running total of what THIS cache holds. RunGarbageCollector needs it on every run, so it
-	// cannot be recomputed by walking m_slot_buffers; the symmetric register/unregister hook is
-	// the cheap place to maintain it.
-	if constexpr (insert) {
-		m_registered_bytes += buffer.Size();
-	} else {
-		m_registered_bytes -= std::min(m_registered_bytes, buffer.Size());
-	}
 	PageTable::PageRange pages {};
 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
 	        !PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
@@ -606,19 +598,20 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	// Driver usage includes other caches and allocator reservations. Keep it
+	// separate from the owned-byte counter decremented during unregistration.
+	const auto used_memory = m_graphics.CanReportMemoryUsage()
+	    ? m_graphics.GetDeviceMemoryUsage() : m_total_used_memory;
+	if (used_memory < m_trigger_gc_memory) {
 		return;
 	}
 
-	// m_total_used_memory is TOTAL device memory, shared with the texture cache - and the texture
-	// cache cannot evict GPU-modified tiled images, so it pins total memory above critical with
-	// memory this cache neither owns nor can free. Gating `aggressive` on that alone left the
-	// buffer GC downloading dirty buffers forever (each download is a full GPU drain) in response
-	// to pressure it could not relieve. Require this cache to hold a material share of the budget
-	// before it pays that cost. KYTY_BUFGC_OWN_SHARE=0 restores the old behaviour.
+	// Driver pressure alone does not justify a drain: the texture cache cannot evict GPU-modified
+	// tiled images, so it pins device usage above critical with memory this cache neither owns nor
+	// can free. Gating `aggressive` on device usage alone left the buffer GC downloading dirty
+	// buffers forever (each download is a full GPU drain) in response to pressure it could not
+	// relieve. Require this cache to hold a material share of the budget before it pays that cost.
+	// KYTY_BUFGC_OWN_SHARE=0 restores the old behaviour.
 	static const uint64_t own_share_pct = [] {
 		const char* env = std::getenv("KYTY_BUFGC_OWN_SHARE");
 		if (env == nullptr) {
@@ -628,9 +621,11 @@ void BufferCache::RunGarbageCollector() {
 		const auto parsed = std::strtoull(env, &end, 10);
 		return end == env ? uint64_t {25} : parsed;
 	}();
+	// m_total_used_memory is this cache's own registered bytes now that the driver snapshot is
+	// kept separate above.
 	const bool own_pressure =
-	    own_share_pct == 0 || m_registered_bytes >= m_critical_gc_memory * own_share_pct / 100;
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory && own_pressure;
+	    own_share_pct == 0 || m_total_used_memory >= m_critical_gc_memory * own_share_pct / 100;
+	const bool     aggressive = used_memory >= m_critical_gc_memory && own_pressure;
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
