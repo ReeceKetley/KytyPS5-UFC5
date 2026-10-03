@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/dispatchInspector.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/watchedImageTrace.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 
 #include <algorithm>
@@ -177,6 +178,7 @@ void RefreshTracedResources() {
 	// applies to - so what is measured can be changed without restarting and re-navigating.
 	ShaderRecompiler::ReloadProbeConfig();
 	RefreshDispatchInspector();
+	WatchedImageRefreshTriggers();
 }
 
 bool TraceResourceAddress(uint64_t address, uint64_t size) {

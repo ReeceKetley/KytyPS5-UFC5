@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/host_gpu/renderer/sceneDrawDebug.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -21,8 +22,8 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cmath>
 #include <cinttypes>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -37,8 +38,8 @@
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
-#include <xxhash.h>
 #include <vulkan/vk_platform.h>
+#include <xxhash.h>
 
 // IWYU pragma: no_include <intrin.h>
 
@@ -165,18 +166,17 @@ void WriteBmpBgra(const std::filesystem::path& path, uint32_t width, uint32_t he
 	return decoded;
 }
 
-void ConvertPackedToBgra(vk::Format format, uint32_t width, uint32_t height,
-                         const uint8_t* packed, std::vector<uint8_t>& bgra, uint64_t& nonzero,
-                         uint32_t& max_channel) {
+void ConvertPackedToBgra(vk::Format format, uint32_t width, uint32_t height, const uint8_t* packed,
+                         std::vector<uint8_t>& bgra, uint64_t& nonzero, uint32_t& max_channel) {
 	bgra.resize(static_cast<size_t>(width) * height * 4u);
-	nonzero     = 0;
-	max_channel = 0;
+	nonzero              = 0;
+	max_channel          = 0;
 	const uint32_t count = width * height;
 	auto           put   = [&](size_t i, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
-        bgra[i * 4 + 0] = b;
-        bgra[i * 4 + 1] = g;
-        bgra[i * 4 + 2] = r;
-        bgra[i * 4 + 3] = a;
+        bgra[i * 4 + 0]    = b;
+        bgra[i * 4 + 1]    = g;
+        bgra[i * 4 + 2]    = r;
+        bgra[i * 4 + 3]    = a;
         const uint8_t peak = std::max({r, g, b});
         max_channel        = std::max(max_channel, static_cast<uint32_t>(peak));
         if (r | g | b) {
@@ -208,8 +208,7 @@ void ConvertPackedToBgra(vk::Format format, uint32_t width, uint32_t height,
 			for (uint32_t i = 0; i < count; i++) {
 				const uint32_t p = words[i];
 				put(i, Unorm10To8(p & 0x3ffu), Unorm10To8((p >> 10) & 0x3ffu),
-				    Unorm10To8((p >> 20) & 0x3ffu),
-				    static_cast<uint8_t>(((p >> 30) & 0x3u) * 85u));
+				    Unorm10To8((p >> 20) & 0x3ffu), static_cast<uint8_t>(((p >> 30) & 0x3u) * 85u));
 			}
 			return;
 		case vk::Format::eB10G11R11UfloatPack32:
@@ -318,100 +317,128 @@ void ConvertPackedToBgra(vk::Format format, uint32_t width, uint32_t height,
 
 void DumpGpuImage(CommandBuffer& command, RenderContext& renderer, Image& image, const char* tag,
                   uint64_t address, bool dump, bool raw = false,
-                  const std::string* exact_stem = nullptr,
+                  const std::string*                      exact_stem  = nullptr,
                   std::function<void(uint64_t, uint64_t)> on_complete = {}) {
 	if (!dump || command.IsInvalid() || image.backing.image == nullptr || !image.IsGpuModified()) {
 		return;
 	}
 	const auto width  = image.backing.extent.width;
 	const auto height = image.backing.extent.height;
+	const auto depth  = image.backing.extent.depth;
 	if (!DumpFormatSupported(image.backing.format)) {
 		return;
 	}
-	if (width == 0 || height == 0 || image.backing.extent.depth != 1) {
+	if (width == 0 || height == 0 || depth == 0) {
 		return;
 	}
 	const auto frame_num = renderer.DiagnosticFrameNum();
-
-	const uint64_t byte_size =
+	// Array images (e.g. UFC UI strip 512x3x7) and volume icons (32x32x32 type=10): dump each
+	// layer / depth slice so rainbow/corruption outside slice 0 is visible. Cap total slices.
+	constexpr uint32_t kMaxDumpSlices = 16u;
+	const uint32_t     layer_count    = std::max(image.backing.layers, 1u);
+	const uint32_t     depth_count    = std::max(depth, 1u);
+	const uint32_t     total_slices   = layer_count * depth_count;
+	const uint32_t     slice_limit    = std::min(total_slices, kMaxDumpSlices);
+	const uint64_t     byte_size =
 	    static_cast<uint64_t>(width) * height * DumpBytesPerPixel(image.backing.format);
-	auto&          scheduler = renderer.GetCommandScheduler();
-	auto&          download  = renderer.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
-	auto [mapped, offset]    = download.Map(byte_size, 256);
-	if (mapped == nullptr) {
-		LOGF("VideoOut dump: failed to map download buffer for %s\n", tag);
-		return;
-	}
+	auto& scheduler = renderer.GetCommandScheduler();
+	auto& download  = renderer.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
 
 	command.EndRendering();
 	auto vk_command = command.Handle();
 	image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	              vk_command);
-	vk::BufferImageCopy copy {};
-	copy.bufferOffset                    = offset;
-	copy.imageSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
-	copy.imageSubresource.mipLevel       = 0;
-	copy.imageSubresource.baseArrayLayer = 0;
-	copy.imageSubresource.layerCount     = 1;
-	copy.imageExtent                     = {width, height, 1};
-	vk::BufferMemoryBarrier2 to_copy {};
-	to_copy.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
-	to_copy.srcAccessMask       = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-	to_copy.dstStageMask        = vk::PipelineStageFlagBits2::eCopy;
-	to_copy.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
-	to_copy.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	to_copy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	to_copy.buffer              = download.Handle();
-	to_copy.offset              = offset;
-	to_copy.size                = byte_size;
-	vk::DependencyInfo dependency {};
-	dependency.bufferMemoryBarrierCount = 1;
-	dependency.pBufferMemoryBarriers    = &to_copy;
-	vk_command.pipelineBarrier2(dependency);
-	vk_command.copyImageToBuffer(image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
-	                             download.Handle(), 1, &copy);
-	to_copy.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
-	to_copy.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-	to_copy.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
-	to_copy.dstAccessMask = vk::AccessFlagBits2::eHostRead;
-	vk_command.pipelineBarrier2(dependency);
-	download.Commit();
 
-	const auto      format   = image.backing.format;
-	const std::string tag_copy = tag;
-	const std::string stem_copy = exact_stem != nullptr ? *exact_stem : std::string {};
-	scheduler.DeferPriorityOperation(
-	    [&download, mapped, offset, byte_size, width, height, format, frame_num, tag_copy,
-	     address, raw, stem_copy, on_complete] {
-		    download.Invalidate(offset, byte_size);
-		    std::vector<uint8_t> packed(mapped, mapped + byte_size);
-		    std::vector<uint8_t> bgra;
-		    uint64_t             nonzero     = 0;
-		    uint32_t             max_channel = 0;
-		    ConvertPackedToBgra(format, width, height, packed.data(), bgra, nonzero, max_channel);
-		    std::error_code ec;
-		    std::filesystem::create_directories("D:/PS5/dumps", ec);
-		    const auto path = stem_copy.empty()
-		                          ? std::filesystem::path("D:/PS5/dumps") /
-		                                (tag_copy + "-f" + std::to_string(frame_num) + ".bmp")
-		                          : std::filesystem::path(stem_copy + ".bmp");
-		    WriteBmpBgra(path, width, height, bgra);
-		    if (raw) {
-			    auto raw_path = path;
-			    raw_path.replace_extension(".bin");
-			    std::ofstream output(raw_path, std::ios::binary);
-			    output.write(reinterpret_cast<const char*>(packed.data()),
-			                 static_cast<std::streamsize>(packed.size()));
-		    }
-		    const auto xxh3 = XXH3_64bits(packed.data(), packed.size());
-		    LOGF("VideoOut dump: %s frame=%d fmt=%d addr=0x%016" PRIx64
-		         " extent=%ux%u nonzero=%" PRIu64 "/%u max8=%u xxh3=0x%016" PRIx64 " file=%s\n",
-		         tag_copy.c_str(), frame_num, static_cast<int>(format), address, width, height,
-		         nonzero, width * height, max_channel, xxh3, path.string().c_str());
-		    if (on_complete) {
-			    on_complete(xxh3, byte_size);
-		    }
-	    });
+	uint32_t slices_done = 0;
+	for (uint32_t layer = 0; layer < layer_count && slices_done < slice_limit; ++layer) {
+		for (uint32_t z = 0; z < depth_count && slices_done < slice_limit; ++z, ++slices_done) {
+			auto [mapped, offset] = download.Map(byte_size, 256);
+			if (mapped == nullptr) {
+				LOGF("VideoOut dump: failed to map download buffer for %s layer=%u z=%u\n", tag,
+				     layer, z);
+				return;
+			}
+			vk::BufferImageCopy copy {};
+			copy.bufferOffset                    = offset;
+			copy.imageSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
+			copy.imageSubresource.mipLevel       = 0;
+			copy.imageSubresource.baseArrayLayer = layer;
+			copy.imageSubresource.layerCount     = 1;
+			copy.imageOffset                     = {0, 0, static_cast<int32_t>(z)};
+			copy.imageExtent                     = {width, height, 1};
+			vk::BufferMemoryBarrier2 to_copy {};
+			to_copy.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+			to_copy.srcAccessMask       = vk::AccessFlagBits2::eMemoryRead |
+			                        vk::AccessFlagBits2::eMemoryWrite;
+			to_copy.dstStageMask        = vk::PipelineStageFlagBits2::eCopy;
+			to_copy.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+			to_copy.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			to_copy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			to_copy.buffer              = download.Handle();
+			to_copy.offset              = offset;
+			to_copy.size                = byte_size;
+			vk::DependencyInfo dependency {};
+			dependency.bufferMemoryBarrierCount = 1;
+			dependency.pBufferMemoryBarriers    = &to_copy;
+			vk_command.pipelineBarrier2(dependency);
+			vk_command.copyImageToBuffer(image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+			                             download.Handle(), 1, &copy);
+			to_copy.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
+			to_copy.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+			to_copy.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+			to_copy.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+			vk_command.pipelineBarrier2(dependency);
+			download.Commit();
+
+			const auto format = image.backing.format;
+			std::string suffix;
+			if (layer_count > 1) {
+				suffix += "-L" + std::to_string(layer);
+			}
+			if (depth_count > 1) {
+				suffix += "-Z" + std::to_string(z);
+			}
+			const std::string tag_copy  = std::string(tag) + suffix;
+			const std::string stem_copy = exact_stem != nullptr ? (*exact_stem + suffix)
+			                                                    : std::string {};
+			const bool        last_slice = slices_done + 1 == slice_limit;
+			scheduler.DeferPriorityOperation(
+			    [&download, mapped, offset, byte_size, width, height, format, frame_num, tag_copy,
+			     address, raw, stem_copy, on_complete, last_slice] {
+				    download.Invalidate(offset, byte_size);
+				    std::vector<uint8_t> packed(mapped, mapped + byte_size);
+				    std::vector<uint8_t> bgra;
+				    uint64_t             nonzero     = 0;
+				    uint32_t             max_channel = 0;
+				    ConvertPackedToBgra(format, width, height, packed.data(), bgra, nonzero,
+				                        max_channel);
+				    std::error_code ec;
+				    std::filesystem::create_directories("D:/PS5/dumps", ec);
+				    const auto path =
+				        stem_copy.empty()
+				            ? std::filesystem::path("D:/PS5/dumps") /
+				                  (tag_copy + "-f" + std::to_string(frame_num) + ".bmp")
+				            : std::filesystem::path(stem_copy + ".bmp");
+				    WriteBmpBgra(path, width, height, bgra);
+				    if (raw) {
+					    auto raw_path = path;
+					    raw_path.replace_extension(".bin");
+					    std::ofstream output(raw_path, std::ios::binary);
+					    output.write(reinterpret_cast<const char*>(packed.data()),
+					                 static_cast<std::streamsize>(packed.size()));
+				    }
+				    const auto xxh3 = XXH3_64bits(packed.data(), packed.size());
+				    LOGF("VideoOut dump: %s frame=%d fmt=%d addr=0x%016" PRIx64
+				         " extent=%ux%u nonzero=%" PRIu64 "/%u max8=%u xxh3=0x%016" PRIx64
+				         " file=%s\n",
+				         tag_copy.c_str(), frame_num, static_cast<int>(format), address, width,
+				         height, nonzero, width * height, max_channel, xxh3, path.string().c_str());
+				    if (last_slice && on_complete) {
+					    on_complete(xxh3, byte_size);
+				    }
+			    });
+		}
+	}
 }
 
 // One-shot image clear, triggered by writing comma-separated hex addresses into
@@ -478,11 +505,19 @@ void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCac
 	// whatever the current scene actually uses.
 	static const std::vector<uint64_t> kSurfaces = [] {
 		std::vector<uint64_t> list {
-		    0x0000001162c00000ull, 0x0000001163470000ull, 0x0000001167150000ull,
-		    0x0000001169860000ull, 0x0000001168270000ull, 0x0000001168260000ull,
-		    0x0000001164240000ull, 0x0000001164e50000ull, 0x00000011592b0000ull,
+		    0x0000001162c00000ull,
+		    0x0000001163470000ull,
+		    0x0000001167150000ull,
+		    0x0000001169860000ull,
+		    0x0000001168270000ull,
+		    0x0000001168260000ull,
+		    0x0000001164240000ull,
+		    0x0000001164e50000ull,
+		    0x00000011592b0000ull,
 		    // In-fight 1600x900 targets, the dominant render extent in a round.
-		    0x0000001170e40000ull, 0x0000001170210000ull, 0x000000116d5b0000ull,
+		    0x0000001170e40000ull,
+		    0x0000001170210000ull,
+		    0x000000116d5b0000ull,
 		};
 		const char* env = std::getenv("KYTY_DUMP_SURFACES");
 		if (env == nullptr || env[0] == '\0') {
@@ -519,8 +554,9 @@ void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCac
 		for (const auto each: all) {
 			const auto& img = cache.GetImage(each);
 			char        all_tag[64];
-			std::snprintf(all_tag, sizeof(all_tag), "rt%08x-%ux%u-i%u", static_cast<uint32_t>(address),
-			              img.backing.extent.width, img.backing.extent.height, each.index);
+			std::snprintf(all_tag, sizeof(all_tag), "rt%08x-%ux%u-i%u",
+			              static_cast<uint32_t>(address), img.backing.extent.width,
+			              img.backing.extent.height, each.index);
 			LOGF("DumpAlias: %s addr=0x%016" PRIx64 " img=%u:%u extent=%ux%u fmt=%d "
 			     "render_target=%d gpu_modified=%d frame=%d count=%zu\n",
 			     all_tag, address, each.index, each.generation, img.backing.extent.width,
@@ -539,11 +575,10 @@ void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCac
 		// WatchedDrawTarget: if the draws write a different ImageId than the dump reads for the
 		// same guest address, the surface is aliased and the compositor is reading the wrong
 		// one - which is what a frozen dump alongside a live game would mean.
-		uint32_t draw_img        = UINT32_MAX;
-		uint32_t draw_generation = 0;
-		uint32_t draw_frame      = UINT32_MAX;
-		const bool tracked =
-		    GetTrackedDrawTarget(address, draw_img, draw_generation, draw_frame);
+		uint32_t   draw_img        = UINT32_MAX;
+		uint32_t   draw_generation = 0;
+		uint32_t   draw_frame      = UINT32_MAX;
+		const bool tracked = GetTrackedDrawTarget(address, draw_img, draw_generation, draw_frame);
 		LOGF("DumpResolve: %s addr=0x%016" PRIx64
 		     " img=%u:%u draw_img=%u:%u draw_frame=%u dump_frame=%d tracked=%d\n",
 		     tag, address, id.index, id.generation, draw_img, draw_generation, draw_frame,
@@ -568,18 +603,19 @@ void DumpShaderInput(CommandBuffer& command, RenderContext& renderer, Image& ima
 	const auto saved = image.backing.state;
 	if (saved.layout == vk::ImageLayout::eUndefined || image.backing.samples != 1) return;
 	if (!image.IsGpuModified() || !DumpFormatSupported(image.backing.format) ||
-	    image.backing.extent.depth != 1) return;
-	static uint64_t budget_frame = UINT64_MAX;
-	static uint64_t budget_bytes = 0;
+	    image.backing.extent.depth != 1)
+		return;
+	static uint64_t   budget_frame = UINT64_MAX;
+	static uint64_t   budget_bytes = 0;
 	static std::mutex capture_lock;
-	std::scoped_lock guard {capture_lock};
-	const auto frame = renderer.DiagnosticFrameNum();
+	std::scoped_lock  guard {capture_lock};
+	const auto        frame = renderer.DiagnosticFrameNum();
 	if (budget_frame != frame) {
 		budget_frame = frame;
 		budget_bytes = 0;
 	}
 	const uint64_t bytes = uint64_t(image.backing.extent.width) * image.backing.extent.height *
-	    DumpBytesPerPixel(image.backing.format);
+	                       DumpBytesPerPixel(image.backing.format);
 	if (bytes > (512ull << 20) - budget_bytes) {
 		LOGF("InputCapture: image budget exhausted at %s\n", tag.c_str());
 		return;
@@ -596,42 +632,46 @@ void DumpShaderBufferInput(CommandBuffer& command, RenderContext& renderer, vk::
 	if (command.IsInvalid() || buffer == nullptr || byte_size == 0 || byte_size > (1ull << 20)) {
 		return;
 	}
-	auto& download = renderer.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
+	auto& download        = renderer.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
 	auto [mapped, offset] = download.Map(byte_size, 256);
 	if (mapped == nullptr) return;
 	command.EndRendering();
-	auto vk_command = command.Handle();
+	auto               vk_command = command.Handle();
 	vk::MemoryBarrier2 barrier {};
-	barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-	barrier.dstStageMask = vk::PipelineStageFlagBits2::eCopy;
-	barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eCopy;
+	barrier.dstAccessMask =
+	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;
-	dependency.pMemoryBarriers = &barrier;
+	dependency.pMemoryBarriers    = &barrier;
 	vk_command.pipelineBarrier2(dependency);
 	const vk::BufferCopy copy {source_offset, offset, byte_size};
 	vk_command.copyBuffer(buffer, download.Handle(), 1, &copy);
 	barrier.srcStageMask = vk::PipelineStageFlagBits2::eCopy;
-	barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
-	barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eHost;
+	barrier.srcAccessMask =
+	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	barrier.dstStageMask =
+	    vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eHost;
 	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
 	                        vk::AccessFlagBits2::eHostRead;
 	vk_command.pipelineBarrier2(dependency);
 	download.Commit();
 	const auto frame = renderer.DiagnosticFrameNum();
-	renderer.GetCommandScheduler().DeferPriorityOperation(
-	    [&download, mapped, offset, byte_size, tag, frame] {
-		    download.Invalidate(offset, byte_size);
-		    std::error_code ec;
-		    std::filesystem::create_directories("D:/PS5/dumps", ec);
-		    const auto path = std::filesystem::path("D:/PS5/dumps") /
-		                      (tag + "-f" + std::to_string(frame) + ".bin");
-		    std::ofstream output(path, std::ios::binary);
-		    output.write(reinterpret_cast<const char*>(mapped), static_cast<std::streamsize>(byte_size));
-		    LOGF("InputCapture: buffer bytes=%" PRIu64 " file=%s success=%d\n",
-		         byte_size, path.string().c_str(), static_cast<int>(output.good()));
-	    });
+	renderer.GetCommandScheduler().DeferPriorityOperation([&download, mapped, offset, byte_size,
+	                                                       tag, frame] {
+		download.Invalidate(offset, byte_size);
+		std::error_code ec;
+		std::filesystem::create_directories("D:/PS5/dumps", ec);
+		const auto path =
+		    std::filesystem::path("D:/PS5/dumps") / (tag + "-f" + std::to_string(frame) + ".bin");
+		std::ofstream output(path, std::ios::binary);
+		output.write(reinterpret_cast<const char*>(mapped),
+		             static_cast<std::streamsize>(byte_size));
+		LOGF("InputCapture: buffer bytes=%" PRIu64 " file=%s success=%d\n", byte_size,
+		     path.string().c_str(), static_cast<int>(output.good()));
+	});
 }
 
 void FinishInspectorSidecar(const InspectorCaptureRecord& record, std::string metadata_json,
@@ -644,14 +684,14 @@ void FinishInspectorSidecar(const InspectorCaptureRecord& record, std::string me
 	meta["status"] = status;
 	std::error_code ec;
 	std::filesystem::create_directories("D:/PS5/dumps", ec);
-	const auto json_path = record.json_path.empty() ? record.stem + ".json" : record.json_path;
+	const auto    json_path = record.json_path.empty() ? record.stem + ".json" : record.json_path;
 	std::ofstream file {json_path, std::ios::trunc};
 	file << meta.dump(2) << '\n';
-	auto complete          = record;
-	complete.xxh3          = xxh3;
-	complete.ready         = true;
-	complete.json_path     = json_path;
-	complete.note          = status;
+	auto complete      = record;
+	complete.xxh3      = xxh3;
+	complete.ready     = true;
+	complete.json_path = json_path;
+	complete.note      = status;
 	NoteInspectorCaptureComplete(complete);
 }
 
@@ -684,27 +724,29 @@ void DumpInspectorGpuBuffer(CommandBuffer& command, RenderContext& renderer, vk:
 		FinishInspectorSidecar(record, std::move(metadata_json), 0, "skipped_buffer");
 		return;
 	}
-	auto& download = renderer.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
+	auto& download            = renderer.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
 	auto [mapped, map_offset] = download.Map(size, 256);
 	if (mapped == nullptr) {
 		FinishInspectorSidecar(record, std::move(metadata_json), 0, "skipped_map");
 		return;
 	}
 	command.EndRendering();
-	auto vk_command = command.Handle();
+	auto               vk_command = command.Handle();
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eCopy;
-	barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	barrier.dstAccessMask =
+	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
 	vk_command.pipelineBarrier2(dependency);
 	const vk::BufferCopy copy {offset, map_offset, size};
 	vk_command.copyBuffer(buffer, download.Handle(), 1, &copy);
-	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
-	barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	barrier.srcStageMask = vk::PipelineStageFlagBits2::eCopy;
+	barrier.srcAccessMask =
+	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	barrier.dstStageMask =
 	    vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eHost;
 	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
@@ -713,12 +755,12 @@ void DumpInspectorGpuBuffer(CommandBuffer& command, RenderContext& renderer, vk:
 	download.Commit();
 	auto complete = record;
 	renderer.GetCommandScheduler().DeferPriorityOperation(
-	    [&download, mapped, map_offset, size, complete,
-	     metadata_json = std::move(metadata_json)] {
+	    [&download, mapped, map_offset, size, complete, metadata_json = std::move(metadata_json)] {
 		    download.Invalidate(map_offset, size);
 		    std::error_code ec;
 		    std::filesystem::create_directories("D:/PS5/dumps", ec);
-		    const auto path = complete.bin_path.empty() ? complete.stem + ".bin" : complete.bin_path;
+		    const auto path =
+		        complete.bin_path.empty() ? complete.stem + ".bin" : complete.bin_path;
 		    std::ofstream output(path, std::ios::binary);
 		    output.write(reinterpret_cast<const char*>(mapped), static_cast<std::streamsize>(size));
 		    const auto xxh3 = XXH3_64bits(mapped, static_cast<size_t>(size));
@@ -924,7 +966,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout,
                                vk::AccessFlags2 access) {
 	const auto     stage  = access == vk::AccessFlagBits2::eTransferRead ||
-	                                access == vk::AccessFlagBits2::eTransferWrite
+                               access == vk::AccessFlagBits2::eTransferWrite
 	                            ? vk::PipelineStageFlagBits2::eTransfer
 	                            : vk::PipelineStageFlagBits2::eAllCommands;
 	constexpr auto writes = vk::AccessFlagBits2::eTransferWrite |
@@ -1023,17 +1065,17 @@ public:
 private:
 	void Destroy();
 
-	WindowContext&              m_window;
-	vk::SwapchainKHR            m_handle = nullptr;
-	vk::Format                  m_format = vk::Format::eUndefined;
-	vk::Extent2D                m_extent {};
-	std::vector<vk::Image>      m_images;
-	std::vector<vk::ImageView>  m_image_views;
-	std::vector<vk::Semaphore>  m_image_acquired;
-	std::vector<vk::Semaphore>  m_render_complete;
+	WindowContext&                 m_window;
+	vk::SwapchainKHR               m_handle = nullptr;
+	vk::Format                     m_format = vk::Format::eUndefined;
+	vk::Extent2D                   m_extent {};
+	std::vector<vk::Image>         m_images;
+	std::vector<vk::ImageView>     m_image_views;
+	std::vector<vk::Semaphore>     m_image_acquired;
+	std::vector<vk::Semaphore>     m_render_complete;
 	std::unique_ptr<SystemOverlay> m_system_overlay;
-	uint32_t                    m_image_index = static_cast<uint32_t>(-1);
-	uint32_t                    m_frame_index = 0;
+	uint32_t                       m_image_index = static_cast<uint32_t>(-1);
+	uint32_t                       m_frame_index = 0;
 };
 
 struct Presenter::Impl {
@@ -1089,7 +1131,7 @@ void Swapchain::Create() {
 	Common::LockGuard lock(m_window.mutex);
 	EXIT_IF(graphics.screen_width == 0);
 	EXIT_IF(graphics.screen_height == 0);
-	const auto&       surface = m_window.surface_capabilities;
+	const auto& surface = m_window.surface_capabilities;
 	EXIT_NOT_IMPLEMENTED(surface.formats.empty());
 
 	m_extent = surface.capabilities.currentExtent;
@@ -1161,7 +1203,7 @@ void Swapchain::Create() {
 		LOGF("warning: requested present mode is unavailable; falling back to Fifo\n");
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
 	}
-	create_info.clipped          = VK_TRUE;
+	create_info.clipped = VK_TRUE;
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");
 	EXIT_IF(m_handle == nullptr);
@@ -1441,6 +1483,31 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 
 	auto&  cache  = m_impl->renderer.GetTextureCache();
 	Image* source = &scanout;
+	if (SceneDrawDebug::PostBypassEnabled()) {
+		const auto target = SceneDrawDebug::Target();
+		for (const auto id: cache.FindAllImagesAtAddress(target, sizeof(uint32_t))) {
+			auto& candidate = cache.GetImage(id);
+			// Exact identity and shape checks keep an overlapping mip/alias from becoming the
+			// presentation source. B10G11R11 is the measured UFC 5 pre-post scene format.
+			if (candidate.info.data.address == target && candidate.IsGpuModified() &&
+			    candidate.backing.image != nullptr &&
+			    candidate.backing.image_type == vk::ImageType::e2D &&
+			    candidate.backing.extent.width == 1068u &&
+			    candidate.backing.extent.height == 600u &&
+			    candidate.backing.format == vk::Format::eB10G11R11UfloatPack32) {
+				source = &candidate;
+				static std::atomic<uint32_t> bypass_logs {0};
+				if (bypass_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+					LOGF("Scene post bypass present: image=%u.%u addr=0x%016" PRIx64
+					     " extent=%ux%u fmt=%d\n",
+					     id.index, id.generation, candidate.info.data.address,
+					     candidate.backing.extent.width, candidate.backing.extent.height,
+					     static_cast<int>(candidate.backing.format));
+				}
+				break;
+			}
+		}
+	}
 	static std::atomic<uint32_t> ufc_present_logs = 0;
 	const auto consider = [&](ImageId id, const char* tag, bool allow_scanout_addr) {
 		if (!id || source != &scanout) {
@@ -1463,18 +1530,18 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		if (ufc_present_logs.fetch_add(1, std::memory_order_relaxed) < 12) {
 			LOGF("UFC 5 present %s: fmt=%d gpu=%d rt=%d storage=%d extent=%ux%u "
 			     "addr=0x%016" PRIx64 " scanout=0x%016" PRIx64 "\n",
-			     tag, static_cast<int>(candidate.backing.format),
-			     candidate.IsGpuModified() ? 1 : 0, candidate.usage.render_target ? 1 : 0,
-			     candidate.usage.storage ? 1 : 0, candidate.backing.extent.width,
-			     candidate.backing.extent.height, candidate.info.data.address, info.data.address);
+			     tag, static_cast<int>(candidate.backing.format), candidate.IsGpuModified() ? 1 : 0,
+			     candidate.usage.render_target ? 1 : 0, candidate.usage.storage ? 1 : 0,
+			     candidate.backing.extent.width, candidate.backing.extent.height,
+			     candidate.info.data.address, info.data.address);
 		}
 	};
 	// A current GPU-written VideoOut image is authoritative. In UFC matches the last
 	// large colour target can be the UI-only layer, while the final compute composite
 	// writes the actual scanout. Do not replace that completed frame with the UI layer.
 	// Retain the early-menu fallbacks only when scanout has no current GPU contents.
-	const bool native_scanout = scanout.SafeToDownload() &&
-	    (scanout.usage.storage || scanout.usage.render_target);
+	const bool native_scanout =
+	    scanout.SafeToDownload() && (scanout.usage.storage || scanout.usage.render_target);
 	if (!native_scanout) {
 		consider(cache.FindImageFromRange(info.data.address, 0x0000000000870000ull, false),
 		         "flip alias", true);
@@ -1576,18 +1643,18 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	m_impl->frames.ValidateForPresent(&frame, reuse);
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
-	auto&      swapchain  = m_impl->swapchain;
+	auto&      swapchain      = m_impl->swapchain;
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		{
 			FrameWorkScope present_work(FrameWorkKind::Present);
-			auto status = swapchain.AcquireNextImage();
+			auto           status = swapchain.AcquireNextImage();
 			if (status != Swapchain::Status::Success) {
 				m_impl->RecoverSwapchain(status);
 				continue;
 			}
 			{
 				Common::LockGuard render_lock(m_impl->renderer.GetMutex());
-				auto&             command          = m_impl->present_scheduler.BeginCommand();
+				auto&             command = m_impl->present_scheduler.BeginCommand();
 				const bool        draw_system_overlay =
 				    overlay_visual.active && swapchain.PrepareSystemOverlay();
 				swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);

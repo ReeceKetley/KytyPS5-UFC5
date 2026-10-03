@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -113,34 +114,90 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
-	auto& state              = backing.state;
-	auto& subresource_states = backing.subresource_states;
 	if (range && info.IsVolume()) {
 		range->base_layer  = 0;
 		range->layer_count = 1;
 	}
-	// The backing may have fewer levels than the guest declared (over-declared mip
-	// chain clamped at creation, see the Image ctor). Keep every transition inside the
-	// real range so we never emit a barrier for a level that does not exist.
-	if (range && backing.mip_levels != 0) {
-		if (range->base_level >= backing.mip_levels) {
-			range->base_level = backing.mip_levels - 1;
-		}
-		if (range->base_level + range->level_count > backing.mip_levels) {
-			range->level_count = backing.mip_levels - range->base_level;
-		}
-	}
-	const uint32_t full_levels = std::min<uint32_t>(info.resources.levels, backing.mip_levels);
-
-	const bool partial =
-	    range && (range->base_level != 0 || range->level_count != full_levels ||
-	              range->base_layer != 0 || range->layer_count != info.resources.layers);
-	const bool has_subresource_states = !subresource_states.empty();
 
 	Barriers barriers;
+
+	auto append_image_barrier = [&](VulkanImage& image, uint32_t base_mip, uint32_t level_count,
+	                                uint32_t base_layer, uint32_t layer_count) {
+		auto& state = image.state;
+		constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite |
+		                              vk::AccessFlagBits2::eShaderWrite |
+		                              vk::AccessFlagBits2::eMemoryWrite;
+		const bool repeated_write = static_cast<bool>(state.access_mask & write_access);
+		if (state.layout == destination_layout && state.access_mask == destination_access &&
+		    !repeated_write && level_count == image.mip_levels && base_mip == 0 && base_layer == 0 &&
+		    layer_count >= image.layers) {
+			return;
+		}
+		vk::ImageMemoryBarrier2 barrier {};
+		barrier.srcStageMask                    = state.pl_stage;
+		barrier.srcAccessMask                   = state.access_mask;
+		barrier.dstStageMask                    = destination_stage;
+		barrier.dstAccessMask                   = destination_access;
+		barrier.oldLayout                       = state.layout;
+		barrier.newLayout                       = destination_layout;
+		barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+		barrier.image                           = image.image;
+		barrier.subresourceRange.aspectMask     = FullAspectMask(image.format);
+		barrier.subresourceRange.baseMipLevel   = base_mip;
+		barrier.subresourceRange.levelCount     = level_count;
+		barrier.subresourceRange.baseArrayLayer = base_layer;
+		barrier.subresourceRange.layerCount     = layer_count;
+		barriers.push_back(barrier);
+		state = {destination_stage, destination_access, destination_layout};
+	};
+
+	// Extra logical-tail mips live on dedicated VkImages. Never fold them onto the
+	// last native mip of the main backing.
+	if (range && range->level_count == 1 && IsExtraTailMip(range->base_level)) {
+		auto* tail = FindLogicalTail(range->base_level);
+		EXIT_IF(tail == nullptr || tail->image.image == nullptr);
+		append_image_barrier(tail->image, 0, 1, 0, 1);
+		return barriers;
+	}
+
+	auto& state              = backing.state;
+	auto& subresource_states = backing.subresource_states;
+	const uint32_t full_levels = NativeLevelCount();
+
+	// Whole-image or empty range: transition native backing and every logical tail.
+	if (!range) {
+		append_image_barrier(backing, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS);
+		for (auto& tail: logical_tails) {
+			append_image_barrier(tail->image, 0, 1, 0, 1);
+		}
+		subresource_states.clear();
+		return barriers;
+	}
+
+	// Range that still points past the native chain without being a single extra mip
+	// (e.g. a multi-level view spanning native+extra) is unsupported.
+	if (range->base_level >= NativeLevelCount()) {
+		EXIT("unsupported image barrier range on logical-tail mips: base=%u count=%u "
+		     "native=%u guest=%u addr=0x%016" PRIx64 "\n",
+		     range->base_level, range->level_count, NativeLevelCount(), GuestLevelCount(),
+		     info.data.address);
+	}
+	if (range->base_level + range->level_count > NativeLevelCount()) {
+		EXIT("image barrier range spans native and logical-tail mips: base=%u count=%u "
+		     "native=%u guest=%u addr=0x%016" PRIx64 "\n",
+		     range->base_level, range->level_count, NativeLevelCount(), GuestLevelCount(),
+		     info.data.address);
+	}
+
+	const bool partial =
+	    range->base_level != 0 || range->level_count != full_levels || range->base_layer != 0 ||
+	    range->layer_count != info.resources.layers;
+	const bool has_subresource_states = !subresource_states.empty();
+
 	if (partial || has_subresource_states) {
 		if (!has_subresource_states) {
-			subresource_states.resize(info.resources.levels * info.resources.layers, state);
+			subresource_states.resize(full_levels * info.resources.layers, state);
 		}
 
 		const uint32_t base_level  = partial ? range->base_level : 0;
@@ -183,36 +240,12 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 
 		if (!partial) {
 			subresource_states.clear();
+			state = {destination_stage, destination_access, destination_layout};
 		}
 	} else {
-		constexpr auto write_access   = vk::AccessFlagBits2::eTransferWrite |
-		                                vk::AccessFlagBits2::eShaderWrite |
-		                                vk::AccessFlagBits2::eMemoryWrite;
-		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
-		if (state.layout == destination_layout && state.access_mask == destination_access &&
-		    !repeated_write) {
-			return {};
-		}
-
-		vk::ImageMemoryBarrier2 barrier {};
-		barrier.srcStageMask                    = state.pl_stage;
-		barrier.srcAccessMask                   = state.access_mask;
-		barrier.dstStageMask                    = destination_stage;
-		barrier.dstAccessMask                   = destination_access;
-		barrier.oldLayout                       = state.layout;
-		barrier.newLayout                       = destination_layout;
-		barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
-		barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
-		barrier.image                           = backing.image;
-		barrier.subresourceRange.aspectMask     = FullAspectMask(backing.format);
-		barrier.subresourceRange.baseMipLevel   = 0;
-		barrier.subresourceRange.levelCount     = VK_REMAINING_MIP_LEVELS;
-		barrier.subresourceRange.baseArrayLayer = 0;
-		barrier.subresourceRange.layerCount     = VK_REMAINING_ARRAY_LAYERS;
-		barriers.push_back(barrier);
+		append_image_barrier(backing, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS);
 	}
 
-	state = {destination_stage, destination_access, destination_layout};
 	return barriers;
 }
 
@@ -280,6 +313,56 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
+void Image::UploadLogicalTail(uint32_t guest_mip, std::span<const vk::BufferImageCopy> copies,
+                              vk::Buffer buffer, uint64_t offset, uint64_t size) {
+	auto* tail = FindLogicalTail(guest_mip);
+	EXIT_IF(tail == nullptr || copies.empty() || buffer == nullptr || size == 0);
+	m_scheduler.EndRendering();
+	std::vector<vk::BufferImageCopy> remapped;
+	remapped.reserve(copies.size());
+	for (const auto& copy: copies) {
+		auto entry = copy;
+		EXIT_IF(entry.imageSubresource.mipLevel != guest_mip &&
+		        entry.imageSubresource.mipLevel != 0);
+		entry.imageSubresource.mipLevel = 0;
+		remapped.push_back(entry);
+	}
+	vk::BufferMemoryBarrier2 buffer_barrier {};
+	buffer_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	buffer_barrier.srcAccessMask       = vk::AccessFlagBits2::eMemoryWrite;
+	buffer_barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	buffer_barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferRead;
+	buffer_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	buffer_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	buffer_barrier.buffer              = buffer;
+	buffer_barrier.offset              = offset;
+	buffer_barrier.size                = size;
+	const ImageSubresourceRange range {guest_mip, 1, 0, 1};
+	const auto image_barriers =
+	    GetBarriers(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	                vk::PipelineStageFlagBits2::eCopy, range);
+	vk::DependencyInfo dependency {};
+	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &buffer_barrier;
+	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size());
+	dependency.pImageMemoryBarriers     = image_barriers.data();
+	auto command                        = m_scheduler.Current().Handle();
+	command.pipelineBarrier2(dependency);
+	command.copyBufferToImage(buffer, tail->image.image, vk::ImageLayout::eTransferDstOptimal,
+	                          static_cast<uint32_t>(remapped.size()), remapped.data());
+	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
+	buffer_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	buffer_barrier.dstAccessMask =
+	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	dependency.imageMemoryBarrierCount = 0;
+	dependency.pImageMemoryBarriers    = nullptr;
+	command.pipelineBarrier2(dependency);
+	Transit(vk::ImageLayout::eGeneral,
+	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, range, command);
+}
+
 void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
                      uint64_t offset, uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
@@ -316,6 +399,56 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	dependency.imageMemoryBarrierCount = 0;
 	dependency.pImageMemoryBarriers    = nullptr;
 	command.pipelineBarrier2(dependency);
+}
+
+void Image::DownloadLogicalTail(uint32_t guest_mip, std::span<const vk::BufferImageCopy> copies,
+                                vk::Buffer buffer, uint64_t offset, uint64_t size) {
+	auto* tail = FindLogicalTail(guest_mip);
+	EXIT_IF(tail == nullptr || copies.empty() || buffer == nullptr || size == 0);
+	m_scheduler.EndRendering();
+	std::vector<vk::BufferImageCopy> remapped;
+	remapped.reserve(copies.size());
+	for (const auto& copy: copies) {
+		auto entry = copy;
+		EXIT_IF(entry.imageSubresource.mipLevel != guest_mip &&
+		        entry.imageSubresource.mipLevel != 0);
+		entry.imageSubresource.mipLevel = 0;
+		remapped.push_back(entry);
+	}
+	vk::BufferMemoryBarrier2 buffer_barrier {};
+	buffer_barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+	buffer_barrier.srcAccessMask =
+	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	buffer_barrier.dstStageMask        = vk::PipelineStageFlagBits2::eCopy;
+	buffer_barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	buffer_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	buffer_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	buffer_barrier.buffer              = buffer;
+	buffer_barrier.offset              = offset;
+	buffer_barrier.size                = size;
+	const ImageSubresourceRange range {guest_mip, 1, 0, 1};
+	const auto image_barriers =
+	    GetBarriers(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+	                vk::PipelineStageFlagBits2::eCopy, range);
+	vk::DependencyInfo dependency {};
+	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &buffer_barrier;
+	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size());
+	dependency.pImageMemoryBarriers     = image_barriers.data();
+	auto command                        = m_scheduler.Current().Handle();
+	command.pipelineBarrier2(dependency);
+	command.copyImageToBuffer(tail->image.image, vk::ImageLayout::eTransferSrcOptimal, buffer,
+	                          static_cast<uint32_t>(remapped.size()), remapped.data());
+	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
+	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	buffer_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	buffer_barrier.dstAccessMask =
+	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	dependency.imageMemoryBarrierCount = 0;
+	dependency.pImageMemoryBarriers    = nullptr;
+	command.pipelineBarrier2(dependency);
+	Transit(vk::ImageLayout::eGeneral, kRestoredImageAccess, range, command);
 }
 
 std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
@@ -808,6 +941,114 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
 	}
+
+	// Materialize one small VkImage per guest logical mip beyond the Vulkan-complete
+	// chain. These preserve distinct mip-tail subresource identity (e.g. mip8 at
+	// tail_xy=(0,12) vs mip9 at (0,8) in the same 64KB guest block).
+	if (GuestLevelCount() > NativeLevelCount()) {
+		CreateLogicalTailImages();
+	}
+}
+
+void Image::CreateLogicalTailImages() {
+	EXIT_IF(GuestLevelCount() <= NativeLevelCount());
+	EXIT_IF(backing.image == nullptr || info.pixel_format == vk::Format::eUndefined);
+
+	TileSurfaceLayout layout {};
+	const TileSurfaceDescription description {
+	    info.guest_format,
+	    info.tile_mode,
+	    info.IsVolume() ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
+	    info.extent.width,
+	    info.extent.height,
+	    info.IsVolume() ? info.extent.depth : 1u,
+	    GuestLevelCount(),
+	    1};
+	const bool have_layout = TileGetTiledTextureLayout(description, layout);
+
+	logical_tails.clear();
+	logical_tails.reserve(GuestLevelCount() - NativeLevelCount());
+	for (uint32_t guest_mip = NativeLevelCount(); guest_mip < GuestLevelCount(); ++guest_mip) {
+		auto tail       = std::make_unique<LogicalTailImage>();
+		tail->guest_mip = guest_mip;
+		tail->width     = std::max(info.extent.width >> guest_mip, 1u);
+		tail->height    = info.type == Prospero::ImageType::kColor1D
+		                      ? 1u
+		                      : std::max(info.extent.height >> guest_mip, 1u);
+		tail->depth     = info.IsVolume() ? std::max(info.extent.depth >> guest_mip, 1u) : 1u;
+		if (have_layout && guest_mip < 16) {
+			tail->tail_x = layout.mips[guest_mip].tail_x;
+			tail->tail_y = layout.mips[guest_mip].tail_y;
+		}
+
+		tail->image.format     = backing.format;
+		tail->image.image_type = backing.image_type;
+		tail->image.extent     = {tail->width, tail->height, tail->depth};
+		tail->image.layers     = 1;
+		tail->image.mip_levels = 1;
+		tail->image.samples    = backing.samples;
+		tail->image.flags      = backing.flags;
+		tail->image.usage      = backing.usage;
+
+		vk::ImageCreateInfo create {};
+		create.flags         = tail->image.flags;
+		create.imageType     = tail->image.image_type;
+		create.extent        = tail->image.extent;
+		create.mipLevels     = 1;
+		create.arrayLayers   = 1;
+		create.format        = tail->image.format;
+		create.tiling        = vk::ImageTiling::eOptimal;
+		create.initialLayout = tail->image.state.layout;
+		create.usage         = tail->image.usage;
+		create.samples       = vulkan_sample_count(tail->image.samples);
+		tail->image.memory.property = vk::MemoryPropertyFlagBits::eDeviceLocal;
+		if (!m_graphics.CreateImage(create, tail->image)) {
+			EXIT("failed to create logical-tail image: guest_mip=%u extent=%ux%ux%u format=%d\n",
+			     guest_mip, tail->width, tail->height, tail->depth,
+			     static_cast<int>(tail->image.format));
+		}
+
+		static std::atomic<uint32_t> materialize_logs = 0;
+		if (materialize_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+			LOGF("LogicalTailImage: guest_addr=0x%016" PRIx64
+			     " guest_mip=%u guest_levels=%u native_levels=%u logical_extent=%ux%ux%u "
+			     "tail_xy=(%u,%u) host_image=%p host_format=%d usage=0x%x\n",
+			     info.data.address, guest_mip, GuestLevelCount(), NativeLevelCount(), tail->width,
+			     tail->height, tail->depth, tail->tail_x, tail->tail_y,
+			     static_cast<void*>(tail->image.image), static_cast<int>(tail->image.format),
+			     static_cast<vk::ImageUsageFlags::MaskType>(tail->image.usage));
+		}
+		logical_tails.push_back(std::move(tail));
+	}
+}
+
+LogicalTailImage* Image::FindLogicalTail(uint32_t guest_mip) noexcept {
+	if (!IsExtraTailMip(guest_mip)) {
+		return nullptr;
+	}
+	const auto index = ExtraTailIndex(guest_mip);
+	EXIT_IF(index >= logical_tails.size() || logical_tails[index] == nullptr);
+	EXIT_IF(logical_tails[index]->guest_mip != guest_mip);
+	return logical_tails[index].get();
+}
+
+const LogicalTailImage* Image::FindLogicalTail(uint32_t guest_mip) const noexcept {
+	if (!IsExtraTailMip(guest_mip)) {
+		return nullptr;
+	}
+	const auto index = ExtraTailIndex(guest_mip);
+	EXIT_IF(index >= logical_tails.size() || logical_tails[index] == nullptr);
+	EXIT_IF(logical_tails[index]->guest_mip != guest_mip);
+	return logical_tails[index].get();
+}
+
+vk::ImageLayout Image::LayoutForView(const ImageViewInfo& view) const noexcept {
+	if (view.level_count == 1 && IsExtraTailMip(view.base_level)) {
+		const auto* tail = FindLogicalTail(view.base_level);
+		EXIT_IF(tail == nullptr);
+		return tail->image.state.layout;
+	}
+	return backing.state.layout;
 }
 
 uint64_t Image::HashGuestEdges() const {
@@ -833,6 +1074,19 @@ Image::~Image() {
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
 			m_graphics.device.destroyImageView(cached.view, nullptr);
+		}
+	}
+	for (auto& tail: logical_tails) {
+		if (tail == nullptr) {
+			continue;
+		}
+		for (const auto& cached: tail->views) {
+			if (cached.view != nullptr) {
+				m_graphics.device.destroyImageView(cached.view, nullptr);
+			}
+		}
+		if (tail->image.image != nullptr) {
+			m_graphics.DeleteImage(tail->image);
 		}
 	}
 	if (backing.image != nullptr) {

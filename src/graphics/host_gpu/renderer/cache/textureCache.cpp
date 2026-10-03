@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/watchedImageTrace.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -502,6 +503,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
+	WatchedImageNote(WatchedImageEvent::Create, &image, id, "RegisterImage");
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -534,6 +536,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
+	WatchedImageNote(WatchedImageEvent::Delete, image, id, "DeleteImage");
 	if (!image->depth_id) {
 		std::vector<ImageId> associations;
 		m_slot_images.ForEach([&](ImageId candidate, const Image& associated) {
@@ -942,8 +945,11 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	}
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
+		WatchedImageBumpContent(destination, destination_id, WatchedImageEvent::CopyDst,
+		                        "CopyImage");
 	}
 	destination.ClearBufferModified();
+	WatchedImageNote(WatchedImageEvent::CopySrc, &source, source_id, "CopyImage");
 	if (DispatchInspectorEnabled()) {
 		InspectorOperation operation;
 		operation.kind            = InspectorOperationKind::Copy;
@@ -1305,9 +1311,10 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 	                                       info.resources.levels, layers, info.tile_mode,
 	                                       info.data.size, allow_depth_tile, volume, owner);
 	plan.regions = TextureBuildImageCopies(plan.layout);
-	// Keep guest layout/array strides intact, but never issue host copies for the
-	// extra tail levels omitted when the Vulkan backing was clamped.
-	const auto transfer_levels = std::min(info.resources.levels, image.backing.mip_levels);
+	// Keep guest layout/array strides for every logical level. Native Vulkan mips upload
+	// to the main backing; extra logical-tail mips upload to dedicated aux images.
+	const auto transfer_levels = info.resources.levels;
+	const auto native_levels   = image.backing.mip_levels;
 	std::erase_if(plan.regions, [transfer_levels](const auto& region) {
 		return region.imageSubresource.mipLevel >= transfer_levels;
 	});
@@ -1322,6 +1329,7 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 			return plan;
 		}
 	}
+	(void)native_levels;
 	plan.valid = true;
 	return plan;
 }
@@ -1377,7 +1385,29 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		if (plan.swap_bgra16) {
 			linear = m_tiler.SwapBgra16(linear);
 		}
-		upload(plan.regions, linear);
+		std::vector<vk::BufferImageCopy> native_regions;
+		native_regions.reserve(plan.regions.size());
+		for (const auto& region: plan.regions) {
+			if (region.imageSubresource.mipLevel < image.NativeLevelCount()) {
+				native_regions.push_back(region);
+			}
+		}
+		if (!native_regions.empty()) {
+			upload(native_regions, linear);
+		}
+		for (uint32_t guest_mip = image.NativeLevelCount(); guest_mip < image.GuestLevelCount();
+		     ++guest_mip) {
+			std::vector<vk::BufferImageCopy> tail_regions;
+			for (const auto& region: plan.regions) {
+				if (region.imageSubresource.mipLevel == guest_mip) {
+					tail_regions.push_back(region);
+				}
+			}
+			if (!tail_regions.empty()) {
+				image.UploadLogicalTail(guest_mip, tail_regions, linear.buffer, linear.offset,
+				                        linear.size);
+			}
+		}
 		return;
 	}
 
@@ -1446,9 +1476,11 @@ void TextureCache::InitializeImage(ImageId id) {
 		}
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
+		WatchedImageBumpContent(image, id, WatchedImageEvent::Upload, "InitializeImage/Upload");
 	}
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
+		WatchedImageNote(WatchedImageEvent::Materialize, &image, id, "RefreshComplete");
 	}
 }
 
@@ -1937,6 +1969,16 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	}
 	const auto view = image.FindView(view_info);
 	NameImageBinding(m_graphics, image, view, desc.type, view_info);
+	const auto event = desc.type == BindingType::Storage ? WatchedImageEvent::StorageBind
+	                                                     : WatchedImageEvent::SampleBind;
+	WatchedImageNoteBind(event, image, id,
+	                     reinterpret_cast<uintptr_t>(static_cast<VkImageView>(view)), view_info,
+	                     0, desc.type == BindingType::Storage ? "storage" : "sample");
+	if (WatchedImageUiProbeEnabled() && desc.type == BindingType::Texture) {
+		WatchedImageNoteUiProbeSample(GetInspectorRecordingFrame(), 0, image, id,
+		                              reinterpret_cast<uintptr_t>(static_cast<VkImageView>(view)),
+		                              view_info);
+	}
 	return view;
 }
 
@@ -1966,6 +2008,9 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	TrackImageDownload(id, image);
 	const auto view = image.FindView(desc.view_info);
 	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
+	WatchedImageNoteBind(WatchedImageEvent::RenderTargetBind, image, id,
+	                     reinterpret_cast<uintptr_t>(static_cast<VkImageView>(view)),
+	                     desc.view_info, 0, "color_rt");
 	return view;
 }
 
@@ -2012,6 +2057,11 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 	}
 	TrackImage(id);
 	CommitGpuWrite(image);
+	// CommitGpuWrite already bumps + emits GpuWrite (address match). Re-emit with ImageId
+	// so ImageId-keyed watches still see the writer.
+	if (WatchedImageEnabled()) {
+		WatchedImageNote(WatchedImageEvent::GpuWrite, &image, id, "MarkGpuWritten");
+	}
 }
 
 void TextureCache::CommitGpuWrite(Image& image) {
@@ -2023,6 +2073,8 @@ void TextureCache::CommitGpuWrite(Image& image) {
 		image.RefreshComplete();
 	}
 	image.MarkGpuModified();
+	// Bump content_generation and emit GpuWrite for address-keyed watches (BREAK_ON_WRITE).
+	WatchedImageBumpContent(image, {}, WatchedImageEvent::GpuWrite, "CommitGpuWrite");
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -2239,23 +2291,63 @@ void TextureCache::DownloadImageData(Image& image, Buffer& destination, uint64_t
 	auto&      texture   = plan.texture;
 	const auto transform = texture.swap_bgra16 ? TileManager::ColorTransform::SwapBgra16
 	                                           : TileManager::ColorTransform::None;
+
+	auto download_regions = [&](vk::Buffer buffer, uint64_t offset, uint64_t size) {
+		std::vector<vk::BufferImageCopy> native_regions;
+		native_regions.reserve(texture.regions.size());
+		for (const auto& region: texture.regions) {
+			if (region.imageSubresource.mipLevel < image.NativeLevelCount()) {
+				auto copy = region;
+				if (offset != 0) {
+					copy.bufferOffset += offset;
+				}
+				native_regions.push_back(copy);
+			}
+		}
+		if (!native_regions.empty()) {
+			image.Download(native_regions, buffer, offset, size);
+		}
+		for (uint32_t guest_mip = image.NativeLevelCount(); guest_mip < image.GuestLevelCount();
+		     ++guest_mip) {
+			std::vector<vk::BufferImageCopy> tail_regions;
+			for (const auto& region: texture.regions) {
+				if (region.imageSubresource.mipLevel == guest_mip) {
+					auto copy = region;
+					if (offset != 0) {
+						copy.bufferOffset += offset;
+					}
+					tail_regions.push_back(copy);
+				}
+			}
+			if (!tail_regions.empty()) {
+				image.DownloadLogicalTail(guest_mip, tail_regions, buffer, offset, size);
+			}
+		}
+	};
+
 	if (texture.tiles.empty()) {
 		if (transform == TileManager::ColorTransform::SwapBgra16) {
 			auto linear = m_tiler.GetScratchBuffer(destination_size);
-			image.Download(texture.regions, linear.buffer, 0, linear.size);
+			download_regions(linear.buffer, 0, linear.size);
 			m_tiler.SwapBgra16(linear,
 			                   {destination.Handle(), destination_offset, destination_size});
 			return;
 		}
-		for (auto& copy: texture.regions) {
-			copy.bufferOffset += destination_offset;
-		}
-		image.Download(texture.regions, destination.Handle(), destination_offset, destination_size);
+		download_regions(destination.Handle(), destination_offset, destination_size);
 		return;
 	}
 
-	m_tiler.TileImage(image, texture.regions, destination.Handle(), destination_offset,
-	                  destination_size, texture.LinearSize(), texture.tiles, transform);
+	// Detile path: pull every logical mip (native + aux tails) into a linear scratch,
+	// then retile into guest memory. GpuTileInfo already addresses distinct mip-tail
+	// slots, so neighbouring logical mips are preserved.
+	auto linear = m_tiler.GetScratchBuffer(texture.LinearSize());
+	download_regions(linear.buffer, 0, linear.size);
+	TileManager::Result source {linear.buffer, 0, linear.size};
+	if (transform == TileManager::ColorTransform::SwapBgra16) {
+		source = m_tiler.SwapBgra16(source);
+	}
+	m_tiler.Tile(source.buffer, source.offset, texture.LinearSize(), destination.Handle(),
+	             destination_offset, destination_size, texture.tiles);
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
@@ -2408,6 +2500,9 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 		}
 		if (owner->Overlaps(address, size)) {
 			owner->InvalidateCpuWrite(address, size);
+			++owner->content_generation;
+			std::snprintf(owner->last_writer, sizeof(owner->last_writer), "%s", "CPU_WRITE");
+			WatchedImageNote(WatchedImageEvent::CpuWrite, owner, id, "InvalidateCpuAliases");
 			UntrackImage(id);
 			continue;
 		}
@@ -2612,20 +2707,25 @@ void TextureCache::RunGarbageCollector() {
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
 				g_texgc_skip_unregistered.fetch_add(1, std::memory_order_relaxed);
+				WatchedImageNoteGc(WatchedImageEvent::GcSkip, owner, id, "unregistered/depth");
 				continue;
 			}
+			WatchedImageNoteGc(WatchedImageEvent::GcConsider, owner, id, "lru_candidate");
 			if (owner->IsGpuModified()) {
 				const bool safe = SafeToDownload(*owner);
 				if (safe && owner->info.IsTiled()) {
 					g_texgc_skip_tiled.fetch_add(1, std::memory_order_relaxed);
+					WatchedImageNoteGc(WatchedImageEvent::GcSkip, owner, id, "tiled");
 					continue;
 				}
 				if (safe && !pressured) {
 					g_texgc_skip_unpressured.fetch_add(1, std::memory_order_relaxed);
+					WatchedImageNoteGc(WatchedImageEvent::GcSkip, owner, id, "unpressured");
 					continue;
 				}
 				if (safe && !TryDownloadImage(id)) {
 					g_texgc_skip_download.fetch_add(1, std::memory_order_relaxed);
+					WatchedImageNoteGc(WatchedImageEvent::GcSkip, owner, id, "download_failed");
 					continue;
 				}
 				if (!safe) {
@@ -2633,6 +2733,7 @@ void TextureCache::RunGarbageCollector() {
 				}
 				owner->ClearGpuModified();
 			}
+			WatchedImageNoteGc(WatchedImageEvent::GcDelete, owner, id, "evict");
 			DeleteImage(id);
 			deleted_this_run++;
 			if (fix_budget && deletions > 0) {

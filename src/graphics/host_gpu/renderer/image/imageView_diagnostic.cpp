@@ -5,7 +5,10 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/mipTailDiagnostic.h"
 
+#include "graphics/host_gpu/renderer/watchedImageTrace.h"
+
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 
 namespace Libs::Graphics {
@@ -595,13 +598,86 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
 
-	// Diagnostic correctness mode: do NOT silently fold an out-of-range guest mip request
-	// onto the last host mip. If the guest asks for a mip that the host image does not own,
-	// fail here with enough state to determine whether image creation/cache aliasing dropped it.
-	// This is intentionally stricter than the previous UFC bring-up behaviour.
 	const bool image_valid       = image.image != nullptr;
 	const bool format_compatible = normalized.format != vk::Format::eUndefined &&
 	                               ImageViewOps::FormatsCompatible(image.format, normalized.format);
+	const bool mapping_valid =
+	    IsComponentSwizzle(normalized.mapping.r) && IsComponentSwizzle(normalized.mapping.g) &&
+	    IsComponentSwizzle(normalized.mapping.b) && IsComponentSwizzle(normalized.mapping.a);
+	const bool aspect_valid = IsValidAspect(image, normalized.aspect);
+
+	// Extra logical-tail mips: one dedicated VkImage per guest mip beyond the native chain.
+	// Do not rewrite guest baseMipLevel onto a native mip.
+	if (normalized.level_count == 1 && IsExtraTailMip(normalized.base_level)) {
+		auto* tail = FindLogicalTail(normalized.base_level);
+		if (tail == nullptr || tail->image.image == nullptr || !format_compatible ||
+		    !mapping_valid || !aspect_valid || normalized.layer_count == 0) {
+			LogGuestHostMipMismatch("Image::FindView/logical-tail", info.data.address, info,
+			                        NativeLevelCount(), normalized.base_level,
+			                        normalized.level_count);
+			EXIT("invalid logical-tail image view: guest_mip=%u native=%u guest_levels=%u "
+			     "addr=0x%016" PRIx64 "\n",
+			     normalized.base_level, NativeLevelCount(), GuestLevelCount(), info.data.address);
+		}
+		for (const auto& cached: tail->views) {
+			if (cached.info == normalized) {
+				return cached.view;
+			}
+		}
+		// Guard: never bind two different guest logical mips to the same host subresource.
+		for (const auto& other: logical_tails) {
+			if (other == nullptr || other->guest_mip == normalized.base_level) {
+				continue;
+			}
+			if (other->image.image == tail->image.image) {
+				EXIT("LogicalTailAlias: distinct guest mips %u and %u share host image %p "
+				     "addr=0x%016" PRIx64 "\n",
+				     other->guest_mip, normalized.base_level,
+				     static_cast<void*>(tail->image.image), info.data.address);
+			}
+		}
+
+		vk::ImageViewUsageCreateInfo usage {};
+		usage.usage = tail->image.usage;
+		if (!is_storage) {
+			usage.usage &= ~vk::ImageUsageFlagBits::eStorage;
+		}
+		vk::ImageViewCreateInfo create {};
+		create.pNext                           = &usage;
+		create.image                           = tail->image.image;
+		create.viewType                        = normalized.type == vk::ImageViewType::e3D
+		                                             ? vk::ImageViewType::e3D
+		                                             : (normalized.type == vk::ImageViewType::e1D ||
+                                            normalized.type == vk::ImageViewType::e1DArray
+		                                                    ? vk::ImageViewType::e1D
+		                                                    : vk::ImageViewType::e2D);
+		create.format                          = normalized.format;
+		create.components                      = normalized.mapping;
+		create.subresourceRange.aspectMask     = normalized.aspect;
+		create.subresourceRange.baseMipLevel   = 0;
+		create.subresourceRange.levelCount     = 1;
+		create.subresourceRange.baseArrayLayer = 0;
+		create.subresourceRange.layerCount     = 1;
+
+		vk::ImageView view   = nullptr;
+		const auto    result = m_graphics.device.createImageView(&create, nullptr, &view);
+		if (result != vk::Result::eSuccess || view == nullptr) {
+			EXIT("failed to create logical-tail image view: result=%d guest_mip=%u format=%d\n",
+			     static_cast<int>(result), normalized.base_level, static_cast<int>(normalized.format));
+		}
+		tail->views.push_back({normalized, view, normalized.base_level});
+		static std::atomic<uint32_t> view_logs = 0;
+		if (view_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+			LOGF("LogicalTailView: guest_addr=0x%016" PRIx64
+			     " guest_mip=%u storage=%d host_image=%p view=%p logical_extent=%ux%ux%u "
+			     "tail_xy=(%u,%u)\n",
+			     info.data.address, normalized.base_level, is_storage,
+			     static_cast<void*>(tail->image.image), static_cast<void*>(view), tail->width,
+			     tail->height, tail->depth, tail->tail_x, tail->tail_y);
+		}
+		return view;
+	}
+
 	const bool slice_view =
 	    image.image_type == vk::ImageType::e3D && (normalized.type == vk::ImageViewType::e2D ||
 	                                               normalized.type == vk::ImageViewType::e2DArray);
@@ -614,24 +690,19 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	const bool ranges_valid = levels_valid && normalized.layer_count != 0 &&
 	                          normalized.base_layer < view_layers &&
 	                          normalized.layer_count <= view_layers - normalized.base_layer;
-	const bool mapping_valid =
-	    IsComponentSwizzle(normalized.mapping.r) && IsComponentSwizzle(normalized.mapping.g) &&
-	    IsComponentSwizzle(normalized.mapping.b) && IsComponentSwizzle(normalized.mapping.a);
 	const bool view_type_valid = IsValidViewType(image, normalized);
-	const bool aspect_valid    = IsValidAspect(image, normalized.aspect);
 
 	if (!image_valid || !format_compatible || !ranges_valid || !mapping_valid ||
 	    !view_type_valid || !aspect_valid) {
-		if (info.resources.levels > image.mip_levels ||
-		    normalized.base_level >= image.mip_levels) {
-			LogGuestHostMipMismatch("Image::FindView", info.data.address, info, image.mip_levels,
+		if (GuestLevelCount() > NativeLevelCount() || normalized.base_level >= NativeLevelCount()) {
+			LogGuestHostMipMismatch("Image::FindView", info.data.address, info, NativeLevelCount(),
 			                        normalized.base_level, normalized.level_count);
 		}
 		EXIT("invalid image view: image_ok=%d format_ok=%d levels_ok=%d ranges_ok=%d "
 		     "mapping_ok=%d view_type_ok=%d aspect_ok=%d | "
 		     "image_format=%d view_format=%d image_type=%d view_type=%d aspect=0x%x "
 		     "mip=%u+%u layer=%u+%u view_layers=%u usage=0x%x "
-		     "image_levels=%u image_layers=%u extent=%ux%ux%u | "
+		     "image_levels=%u guest_levels=%u image_layers=%u extent=%ux%ux%u | "
 		     "original_format=%d original_type=%d original_aspect=0x%x original_mip=%u+%u "
 		     "original_layer=%u+%u original_usage=0x%x\n",
 		     image_valid, format_compatible, levels_valid, ranges_valid, mapping_valid,
@@ -641,8 +712,9 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     static_cast<vk::ImageAspectFlags::MaskType>(normalized.aspect), normalized.base_level,
 		     normalized.level_count, normalized.base_layer, normalized.layer_count, view_layers,
 		     static_cast<vk::ImageUsageFlags::MaskType>(normalized.usage), image.mip_levels,
-		     image.layers, image.extent.width, image.extent.height, image.extent.depth,
-		     static_cast<int>(view_info.format), static_cast<int>(view_info.type),
+		     GuestLevelCount(), image.layers, image.extent.width, image.extent.height,
+		     image.extent.depth, static_cast<int>(view_info.format),
+		     static_cast<int>(view_info.type),
 		     static_cast<vk::ImageAspectFlags::MaskType>(view_info.aspect), view_info.base_level,
 		     view_info.level_count, view_info.base_layer, view_info.layer_count,
 		     static_cast<vk::ImageUsageFlags::MaskType>(view_info.usage));
@@ -682,7 +754,10 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     view_info.level_count, view_info.base_layer, view_info.layer_count,
 		     static_cast<vk::ImageUsageFlags::MaskType>(view_info.usage));
 	}
-	views.push_back({normalized, view});
+	views.push_back({normalized, view, UINT32_MAX});
+	WatchedImageNote(WatchedImageEvent::ViewCreate, this, {}, "FindView", normalized.base_level,
+	                 normalized.base_layer,
+	                 reinterpret_cast<uintptr_t>(static_cast<VkImageView>(view)), &normalized);
 	return view;
 }
 

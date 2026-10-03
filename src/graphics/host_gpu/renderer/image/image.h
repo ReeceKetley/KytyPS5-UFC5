@@ -8,6 +8,7 @@
 
 #include <compare>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -24,6 +25,22 @@ using ImageId = Common::SlotId;
 struct CachedImageView {
 	ImageViewInfo info;
 	vk::ImageView view = nullptr;
+	// UINT32_MAX => view targets the main Vulkan backing.
+	// Otherwise the view targets logical_tails[ExtraTailIndex(guest_logical_mip)].
+	uint32_t guest_logical_mip = UINT32_MAX;
+};
+
+// One host VkImage for a single guest logical mip that sits beyond the
+// Vulkan-complete chain of the main backing (e.g. guest mip9 on a 256^2 image).
+struct LogicalTailImage {
+	uint32_t                     guest_mip = 0;
+	uint32_t                     width     = 1;
+	uint32_t                     height    = 1;
+	uint32_t                     depth     = 1;
+	uint32_t                     tail_x    = 0;
+	uint32_t                     tail_y    = 0;
+	VulkanImage                  image;
+	std::vector<CachedImageView> views;
 };
 
 struct ImageUsage {
@@ -60,14 +77,34 @@ public:
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
+	// Upload linearized copies into one auxiliary logical-tail image (host mip 0).
+	void UploadLogicalTail(uint32_t guest_mip, std::span<const vk::BufferImageCopy> copies,
+	                       vk::Buffer buffer, uint64_t offset, uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	              uint64_t size);
+	void DownloadLogicalTail(uint32_t guest_mip, std::span<const vk::BufferImageCopy> copies,
+	                         vk::Buffer buffer, uint64_t offset, uint64_t size);
 	void CopyImage(Image& source);
 	void BlitColor(Image& source);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
+
+	[[nodiscard]] uint32_t GuestLevelCount() const noexcept { return info.resources.levels; }
+	[[nodiscard]] uint32_t NativeLevelCount() const noexcept { return backing.mip_levels; }
+	[[nodiscard]] bool     IsNativeMip(uint32_t mip) const noexcept {
+		return mip < NativeLevelCount();
+	}
+	[[nodiscard]] bool IsExtraTailMip(uint32_t mip) const noexcept {
+		return mip >= NativeLevelCount() && mip < GuestLevelCount();
+	}
+	[[nodiscard]] uint32_t ExtraTailIndex(uint32_t mip) const noexcept {
+		return mip - NativeLevelCount();
+	}
+	[[nodiscard]] LogicalTailImage*       FindLogicalTail(uint32_t guest_mip) noexcept;
+	[[nodiscard]] const LogicalTailImage* FindLogicalTail(uint32_t guest_mip) const noexcept;
+	[[nodiscard]] vk::ImageLayout         LayoutForView(const ImageViewInfo& view) const noexcept;
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
@@ -124,6 +161,12 @@ public:
 	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
+	// Logical content generation for watched-image tracing. Bumped on every path that Kyty
+	// believes mutates host contents (upload, GPU write, clear, copy-dst, CPU invalidate).
+	uint64_t              content_generation = 0;
+	std::vector<uint64_t> content_generation_mips;
+	char                  last_writer[96] = {};
+
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
 		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
@@ -141,6 +184,10 @@ public:
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
+	// Guest logical mips beyond backing.mip_levels. Index i corresponds to
+	// guest mip (NativeLevelCount() + i). Empty for normal complete chains.
+	// unique_ptr: VulkanImage is non-movable (KYTY_CLASS_NO_COPY).
+	std::vector<std::unique_ptr<LogicalTailImage>> logical_tails;
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
@@ -153,6 +200,8 @@ public:
 
 private:
 	friend struct ImageTestAccess;
+
+	void CreateLogicalTailImages();
 
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,

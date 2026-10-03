@@ -44,13 +44,21 @@ enum class Mode : uint32_t {
 
 // --- render thread -----------------------------------------------------------------------
 // True when `id` (this frame's scene-draw index) is inside the active selection.
-[[nodiscard]] bool ShouldSuppress(uint32_t id) noexcept;
+[[nodiscard]] bool ShouldSuppress(uint32_t id, const Entry& entry) noexcept;
 [[nodiscard]] Mode CurrentMode() noexcept;
 // Called once per scene-target draw, in submission order. Returns the assigned id.
 uint32_t NoteDraw(uint32_t frame_num, const Entry& entry);
-// Guest address of the colour target being bisected (KYTY_CENSUS_TARGET, default the in-fight
-// HDR scene target).
+// Guest address of the colour target being bisected. The tonemapper reports its input every
+// frame, so this follows address relocation automatically. KYTY_CENSUS_TARGET pins an explicit
+// address when a different surface is under investigation.
 [[nodiscard]] uint64_t Target() noexcept;
+void                   ObserveSceneTarget(uint64_t address) noexcept;
+
+// --- post bypass --------------------------------------------------------------------------
+// Ctrl+F11 presents Target() directly instead of the completed post chain. This is diagnostic:
+// the source is linear HDR and deliberately receives no game exposure/tonemapping.
+[[nodiscard]] bool PostBypassEnabled() noexcept;
+void               TogglePostBypass();
 
 // --- wireframe ---------------------------------------------------------------------------
 // Global polygonMode override, toggled live on F12. Costs nothing when off.
@@ -76,17 +84,17 @@ void               ToggleWireframe();
 // and decoding it offline sidesteps post entirely - see tools/scene_shot.py.
 //
 // Override the captured shader with KYTY_SCENE_SHOT_HASH (hex, no 0x).
-void               DumpSceneShot();
+void DumpSceneShot();
 
 // --- ui thread ---------------------------------------------------------------------------
-void Capture();        // arm a one-frame capture; call again to report
-void ReportCapture();  // print the most recent capture
-void NextDraw();       // isolate the next single draw (wraps); prints its identity
+void Capture();       // arm a one-frame capture; call again to report
+void ReportCapture(); // print the most recent capture
+void NextDraw();      // isolate the next single draw (wraps); prints its identity
 void PrevDraw();
-void ToggleActive();   // suppression on/off, so you can A/B the same draw instantly
+void ToggleActive(); // suppression on/off, so you can A/B the same draw instantly
 void SelectAll();
 void ClearSelection();
-void ToggleMode();     // Skip <-> Hide
+void ToggleMode(); // Skip <-> Hide
 void LogState(const char* reason);
 
 struct Snapshot {

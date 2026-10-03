@@ -27,12 +27,12 @@
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
-#include "graphics/host_gpu/renderer/sceneDrawDebug.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/sceneDrawDebug.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -222,11 +222,9 @@ static void ToggleDesktopFullscreen() {
 		return;
 	}
 
-	const auto flags = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
-	const bool fullscreen =
-	    (flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u;
-	const auto mode =
-	    fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
+	const auto flags      = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
+	const bool fullscreen = (flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u;
+	const auto mode       = fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
 	if (SDL_SetWindowFullscreen(g_window->window, mode) != 0) {
 		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
 	}
@@ -294,7 +292,11 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 				break;
 			case SDLK_F11:
 				if (!key.repeat) {
-					ToggleDesktopFullscreen();
+					if ((key.mod & KMOD_CTRL) != 0) {
+						SceneDrawDebug::TogglePostBypass();
+					} else {
+						ToggleDesktopFullscreen();
+					}
 				}
 				break;
 			case SDLK_F12:
@@ -325,8 +327,8 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 	if (fullscreen_key_event && key.up) {
 		fullscreen_key = SDLK_UNKNOWN;
 	}
-	if ((key.down || key.up) && !key.repeat && !fullscreen_key_event &&
-	    key.key_code != SDLK_F8 && key.key_code != SDLK_F9) {
+	if ((key.down || key.up) && !key.repeat && !fullscreen_key_event && key.key_code != SDLK_F8 &&
+	    key.key_code != SDLK_F9) {
 		HostInputKey(key.key_code, key.down);
 	}
 }
@@ -424,8 +426,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	if (f.axis) {
 		const auto axis = ControllerAxisFromSdl(f.axis_id);
 		if (axis != Controller::Axis::AxisMax) {
-			Controller::SetAxis(f.id, axis,
-			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+			Controller::SetAxis(f.id, axis, ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
 		}
 	}
 }
@@ -1046,10 +1047,10 @@ void WindowContext::UpdateTitle() {
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
-	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
-	static uint64_t frame_num   = 0;
-	static uint64_t fps_frames  = 0;
-	static double   current_fps = 0.0;
+	static uint64_t          fps_start      = Common::Timer::QueryPerformanceCounter();
+	static uint64_t          frame_num      = 0;
+	static uint64_t          fps_frames     = 0;
+	static double            current_fps    = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -1125,8 +1126,8 @@ void WindowContext::UpdateTitle() {
 		// gc_ms already contains finish_ms spent inside GC, and drawprep_ms contains
 		// draw_ms; cp_rest is process time not in any of: draw-prep, dispatch, submit,
 		// gc, flush, sendcmd  => raw PM4 decode + register/state packet handlers.
-		const double cp_rest = process_ms - drawprep_ms - dispatch_ms - submit_ms - gc_ms -
-		                       flush_ms - sendcmd_ms;
+		const double cp_rest =
+		    process_ms - drawprep_ms - dispatch_ms - submit_ms - gc_ms - flush_ms - sendcmd_ms;
 		LOGF("FrameProfile: fps=%.3f frames=%" PRIu64 " shader_compiles=%u shader_ms=%.1f "
 		     "pso_creates=%u pso_ms=%.1f draws=%u draw_ms=%.1f dispatch=%u dispatch_ms=%.1f "
 		     "submit=%u submit_ms=%.1f finish=%u finish_ms=%.1f present_ms=%.1f "
@@ -1167,11 +1168,11 @@ void WindowContext::UpdateTitle() {
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
-	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", KYTY_BUILD_LABEL, build_type,
-	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
-	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	auto        text        = fmt::format(
+        "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", KYTY_BUILD_LABEL, build_type,
+        (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
+        (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
+        device_name, processor_name, frame_num, current_fps);
 
 	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
 }

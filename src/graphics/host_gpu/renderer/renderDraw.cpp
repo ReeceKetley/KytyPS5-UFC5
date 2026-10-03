@@ -1581,7 +1581,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		entry.depth_test     = state.depth_info.depth_test_enable;
 		entry.depth_write    = state.depth_info.depth_write_enable;
 		const auto id = SceneDrawDebug::NoteDraw(m_context.DiagnosticFrameNum(), entry);
-		if (SceneDrawDebug::ShouldSuppress(id)) {
+		if (SceneDrawDebug::ShouldSuppress(id, entry)) {
 			// Skip drops the draw entirely, which also removes its depth writes. Hide keeps
 			// depth behaviour and only stops colour. The difference distinguishes "this draw
 			// paints the black" from "this draw's depth hides everything behind it".

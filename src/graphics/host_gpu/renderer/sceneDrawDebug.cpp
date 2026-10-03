@@ -6,9 +6,9 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
-#include <mutex>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string_view>
 
 namespace Libs::Graphics::SceneDrawDebug {
@@ -22,18 +22,23 @@ std::atomic<uint32_t> g_sel_end {0}; // start > end means "nothing selected"
 std::atomic<uint32_t> g_mode {static_cast<uint32_t>(Mode::Skip)};
 std::atomic<int32_t>  g_cursor {-1}; // step-through position; -1 = nothing isolated
 std::atomic<bool>     g_suppress_on {true};
+std::atomic<bool>     g_match_identity {false};
+std::atomic<uint64_t> g_match_vs {0};
+std::atomic<uint64_t> g_match_ps {0};
+std::atomic<uint32_t> g_match_indices {0};
 // Per-draw id generation is lock-free. Recording the entry list costs a mutex, so it only happens
 // for the single frame after Capture() arms it - the draw path must not take a lock per draw on a
 // target that carries thousands of them.
 std::atomic<uint32_t> g_seq {0};
 std::atomic<uint32_t> g_seq_frame {UINT32_MAX};
 std::atomic<bool>     g_recording {false};
+std::atomic<uint64_t> g_observed_target {0};
+std::atomic<bool>     g_post_bypass {false};
 
 std::mutex         g_mutex;
 std::vector<Entry> g_current;  // this frame, being filled
 std::vector<Entry> g_previous; // last completed frame, for the stability check
 std::vector<Entry> g_captured; // frozen list the selection indexes into
-uint32_t           g_frame     = UINT32_MAX;
 float              g_stability = 0.0f;
 
 uint64_t ParseTarget() {
@@ -45,6 +50,14 @@ uint64_t ParseTarget() {
 		env += 2;
 	}
 	return std::strtoull(env, nullptr, 16);
+}
+
+bool HasTargetOverride() {
+	static const bool overridden = [] {
+		const char* env = std::getenv("KYTY_CENSUS_TARGET");
+		return env != nullptr && env[0] != '\0';
+	}();
+	return overridden;
 }
 
 // Fraction of ids whose (vs,ps) pair is unchanged from the previous frame. Positional ids are
@@ -71,33 +84,77 @@ uint32_t CapturedCount() {
 } // namespace
 
 uint64_t Target() noexcept {
-	static const uint64_t target = ParseTarget();
-	return target;
+	static const uint64_t configured = ParseTarget();
+	if (HasTargetOverride()) {
+		return configured;
+	}
+	const auto observed = g_observed_target.load(std::memory_order_relaxed);
+	return observed != 0 ? observed : configured;
 }
 
-Mode CurrentMode() noexcept { return static_cast<Mode>(g_mode.load(std::memory_order_relaxed)); }
+void ObserveSceneTarget(uint64_t address) noexcept {
+	if (address == 0 || HasTargetOverride()) {
+		return;
+	}
+	const auto previous = g_observed_target.exchange(address, std::memory_order_relaxed);
+	if (previous != address) {
+		LOGF("SceneDraw: following tonemapper scene target 0x%016llx (was 0x%016llx)\n",
+		     static_cast<unsigned long long>(address), static_cast<unsigned long long>(previous));
+	}
+}
 
-bool ShouldSuppress(uint32_t id) noexcept {
+bool PostBypassEnabled() noexcept {
+	return g_post_bypass.load(std::memory_order_relaxed);
+}
+
+void TogglePostBypass() {
+	const bool on = !g_post_bypass.load(std::memory_order_relaxed);
+	g_post_bypass.store(on, std::memory_order_relaxed);
+	LOGF("Scene post bypass: %s (Ctrl+F11), target=0x%016llx. Raw linear HDR is not "
+	     "exposed or tonemapped.\n",
+	     on ? "ON" : "OFF", static_cast<unsigned long long>(Target()));
+}
+
+Mode CurrentMode() noexcept {
+	return static_cast<Mode>(g_mode.load(std::memory_order_relaxed));
+}
+
+bool ShouldSuppress(uint32_t id, const Entry& entry) noexcept {
 	const auto start = g_sel_start.load(std::memory_order_relaxed);
 	const auto end   = g_sel_end.load(std::memory_order_relaxed);
-	return start <= end && id >= start && id <= end;
+	if (start > end) {
+		return false;
+	}
+	if (!g_match_identity.load(std::memory_order_relaxed)) {
+		return id >= start && id <= end;
+	}
+	return entry.vs_hash == g_match_vs.load(std::memory_order_relaxed) &&
+	       entry.ps_hash == g_match_ps.load(std::memory_order_relaxed) &&
+	       entry.index_count == g_match_indices.load(std::memory_order_relaxed);
 }
 
 uint32_t NoteDraw(uint32_t frame_num, const Entry& entry) {
 	// Lock-free id assignment: reset the sequence on the first draw of a new frame.
+	bool published = false;
 	auto seen = g_seq_frame.load(std::memory_order_relaxed);
 	if (seen != frame_num &&
 	    g_seq_frame.compare_exchange_strong(seen, frame_num, std::memory_order_relaxed)) {
 		g_seq.store(0, std::memory_order_relaxed);
 		if (g_recording.load(std::memory_order_relaxed)) {
 			// One frame of recording is enough; publish it and disarm.
-			std::scoped_lock lock {g_mutex};
-			g_stability = ComputeStability(g_current, g_previous);
-			g_previous  = g_current;
-			g_captured  = std::move(g_current);
-			g_current.clear();
-			g_recording.store(false, std::memory_order_relaxed);
+			{
+				std::scoped_lock lock {g_mutex};
+				g_stability = ComputeStability(g_current, g_previous);
+				g_previous  = g_current;
+				g_captured  = std::move(g_current);
+				g_current.clear();
+				g_recording.store(false, std::memory_order_relaxed);
+			}
+			published = true;
 		}
+	}
+	if (published) {
+		ReportCapture();
 	}
 	const auto id = g_seq.fetch_add(1, std::memory_order_relaxed);
 	if (g_recording.load(std::memory_order_relaxed)) {
@@ -141,8 +198,8 @@ void LogState(const char* reason) {
 			std::printf("[SceneDraw]   >>> id=%u vs=0x%016llx ps=0x%016llx idx=%u inst=%u topo=%u "
 			            "target=%ux%u img=%u depth_test=%d write=%d\n",
 			            s.sel_start, static_cast<unsigned long long>(e.vs_hash),
-			            static_cast<unsigned long long>(e.ps_hash), e.index_count,
-			            e.instance_count, e.topology, e.target_width, e.target_height, e.image_id,
+			            static_cast<unsigned long long>(e.ps_hash), e.index_count, e.instance_count,
+			            e.topology, e.target_width, e.target_height, e.image_id,
 			            e.depth_test ? 1 : 0, e.depth_write ? 1 : 0);
 			LOGF("[SceneDraw] isolated id=%u vs=0x%016" PRIx64 " ps=0x%016" PRIx64
 			     " idx=%u inst=%u topo=%u depth_test=%d write=%d\n",
@@ -159,10 +216,20 @@ void ApplyCursor(const char* reason) {
 	const auto n      = CapturedCount();
 	const auto cursor = g_cursor.load(std::memory_order_relaxed);
 	if (n == 0 || cursor < 0 || !g_suppress_on.load(std::memory_order_relaxed)) {
+		g_match_identity.store(false, std::memory_order_relaxed);
 		g_sel_start.store(1, std::memory_order_relaxed);
 		g_sel_end.store(0, std::memory_order_relaxed);
 	} else {
 		const auto id = static_cast<uint32_t>(cursor) % n;
+		Entry      match;
+		{
+			std::scoped_lock lock {g_mutex};
+			match = g_captured[id];
+		}
+		g_match_vs.store(match.vs_hash, std::memory_order_relaxed);
+		g_match_ps.store(match.ps_hash, std::memory_order_relaxed);
+		g_match_indices.store(match.index_count, std::memory_order_relaxed);
+		g_match_identity.store(true, std::memory_order_relaxed);
 		g_sel_start.store(id, std::memory_order_relaxed);
 		g_sel_end.store(id, std::memory_order_relaxed);
 	}
@@ -184,11 +251,13 @@ namespace {
 std::atomic<bool> g_wireframe {false};
 } // namespace
 
-bool WireframeEnabled() noexcept { return g_wireframe.load(std::memory_order_relaxed); }
+bool WireframeEnabled() noexcept {
+	return g_wireframe.load(std::memory_order_relaxed);
+}
 
 namespace {
 bool WriteTrigger(const char* path, std::string_view contents) {
-	std::error_code ec;
+	std::error_code             ec;
 	const std::filesystem::path out {path};
 	std::filesystem::create_directories(out.parent_path(), ec);
 	std::ofstream file {out, std::ios::binary | std::ios::trunc};
@@ -223,7 +292,8 @@ void ToggleWireframe() {
 	const bool on = !g_wireframe.load(std::memory_order_relaxed);
 	g_wireframe.store(on, std::memory_order_relaxed);
 	LOGF("Wireframe: %s (F12). The UI draws through the same pipelines, so toggle it off "
-	     "to navigate menus.\n", on ? "ON" : "OFF");
+	     "to navigate menus.\n",
+	     on ? "ON" : "OFF");
 }
 
 void Capture() {
@@ -235,13 +305,13 @@ void Capture() {
 	}
 	g_cursor.store(-1, std::memory_order_relaxed);
 	g_suppress_on.store(true, std::memory_order_relaxed);
+	g_match_identity.store(false, std::memory_order_relaxed);
 	g_sel_start.store(1, std::memory_order_relaxed);
 	g_sel_end.store(0, std::memory_order_relaxed);
 	g_recording.store(true, std::memory_order_relaxed);
 	std::printf("[SceneDraw] arming one-frame capture on 0x%016llx\n",
 	            static_cast<unsigned long long>(Target()));
 	std::fflush(stdout);
-	ReportCapture();
 }
 
 void ReportCapture() {
@@ -314,6 +384,7 @@ void SelectAll() {
 	const auto n = CapturedCount();
 	g_cursor.store(-1, std::memory_order_relaxed);
 	g_suppress_on.store(true, std::memory_order_relaxed);
+	g_match_identity.store(false, std::memory_order_relaxed);
 	g_sel_start.store(0, std::memory_order_relaxed);
 	g_sel_end.store(n - 1u, std::memory_order_relaxed);
 	LogState("ALL");
@@ -321,6 +392,7 @@ void SelectAll() {
 
 void ClearSelection() {
 	g_cursor.store(-1, std::memory_order_relaxed);
+	g_match_identity.store(false, std::memory_order_relaxed);
 	g_sel_start.store(1, std::memory_order_relaxed);
 	g_sel_end.store(0, std::memory_order_relaxed);
 	LogState("CLEAR");

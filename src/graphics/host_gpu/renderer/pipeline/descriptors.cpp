@@ -1256,7 +1256,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				                                   : vk::ImageLayout::eShaderReadOnlyOptimal,
 				              vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
 			}
-			binding.layout = image.backing.state.layout;
+			binding.layout = image.LayoutForView(view);
 		}
 
 		m_image_occurrences.assign(descriptors.images.size(), 0);

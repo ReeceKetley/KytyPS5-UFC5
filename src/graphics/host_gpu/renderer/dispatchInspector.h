@@ -234,7 +234,7 @@ void CollectInspectorResourceTimeline(const InspectorFrameIndex& index,
 
 void ArmInspectorCapture(const InspectorCaptureArm& arm);
 [[nodiscard]] InspectorCaptureArm PeekInspectorCaptureArm();
-[[nodiscard]] bool InspectorShouldCapture(const InspectorOperation& operation, uint32_t index,
+[[nodiscard]] bool InspectorShouldCapture(InspectorOperation& operation, uint32_t index,
                                           bool* capture_inputs, bool* capture_outputs);
 void InspectorCompleteCapture();
 void CaptureInspectorResources(CommandBuffer& command, RenderContext& renderer,

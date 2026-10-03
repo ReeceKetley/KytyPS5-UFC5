@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/dispatchInspector.h"
+#include "graphics/host_gpu/renderer/watchedImageTrace.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/translate/ProbeConfig.h"
@@ -1844,6 +1845,34 @@ struct SystemOverlay::Impl {
 					inspector_status = WriteDiagnosticTrigger("D:/PS5/dumps/TRACE_ADDRS", address, &error)
 					                       ? "TRACE_ADDRS now watches the selected address"
 					                       : "trace request failed: " + error;
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Watch image")) {
+					if (selected_resource_image_id != 0) {
+						WatchedImageSetImageId(selected_resource_image_id,
+						                       selected_resource_generation);
+						inspector_status = "WatchImage armed on selected ImageId";
+					} else if (selected_resource_address != 0) {
+						WatchedImageSetAddress(selected_resource_address);
+						inspector_status = "WatchImage armed on selected guest address";
+					} else {
+						inspector_status = "select an image resource first";
+					}
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Break next write")) {
+					WatchedImageArmBreakOnWrite();
+					inspector_status = "WatchImage BREAK_ON_WRITE armed";
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Snapshot GOOD")) {
+					WatchedImageArmSnapshotGood();
+					inspector_status = "WatchImage SNAPSHOT_GOOD armed (next event)";
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Snapshot BAD")) {
+					WatchedImageArmSnapshotBad();
+					inspector_status = "WatchImage SNAPSHOT_BAD armed (next event)";
 				}
 				ImGui::SameLine();
 				if (ImGui::Button("Clear images once at address")) {

@@ -1002,7 +1002,7 @@ InspectorCaptureArm PeekInspectorCaptureArm() {
 	return state.capture_arm;
 }
 
-bool InspectorShouldCapture(const InspectorOperation& operation, uint32_t index,
+bool InspectorShouldCapture(InspectorOperation& operation, uint32_t index,
                             bool* capture_inputs, bool* capture_outputs) {
 	if (capture_inputs != nullptr) {
 		*capture_inputs = false;
@@ -1015,6 +1015,21 @@ bool InspectorShouldCapture(const InspectorOperation& operation, uint32_t index,
 	}
 	auto&            state = State();
 	std::scoped_lock lock(state.mutex);
+	// Capture is tested immediately before RecordInspectorOperation(), which is where dispatch
+	// occurrences were historically assigned. Consequently every live operation still had the
+	// default occurrence 0 here and a headless request for occurrence 1 could never fire. Derive
+	// the pending occurrence from the already-recorded dispatches and publish it on the operation
+	// before matching/capturing. An index of zero also covers the first operation of a new frame,
+	// while state.current may still contain the previous frame.
+	if (operation.kind == InspectorOperationKind::Dispatch) {
+		operation.occurrence = 0;
+		if (index != 0 && state.current.operations.size() == index) {
+			const auto found = state.dispatch_counts.find(OperationHash(operation));
+			if (found != state.dispatch_counts.end()) {
+				operation.occurrence = found->second;
+			}
+		}
+	}
 	const auto&      arm   = state.capture_arm;
 	if (arm.mode == InspectorCaptureMode::None) {
 		return false;
