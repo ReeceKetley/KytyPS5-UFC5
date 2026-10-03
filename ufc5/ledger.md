@@ -1,6 +1,28 @@
 # UFC 5 / KytyPS5 ledger
 
-Last updated: 2026-09-16 session 15 — **WATCHED-IMAGE FIRST-CORRUPTION TRACER (spinner path).**
+Last updated: 2026-10-03 session 16 — **UPSTREAM RENDERS UFC 5 CORRECTLY AT ~1 FPS. THE PLAN INVERTS:
+PORT OUR TWO PERF FIXES ONTO `origin/main`, NOT THE OTHER WAY ROUND.**
+After a two-week gap `origin/main` is **425 commits** ahead of our branch point (`b847135`,
+2026-09-08). A stock upstream build **gets in-game with no graphical issues** and runs **~1 fps** —
+slower than our 5 fps but visually correct. That number is exactly our pre-ubershader-fix baseline,
+and the mechanism is identified: #883 deleted the strategy ladder and made goto elimination the only
+structurizer. `GotoStructurizer` is the guard-variable algorithm (`CaptureVariable`, `RouteVariable`,
+`GotoAfter`, `Eliminate`), so the three pixel ubershaders now get the same shape as the old dispatcher
+fallback that cost **21,157 us/draw** (census was `645 legacy, 3 dispatch` — those 3 were the
+ubershaders). Semantically faithful, hence correct rendering; catastrophically slow.
+**`SplitSharedTerminalBlocks` is a CFG pre-pass, not a structurizer strategy** — it makes the graph
+reducible before anything consumes it, so it should drop in front of upstream's `Structurize()`
+(`ShaderCFG.cpp:1677`) and leave goto elimination nothing to lift. **~91 lines** + 3 trivial helpers
+upstream lacks (`AppendClonedSemanticBlock` 16, `ReplaceValue` 13, `ReplaceTerminatorTarget` 12);
+drop the `post_dominators.clear()` line (#883 removed that analysis). The BufferCache GC fix is
+**still absent upstream** (`bufferCache.cpp:607` still gates `aggressive` on `m_total_used_memory`).
+Expected ladder on a fresh branch: **~1 → ~3 → ~5 fps with correct rendering.**
+**THE EXPERIMENT IN STEP 1:** privatising shared `Return` blocks is semantics-affecting. Upstream
+renders correctly *without* it; we render wrong *with* it. If the black round returns when the
+pre-pass is ported, **our own fix was the correctness bug** and sessions 5–15 chased a self-inflicted
+wound. That outcome is worth more than any further NaN tracing. See "session 16" below.
+
+Previously: 2026-09-16 session 15 — **WATCHED-IMAGE FIRST-CORRUPTION TRACER (spinner path).**
 Generic `WatchImage` tracer landed (no UFC hard-codes). Arms via `KYTY_WATCH_IMAGE_ADDR` /
 `KYTY_WATCH_IMAGE_ID`, `D:/PS5/dumps/WATCH_IMAGE`, or inspector **Watch image**. Logs CREATE/
 UPLOAD/SAMPLE_BIND/GPU_WRITE/CPU_WRITE/GC_*/VIEW_*/COPY_*/… with content_generation. Break-on-
@@ -111,6 +133,133 @@ See "2026-09-11 (session 3)".
 Previously: 2026-09-11 session 2 — **in-fight wall identified: `IT_DISPATCH_INDIRECT` host arg read, ~45-50% of the frame**; CPU/GPU measured ~50/50 and serialised (per-draw track floors at ~2.1 fps); `vkCmdDispatchIndirect` implemented behind `KYTY_INDIRECT_DISPATCH`, default off, blocked on a depth-alias-sampling bug. See "2026-09-11 (session 2)".
 
 Previously: 2026-09-10 (FPS work: intra-command-buffer EOP-wait skip — menu ~24→~33 fps, in-match cp_rest/finish collapsed but drawprep_ms now the wall; frame instrumentation added; commits 745d4d8 / 8ee5cc8 / aa794cd on fork)
+
+### SESSION 16 (2026-10-03) — UPSTREAM CAUGHT UP AND OVERTOOK US ON CORRECTNESS. REBASE DIRECTION INVERTS.
+
+No emulator was run this session. Everything below is read out of `origin/main`, the GitHub API, or
+our own tree. **The user reports a stock upstream build gets in-game with no graphical issues at
+~1 fps.** That single observation reframes the whole project.
+
+**UPSTREAM STATE.** `origin/main` = `b11aea8` (2026-10-03 19:13, "loader: native trampoline for
+VRSQRTPS under `--amd-cpu`", #893). **425 commits** ahead of our merge-base `b847135` (2026-09-08).
+20 of those landed on 2026-10-03 alone — upstream is moving fast; re-fetch before trusting any count
+here. 355 files changed, +51,697/-23,960.
+
+**WHY UPSTREAM IS AT ~1 FPS — IDENTIFIED, NOT GUESSED.** `0791f92` ("UFC 5 in-game", #883, nmzik,
+2026-09-28, 19 commits, 34 files) **deleted the structurizer ladder**: `ShaderCFG.cpp` went
+3311 → 1772 lines, and `StructurizeLegacy` / `StructurizerKind::LegacySplit` / the retry ladder are
+gone. `Structurize()` (`ShaderCFG.cpp:1677`) now calls `GotoStructurizer(graph).Run()` and nothing
+else. That class is the textbook guard-variable goto-elimination algorithm — `CaptureVariable`,
+`RouteVariable`, `GotoAfter`, `SetBefore`, `Eliminate`. On a CFG with a shared exit reached from many
+predecessors it introduces a route variable per goto and lifts them through enclosing constructs,
+turning straight-line code into guarded loops. **That is the same shape as the old dispatcher
+fallback, which session 3 measured at 21,157 us/draw.** Session 3's census — `645 legacy, 3 dispatch`
+before our fix, `672 legacy, 0 dispatch` after — says only three shaders ever failed to structurize
+natively, and those three were the ubershaders. Upstream never had our win; it did not regress.
+
+**OUR FIXES THAT ARE NOW UPSTREAM — DROP ON REBASE.**
+- **LDS `DS_APPEND` `m0`** (session 14, committed this session as `ea81081`). Upstream
+  `EmitAppendConsume` gates the `(base<<16)|size` window on `mem.kind == IR::ResourceKind::Gds`;
+  LDS uses the DS offset only. **Identical fix, independently derived** — ours was never pushed
+  (fork last pushed 2026-09-12 01:49, the finding is 2026-09-15) and was still uncommitted until
+  today. Upstream's label: "shader: fix LDS counter bounds".
+- **`KYTY_INDIRECT_DISPATCH`** (session 2, ~45–50% of frame, parked default-off on a depth-alias bug).
+  `79530b4` "Read indirect dispatch counts from GPU buffers" ships it **unconditionally, no env gate**.
+  And `da33a1c` "respect physical tile layout when resolving depth aliases" **fixes the blocker that
+  kept ours off**. Note session 3 already recorded `op0x16` collapsing on its own, which killed this
+  lever's value anyway.
+- **Mip tails.** `8589731` "Preserve PS5 mip-tail views and GPU data during image expansion" and
+  `041874f` "resolve equivalent terminal mip views without expanding backing". Our `1e724e0`
+  logical-tail implementation may be redundant — **compare before porting it.**
+
+**OUR FIXES STILL ABSENT UPSTREAM — KEEP.**
+- **BufferCache GC ownership** (`4572ebe`, the 2.7 → 4.6 median step). Verified: upstream
+  `bufferCache.cpp:607` still reads `const bool aggressive = m_total_used_memory >= m_critical_gc_memory;`
+  — total device memory, shared with the texture cache, exactly the bug. Core of our fix is ~5 lines
+  (`&& own_pressure`, where `own_pressure` compares `m_registered_bytes` against a share of critical);
+  the rest of that commit's +331/-10 across 4 files is census logging. **`m_registered_bytes` is ours
+  — upstream has no equivalent counter, so the port must add it.** PR **#977** adds cache-owned
+  accounting from the HFW side; cherry-pick it first and our gate collapses to ~1 line.
+- **`SplitSharedTerminalBlocks`** (`0ffcecb`, the 1.0 → 2.9 step). See the plan below.
+- **Per-phase frame instrumentation.** Upstream has **none** — grepped `drawprep` / `cp_rest` across
+  `origin/main:src/`, zero hits. `gpuTimestamps.cpp` (311 lines) / `.h` (85) don't exist upstream, so
+  they port with zero conflict. **Port these first or you cannot measure anything on the new branch.**
+
+**NEW FINDING — THE FOURTH `*Zero` SITE, AND IT IS LIVE IN OUR TREE.** `aad25ff` fixed two EXEC/VCC
+read paths and `b238b33` fixed the branch terminator via `Translator::MaskIsZero`
+(`Translate.cpp:126`, ORs both mask halves and compares to zero — correct, and immune to ballot
+under-population because it reads the *modelled* mask words). **There is a fourth site we missed:**
+`BranchCondition()` in `spirvEmitterProgram.cpp:251` begins
+`if (ctx.other_half == nullptr || ...) return ctx.Def(info.condition);` — so `MaskIsZero` is used only
+when `lane_count == 1`. **When `other_half != nullptr` (wave64 lowered as two wave32 halves — exactly
+the RTX 3070 path our hang CS takes) it discards `info.condition` and re-derives the test from
+`ctx.Ballot(info.condition)`, then compares `AND(low,high)` against `~0u`.** `info.condition` for
+`ExecZero` is already a wave-uniform boolean; balloting a uniform `true` sets bits for *active lanes
+only*, so `== ~0u` is false whenever the wave is not fully populated — even when guest EXEC genuinely
+is zero. **The `s_cbranch_execz` exit is never taken and the loop does not terminate.** That is a
+credible mechanism for `ErrorDeviceLost` on `0xea0aceac518ec52d`. Upstream has the same code, moved to
+`EmitConditionRef` (`spirvEmitterFlow.cpp:656`) — which is why grepping our tree for
+`EmitConditionRef` finds nothing. Open PR **#985** describes this bug exactly ("a wave64 shader run as
+two wave32 halves therefore never sees all-ones") and fixes it by inverting the ballot. **We do not
+need #985: `MaskIsZero` is already wave-correct, so the minimal fix is to stop `BranchCondition`
+overriding `info.condition` for the `*Zero` kinds.** Smaller and more obviously right than #985, and
+#985 is still unmerged — this is the one piece of our work clearly ahead of upstream.
+**If upstream does not TDR on the hang CS, this whole thread closes anyway — test that first.**
+
+**OPEN PRs WORTH PULLING, RANKED** (all still open as of 2026-10-03):
+| PR | why |
+|---|---|
+| **#985** | wave-wide `*Zero` branch as "no lane failing". The bug above. Astro Bot world scene, ~50 s/frame. |
+| **#986** | loop iteration cap, default 65536, `KYTY_SHADER_LOOP_LIMIT`. Turns a TDR into an instrumentable slow frame. |
+| **#988** | recompiler plans + SPIR-V cached on disk. 8.6 s → 0.56 s recompiler time per launch. Pure iteration speed. |
+| **#977** | cache accounting + eviction under memory pressure. Upstream's version of `4572ebe`; also fixes protected textures exhausting the eviction candidate budget (cf. our `deleted=0` across 128 TexGc runs). |
+| **#935** | mask `BufferLane` by guest wave size instead of hardcoded `63`. One line. |
+| **#983** | `FirstLane` via `FindILsb` instead of `OpGroupNonUniformBallotFindLSB`. macOS/MoltenVK only, but touches the emitter path `EmitAppendConsume` uses. |
+
+Also landed upstream and relevant to the `drawprep` wall: `3bd5de6`, `d646fd9`, `684330c`, `37501b5`.
+Nothing upstream or in PRs solves wave64-on-wave32 generally.
+
+**REBASE COST.** 88 of our 122 changed files are also in upstream's 355, and the churn is concentrated
+exactly where we work: `ShaderRecompilerComputeTests.cpp` 10,877 lines, `shaderCfgTests.cpp` 4,823,
+`ShaderCFG.cpp` 1,598, `spirvEmitterMemory.cpp` 1,474, `ResourceTracking.cpp` 1,471, `SrtWalker.cpp`
+1,283. This is rewrite-grade, not a replay. **Our 34 diagnostics-only files do not overlap upstream at
+all** — `dispatchInspector`, `sceneDrawDebug`, `watchedImageTrace`, `mipTailDiagnostic`, `ProbeConfig`,
+`gpuTimestamps`, all of `ufc5/`. The tooling survives intact either way.
+
+**WHY WE PORT ONTO UPSTREAM AND NOT THE REVERSE.** Pulling "the graphics fix" is ill-defined: we do not
+know which of 425 commits did it (candidates include #883, `da33a1c`, `73615c3`, `44ba657`, `0f1ff37`,
+`8589731`). Even if it is #883, that is 19 commits — individually fetchable via `refs/pull/883/head` —
+but **23 of the 34 files it touches are files we have also modified**, on a tree ~300 commits past our
+base. Against that, our perf delta is **~100 lines of real logic**. Port the small thing onto the big
+thing. No clone needed: `origin/main` is already local, so this is `git switch -c ufc5-v2 origin/main`.
+
+**PLAN, IN ORDER.**
+1. `git switch -c ufc5-v2 origin/main`. Confirm it still renders correctly and still runs ~1 fps.
+   Also test the hang CS (`KYTY_EXECUTE_CS_HASH`) — if it does not TDR, close the wave64 thread.
+2. Port the instrumentation (`gpuTimestamps.*`, per-phase counters from `6842843` / `b8e0bdd`).
+   No conflict surface. Without it you cannot tell a real win from a lighter scene.
+3. Port `SplitSharedTerminalBlocks` as a pre-pass before `GotoStructurizer`. Expect ~1 → ~3 fps.
+   **Watch for the black round.** Binary outcome: still correct → best of both, and worth upstreaming;
+   black round returns → our privatisation was the correctness bug all along.
+4. Port the GC gate (via #977 if it applies). Expect ~3 → ~5.
+
+**DROP IF UPSTREAM RENDERS CORRECTLY** — the temporal upscaler NaN (sessions 7–11), the wave64
+`0xea0aceac518ec52d` TDR, the 1x1 auto-exposure texture at 1.05e-19, the mip-tail alias,
+`KYTY_INDIRECT_DISPATCH`, the `DS_APPEND` fix, `KYTY_SRT_LINEAR` (no end-to-end), and the transfer
+queue (measured neutral).
+
+**CONVERGENCE / ATTRIBUTION, for the record.** Our PR **#549** was open **53 seconds** (2026-09-09
+21:29:08 → 21:30:01), contained 4 commits, none of them CFG or LDS work, and has no maintainer
+interaction in its timeline. Our fork is public but last pushed **2026-09-12 01:49**, 0 stars, 1 fork
+(`ibrahimrifatovicc-ui`, 2026-09-18). UFC 5 was already a filed upstream target before our fork
+existed — issues **#100** (2026-07-22) and **#113** (2026-07-27). The LDS convergence is provably
+independent: our finding is 2026-09-15, three days after our last public push, and was uncommitted
+until today. nmzik's structurizer answer is also architecturally different and far more expensive than
+ours. Six genuine convergences total (LDS, shared-exit CFG, wave-wide EXEC/VCC, BufferCache GC,
+indirect dispatch, mip tails). Separately: **PR #470** (brandostrong, "model EXEC and VCC words as
+subgroup ballots", cited in `aad25ff`) was **closed unmerged on 2026-09-15**. New UFC 5 report from a
+third party on an official build: issue **#905**, `masterSemaphore.cpp:53` after the difficulty
+screen, RTX 4090 — i.e. others are now downstream of where we were.
 
 ### 2026-09-11 (session 3) — the übershaders structurize; the cause was a SHARED RETURN BLOCK
 
