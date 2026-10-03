@@ -771,15 +771,19 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	if (ctx.half == 1) {
 		return ctx.other_half->Def(IR::Value(const_cast<IR::Inst*>(&inst)));
 	}
-	const auto m0    = ctx.Arg(inst, 0);
-	const auto base =
-	    Binary(state, OpShiftRightLogical, TypeU32(state), m0, ConstantU32(state, 16));
-	const auto size = Binary(state, OpBitwiseAnd, TypeU32(state), m0, ConstantU32(state, 0xffffu));
+	const auto mem = ctx.Memory(inst);
+	const auto m0  = ctx.Arg(inst, 0);
+	// GDS: M0 = (base << 16) | size. LDS (RDNA2/Prospero): address is the DS offset; M0 is not a
+	// GDS-style size window. UFC sets `s_mov m0, 0` before `ds_append` — treating low16 as size
+	// made every LDS append a no-op and left the CS chasing an empty linked list forever.
 	const auto address =
-	    Binary(state, OpIAdd, TypeU32(state), base, ConstantU32(state, ctx.Memory(inst).offset));
+	    mem.kind == IR::ResourceKind::Gds
+	        ? Binary(state, OpIAdd, TypeU32(state),
+	                 Binary(state, OpShiftRightLogical, TypeU32(state), m0, ConstantU32(state, 16)),
+	                 ConstantU32(state, mem.offset))
+	        : ConstantU32(state, mem.offset);
 	const auto raw_index =
 	    Binary(state, OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
-	const auto mem    = ctx.Memory(inst);
 	const auto access = PrepareMemoryResourceAccess(state, mem);
 	const auto index  = EmitMemoryElementIndex(state, access, raw_index);
 	const auto exec   = ctx.Arg(inst, 1);
@@ -798,11 +802,12 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	const auto is_first =
 	    Binary(state, OpIEqual, TypeBool(state), EmitSubgroupLocalInvocationId(state), source_lane);
 	const auto storage_bounds = EmitMemoryElementInBounds(state, access, index);
-	const auto m0_bounds =
-	    mem.kind == IR::ResourceKind::Gds
-	        ? Binary(state, OpINotEqual, TypeBool(state), size, ConstantU32(state, 0))
-	        : Binary(state, OpULessThan, TypeBool(state),
-	                 ConstantU32(state, ctx.Memory(inst).offset + 3u), size);
+	uint32_t m0_bounds = EmitTrueBool(state);
+	if (mem.kind == IR::ResourceKind::Gds) {
+		const auto size =
+		    Binary(state, OpBitwiseAnd, TypeU32(state), m0, ConstantU32(state, 0xffffu));
+		m0_bounds = Binary(state, OpINotEqual, TypeBool(state), size, ConstantU32(state, 0));
+	}
 	const auto condition = AndCondition(
 	    state, is_first,
 	    AndCondition(state,

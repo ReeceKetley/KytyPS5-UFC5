@@ -22011,6 +22011,8 @@ TestCase ImageLoadVariants() {
 TestCase DsAppendConsumeUsesEncodedLdsSelector() {
   using O = ShaderOpcode;
 
+  // LDS append/consume address is the DS offset. M0 is not a GDS size window on Prospero;
+  // m0=0 must still append (matches UFC hang-CS `s_mov m0, 0; ds_append`).
   std::vector<u32> code;
   AppendSMovLiteral(&code, 124, 0x0000ffffu);
   AppendVMovU32(&code, 1, 0);
@@ -22035,7 +22037,7 @@ TestCase DsAppendConsumeUsesEncodedLdsSelector() {
   return {"DsAppendConsumeLdsSelector",
           code,
           {},
-          {10, 11, 0, 10},
+          {10, 11, 10, 11},
           {O::S_MOV_B32, O::V_MOV_B32, O::DS_WRITE_B32, O::DS_READ_B32,
            O::DS_APPEND, O::DS_CONSUME, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
