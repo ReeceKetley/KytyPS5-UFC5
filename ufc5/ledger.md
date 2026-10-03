@@ -1,6 +1,38 @@
 # UFC 5 / KytyPS5 ledger
 
-Last updated: 2026-10-03 session 16 — **UPSTREAM RENDERS UFC 5 CORRECTLY AT ~1 FPS. THE PLAN INVERTS:
+Last updated: 2026-10-03 session 17 — **THE WALL WAS THE BUFFER GC. 1 → 3-6 FPS ON UPSTREAM.
+PR #977 THEN REGRESSED IT TO 1-2; REVERT POINT IS `7c8f2bb`.**
+
+**BEST KNOWN CONFIGURATION: branch `ufc5-v2` at commit `7c8f2bb` — 3-6 fps in-fight, correct
+rendering.** To get back to it, drop the two PR #977 commits on top:
+`git revert --no-edit f816c6f 04359bd`  (or `git checkout 7c8f2bb -- src/graphics/host_gpu/renderer/cache/`).
+
+`7c8f2bb` is the BufferCache ownership fix: `RunGarbageCollector` gated `aggressive` — download a
+dirty buffer (a full GPU drain) or leave it — on `m_total_used_memory`, which was **total device
+memory shared with the texture cache**. The texture cache cannot evict GPU-modified tiled images, so
+it pins total memory above critical with memory the buffer cache neither owns nor can free; the
+buffer GC therefore drained the GPU permanently in response to pressure it could not relieve.
+Fix: require this cache to hold a material share (25%, `KYTY_BUFGC_OWN_SHARE=0` disables) of the
+budget before going aggressive. Measured **1 → 3-6 fps**, GPU utilisation **33% → 62-78%** and steady
+instead of oscillating 3-86%, shared system memory **2,063 → 1,202 MB**, and
+`BufferCache::RunGarbageCollector` went from **6 of 6** guest-GPU-thread stack captures to **absent**.
+
+**THEN IT REGRESSED.** Cherry-picking upstream PR #977 (`04359bd` separate cache ownership
+accounting, `f816c6f` scan past protected eviction candidates) dropped the fight back to **1-2 fps**,
+even though GPU utilisation stayed high (62%). Working hypothesis, **not yet tested**: `f816c6f`
+scans past the unevictable tiled images and frees textures that are needed again immediately, so the
+GPU looks busy while doing re-upload work instead of rendering. `04359bd` is probably innocent and is
+the commit that makes `m_total_used_memory` mean owned bytes again — our fix now depends on it, so
+**revert `f816c6f` first and alone** before reverting both.
+
+**STILL OPEN AND THE NEXT LEAD: VRAM sits at 7,432 / 8,192 MiB with ~1.2 GB spilled to shared system
+memory and ~4.3 GB/s sustained GPU→host PCIe traffic.** UFC 5 renders at 1068x600 and upscales to
+1600x900; 7.4 GB resident is not a plausible working set for it. Session 3 counted **4,471 images**
+in the texture cache. Suspect duplication or images never released, not legitimate demand — measure
+the cache's image count / accounted bytes / how many are GPU-modified tiled **before** touching
+eviction policy again. See "session 17" below.
+
+Previously: 2026-10-03 session 16 — **UPSTREAM RENDERS UFC 5 CORRECTLY AT ~1 FPS. THE PLAN INVERTS:
 PORT OUR TWO PERF FIXES ONTO `origin/main`, NOT THE OTHER WAY ROUND.**
 After a two-week gap `origin/main` is **425 commits** ahead of our branch point (`b847135`,
 2026-09-08). A stock upstream build **gets in-game with no graphical issues** and runs **~1 fps** —
@@ -133,6 +165,87 @@ See "2026-09-11 (session 3)".
 Previously: 2026-09-11 session 2 — **in-fight wall identified: `IT_DISPATCH_INDIRECT` host arg read, ~45-50% of the frame**; CPU/GPU measured ~50/50 and serialised (per-draw track floors at ~2.1 fps); `vkCmdDispatchIndirect` implemented behind `KYTY_INDIRECT_DISPATCH`, default off, blocked on a depth-alias-sampling bug. See "2026-09-11 (session 2)".
 
 Previously: 2026-09-10 (FPS work: intra-command-buffer EOP-wait skip — menu ~24→~33 fps, in-match cp_rest/finish collapsed but drawprep_ms now the wall; frame instrumentation added; commits 745d4d8 / 8ee5cc8 / aa794cd on fork)
+
+### SESSION 17 (2026-10-03) — THE WALL WAS THE BUFFER GC, FOUND BY MEASUREMENT AFTER TWO WRONG GUESSES
+
+Branch `ufc5-v2` = `origin/main` (`b11aea8`) + our commits. Everything below was measured on this
+machine (RTX 3070 8 GB, i7-10700, PCIe 3.0 x16), not inferred.
+
+**WHAT CLOSED, WITH NUMBERS.**
+- **The wave64 TDR thread is CLOSED.** On upstream the hang CS `0xea0aceac518ec52d` was dispatched
+  **10 times with 0 device losses and 0 shader translation failures**, unstubbed — `KYTY_SKIP_CS_HASH`
+  is not read by upstream at all, so `run_ufc5.ps1` setting it is a no-op there. Sessions 5/13/14's
+  biggest blocker is gone. The `BranchCondition` ballot finding from session 16 is still real code,
+  but it is no longer blocking anything here.
+- **Our ubershader privatisation was NOT the correctness bug.** `SplitSharedTerminalBlocks` ported
+  onto upstream's `GotoStructurizer` as a pre-pass: built clean, **0 CFG failures**, rendering stayed
+  correct — and **fps did not move**. Goto lowering was never the wall. **Reverted.** Sessions 7-11
+  were not chasing our own change.
+- **`2d1f261` (`KYTY_SRT_LINEAR`) is CLOSED — not worth porting.** A census on the per-draw
+  `MaterializeResources` call (`pipelineCache.cpp`, cache-hit path) measured **~5,800 calls/frame,
+  8.0 us mean, ~0.09 s per 2 s wall ≈ 4% of frame time**, and only **4.6-13.2%** of calls see
+  unchanged SRT inputs, so memoisation cannot help either. Optimising this away entirely buys ~4%.
+  Session 3's "does not show end-to-end" was right, for this reason.
+- **`a1fc490` (PR #484 scratch reuse) is CLOSED — redundant.** Upstream's `d6dac92` already pools
+  evaluation contexts on the `ResourcePlan` (`SrtWalker::AcquireContext`, `generation += 2`,
+  stamps at `SrtWalker.cpp:359-377`). Arguably better than the thread-local version we ported.
+
+**HOW THE REAL WALL WAS FOUND.** Three measurements, none of which need a code change:
+1. **`nvidia-smi` over an 8 minute in-fight run (240 samples):** GPU utilisation **mean 33.4%**, only
+   **1.7%** of samples >=90%, **60.7 W of a 220 W** budget, memory bandwidth 2-6%. The GPU was
+   starved, oscillating 3-86%. **Not GPU-bound.**
+2. **Process CPU:** **1.10 cores of 16**, 83 threads, hottest thread only 44.9% of one core. Nothing
+   saturated — everything waiting. A synchronisation problem, not a throughput one.
+3. **`cdb` non-invasive stack sampling** (`-pv -p <pid> -c "~*k8; q"`, 18 sweeps, **1,494
+   thread-stacks**): **every one of the 6 captures of the guest GPU thread was inside
+   `BufferCache::RunGarbageCollector`**, with `DownloadBufferMemory` on the stack twice.
+   `MaterializeResources` and the SRT walker appeared **once each**.
+
+Plus VRAM pinned at **7,404 / 8,192 MiB**, which holds `m_total_used_memory >= m_critical_gc_memory`
+permanently true. That is the condition `7c8f2bb` fixes. Session 3 reached the same conclusion
+independently on a tree 425 commits older.
+
+**METHOD NOTE — STACK SAMPLING BEAT EVERYTHING ELSE, BUT ONLY WHEN AGGREGATED.** An early read of
+**6 samples of one thread** put the hot path in the SRT walker and was **wrong** — those `IR::`
+frames (`ValidateRuntimeValue`, `Value::GetType`, `_Hash<_Uset_traits<IR::Inst>>`) are also used by
+`ResourceTracking` at translation time. Do not draw conclusions from a handful of samples of a single
+thread; sweep all threads repeatedly and aggregate. Also: `std::vector<unsigned>` frames in a Release
+build are usually inlining artifacts, not real allocation.
+
+**TOOLING THAT WORKS (use this next time instead of building a profiler).**
+- `cdb.exe` at `C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe`. Attach **non-invasively**
+  with `-pv` so quitting does not kill the game; set `_NT_SYMBOL_PATH` to the bin dir so the
+  freshly-built PDB resolves. Two minutes to a real answer.
+- `nvidia-smi --query-gpu=utilization.gpu,memory.used,power.draw` and `nvidia-smi dmon -s t` for PCIe
+  RX/TX. Windows shared-memory spill: `Get-Counter '\GPU Adapter Memory(*)\Shared Usage'`.
+- Tracy **is** instrumented upstream (85 `KYTY_PROFILER_FUNCTION` zones, `--profile` flag) and the CLI
+  tools now build at `build-tracy/{capture,csvexport}`. Five failed attempts first: the root Tracy
+  CMakeLists does not include the CLI tools, and they need `-DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl`
+  (clang-cl makes CMake pick `llvm-ar`, which is then handed MSVC-style flags). Not needed in the end.
+- **`devenv.ps1` sets `$ErrorActionPreference = 'Stop'` and dot-sourcing leaves it in the shell.** In
+  PowerShell 5.1 any native stderr output then becomes a *terminating* error, so cmake aborts at its
+  own banner. **Always `$ErrorActionPreference = 'Continue'` after dot-sourcing it.** This single
+  issue caused four consecutive build "failures" that were not failures.
+
+**BUILD/RUN NOTES.**
+- Configure: `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl
+  -DCMAKE_CXX_COMPILER=clang-cl -DKYTY_BUILD_LAUNCHER=OFF`. Cold build ~938 steps, no ccache on this box.
+- Upstream switched **SDL2 → SDL3** (`release-3.4.x`) and moved `ffmpeg-core` to KytyPS5's own fork, so
+  a branch switch needs `git submodule update --init --recursive`. SDL3 links **static** — no new DLL.
+- `_PipelineCache` is keyed by git revision, so it misses after every rebuild; a dirty tree keeps the
+  same revision, so **move it aside manually** when the SPIR-V changes or you will reuse stale pipelines.
+- Run without the log firehose: `kyty_emulator.exe --game D:\PS5\Games\UFC5`. `printf_direction`
+  defaults to Silent. **Logging was tested and is NOT a factor** — still 1 fps with it off, though it
+  does write ~1 MB/s (`Equeue wait:` from `eventQueue.cpp:413`) when `--printf-direction File` is set.
+  The heavy per-draw graphics dump needs `--graphics-debug-dump` as well, which `run_ufc5.ps1` never passes.
+- The old 5 fps fork binary is preserved at `Emulators/KytyPS5-Bin/kyty_emulator.ufc5-fork-5fps.exe`.
+
+**REMAINING GRAPHICAL ISSUES (user-confirmed, not chased this session).** Everything renders and is
+"playable", but: the whole scene is **flat / washed out**, consistent with session 13's `8108f2d`
+(the 1x1 auto-exposure texture has no producer and reads 1.05e-19 — upstream does not read our
+`KYTY_STUB_CLEAR_IMAGES` workaround); and **white UFC logos are speckled with colour**, suspected
+session 12 mip-tail aliasing, which our `1e724e0` implements for real but which upstream may already
+cover via `8589731`/`041874f`. **Compare before porting.**
 
 ### SESSION 16 (2026-10-03) — UPSTREAM CAUGHT UP AND OVERTOOK US ON CORRECTNESS. REBASE DIRECTION INVERTS.
 
