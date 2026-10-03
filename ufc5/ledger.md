@@ -25,12 +25,34 @@ GPU looks busy while doing re-upload work instead of rendering. `04359bd` is pro
 the commit that makes `m_total_used_memory` mean owned bytes again — our fix now depends on it, so
 **revert `f816c6f` first and alone** before reverting both.
 
-**STILL OPEN AND THE NEXT LEAD: VRAM sits at 7,432 / 8,192 MiB with ~1.2 GB spilled to shared system
-memory and ~4.3 GB/s sustained GPU→host PCIe traffic.** UFC 5 renders at 1068x600 and upscales to
-1600x900; 7.4 GB resident is not a plausible working set for it. Session 3 counted **4,471 images**
-in the texture cache. Suspect duplication or images never released, not legitimate demand — measure
-the cache's image count / accounted bytes / how many are GPU-modified tiled **before** touching
-eviction policy again. See "session 17" below.
+**THE VRAM IS PIPELINES, AND THEY ARE NEVER EVICTED.** Measured, after ruling out everything else:
+`PipelineCache` calls `destroyPipeline` **only in `~PipelineCache()`**, so every `VkPipeline` /
+`VkPipelineLayout` / `VkDescriptorSetLayout` built in a session lives until the emulator exits.
+In-fight: **799 pipelines and climbing**, driver usage **7,815 MB** against VMA blocks **4,480 MB** —
+**~3,335 MB of driver-managed memory, ~4.2 MB per pipeline**, invisible to VMA and unreachable by any
+GC. That pushes `driver usage` past `driver budget` (7,815 vs 7,291) and **that** is what makes
+Windows spill to shared system memory. Everything else was eliminated by measurement:
+- **not duplication** — `dup_factor` **1.01** (3,286 distinct guest addresses for 3,311 images);
+- **not the texture cache** — it accounts for **~3.0-3.3 GB** of a 7.5 GB footprint and sits *below*
+  its own 5,223 MB critical threshold, which is also why PR #977's harder eviction made things worse:
+  it was squeezing the wrong cache;
+- **not VMA fragmentation** — blocks 4,225 MB vs allocs 4,212 MB, a **13 MB** gap;
+- the driver-side gap **grows with play**: **12 MB at boot → 113 MB loading → 3,284 MB in a fight**,
+  so it is accumulation, not a startup reservation.
+
+**FAILED, DO NOT RETRY WITHOUT FIXING BUFFER GRANULARITY FIRST: `CACHING_PAGEBITS` 14 → 16.** The BDA
+page table is `(1 TB + 512 GB) / page * 8 B` = **768 MB** of device-local memory at 16 KB pages, 18%
+of the whole VMA footprint; 64 KB pages cut it to 192 MB. The 576 MB saving was **entirely eaten by
+per-buffer padding** — buffer ranges align to `CACHING_PAGESIZE`. Measured: VMA blocks **unchanged**
+(4,281-4,452 → 4,367-4,480 MB), alloc/block fragmentation **13 → 244 MB**, shared spill
+**1.2 → 1.9 GB**, over-budget **477 → 524 MB**, fps 3-6 → 3-7 (noise), and it introduced
+**multi-second stutters** outside the fight. Reverted; the finding is recorded as a comment on the
+constant in `bufferCache.h`.
+
+**Also unexplained and probably worth a look: `trigger=0MB`.** `m_trigger_gc_memory =
+max((budget - threshold) / 2, 0)` evaluates to zero, so the texture GC's early-out never fires and it
+walks the LRU on every call. Not urgent while the cache is under threshold, but the budget arithmetic
+is suspect.
 
 Previously: 2026-10-03 session 16 — **UPSTREAM RENDERS UFC 5 CORRECTLY AT ~1 FPS. THE PLAN INVERTS:
 PORT OUR TWO PERF FIXES ONTO `origin/main`, NOT THE OTHER WAY ROUND.**

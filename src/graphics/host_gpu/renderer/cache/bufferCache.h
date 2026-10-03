@@ -27,6 +27,11 @@ inline constexpr BufferId NULL_BUFFER_ID {0};
 
 class BufferCache {
 public:
+	// Session 17: tried 16 (64 KB) to shrink the 768 MB BDA page table to 192 MB. The saving was
+	// entirely eaten by per-buffer padding (buffer ranges align to CACHING_PAGESIZE): VMA blocks
+	// unchanged at ~4.4 GB, alloc/block fragmentation 13 MB -> 244 MB, shared spill 1.2 -> 1.9 GB,
+	// and it introduced multi-second stutters outside the fight. Do not retry without also fixing
+	// buffer granularity. The real target is pipeline memory - see the ledger, session 17.
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
