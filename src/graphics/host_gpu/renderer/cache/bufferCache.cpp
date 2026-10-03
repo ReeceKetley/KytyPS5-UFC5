@@ -14,6 +14,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -54,6 +55,14 @@ void BufferCache::Unregister(BufferId id) {
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	auto& buffer = m_slot_buffers[id];
+	// Running total of what THIS cache holds. RunGarbageCollector needs it on every run, so it
+	// cannot be recomputed by walking m_slot_buffers; the symmetric register/unregister hook is
+	// the cheap place to maintain it.
+	if constexpr (insert) {
+		m_registered_bytes += buffer.Size();
+	} else {
+		m_registered_bytes -= std::min(m_registered_bytes, buffer.Size());
+	}
 	PageTable::PageRange pages {};
 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
 	        !PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
@@ -604,7 +613,24 @@ void BufferCache::RunGarbageCollector() {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	// m_total_used_memory is TOTAL device memory, shared with the texture cache - and the texture
+	// cache cannot evict GPU-modified tiled images, so it pins total memory above critical with
+	// memory this cache neither owns nor can free. Gating `aggressive` on that alone left the
+	// buffer GC downloading dirty buffers forever (each download is a full GPU drain) in response
+	// to pressure it could not relieve. Require this cache to hold a material share of the budget
+	// before it pays that cost. KYTY_BUFGC_OWN_SHARE=0 restores the old behaviour.
+	static const uint64_t own_share_pct = [] {
+		const char* env = std::getenv("KYTY_BUFGC_OWN_SHARE");
+		if (env == nullptr) {
+			return uint64_t {25};
+		}
+		char*      end    = nullptr;
+		const auto parsed = std::strtoull(env, &end, 10);
+		return end == env ? uint64_t {25} : parsed;
+	}();
+	const bool own_pressure =
+	    own_share_pct == 0 || m_registered_bytes >= m_critical_gc_memory * own_share_pct / 100;
+	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory && own_pressure;
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
