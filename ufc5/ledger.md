@@ -1,6 +1,35 @@
 # UFC 5 / KytyPS5 ledger
 
-Last updated: 2026-09-15 session 12 — **GUEST MIP9 ON A 256² IMAGE IS A REAL MIP-TAIL SLOT, NOT A DECODE TYPO.**
+Last updated: 2026-09-16 session 15 — **WATCHED-IMAGE FIRST-CORRUPTION TRACER (spinner path).**
+Generic `WatchImage` tracer landed (no UFC hard-codes). Arms via `KYTY_WATCH_IMAGE_ADDR` /
+`KYTY_WATCH_IMAGE_ID`, `D:/PS5/dumps/WATCH_IMAGE`, or inspector **Watch image**. Logs CREATE/
+UPLOAD/SAMPLE_BIND/GPU_WRITE/CPU_WRITE/GC_*/VIEW_*/COPY_*/… with content_generation. Break-on-
+next-write + GOOD/BAD snapshots write `watch_image_{good,bad}.json` + `watch_image_diff.txt`.
+`KYTY_WATCH_UI_PROBE=1` / `run_ufc5.ps1 -UiProbe` lists distinct ≤512² sampled textures to
+identify the loading icon. Phase 1 (icon identity) not yet closed — needs a live menu run.
+DS_APPEND fix and hang-CS stub-off remain intact.
+
+Previously: 2026-09-15 session 14 — **HANG CS STUB REMOVED; LDS `DS_APPEND` IGNORED `m0=0`.**
+Root cause of the TDR was not pair-packed wave64 per se: `AppendConsume` applied a GDS-style
+`m0` size window to **LDS** append/consume. UFC does `s_mov m0, 0; ds_append`, so every LDS append
+became a no-op, the CS built no work list, and loop 50 walked zeros forever. Fix: LDS uses the DS
+offset only and relies on allocated LDS bounds; GDS keeps `(base<<16)|size`. After the fix, full
+144×1×1 exec with no GDS/loop caps runs for minutes without `ErrorDeviceLost`.
+`run_ufc5.ps1` no longer sets `KYTY_SKIP_CS_HASH` by default (`-StubHangCs` for A/B rollback).
+See session 14 notes below.
+
+Previously: 2026-09-15 session 13 — **HANG CS STUB STAYS; SAMPLED/STORAGE SHARE VkImage; WAITCNT WAS A NO-OP.**
+CS `0xea0aceac518ec52d` translation is clean (`unsupported=0`, CFG ok, wave=64). Stub reason remains
+wave64-on-wave32 TDR (RTX 3070: `subgroup min=max=32`, `wave64=false`). Live identity: storage+sampled
+pairs for the two RW surfaces are **same ImageId / same VkImage / different VkImageView / same mip+fmt**.
+Texture[2] is depth-tiled (`tile=0x18`) R32F alias of a `D32SfloatS8Uint` depth image — intentional
+depth feedback, not a FindImage collapse bug. Generic fix landed: `S_WAITCNT`/`s_barrier` now emit
+ImageMemory(+UniformMemory) when the program writes images/buffers (`97250b5`). Checkpoint before stub
+removal: `a090a3f` (`KYTY_EXECUTE_CS_HASH` + `CsImageIdentity`/`CsAliasPair`). Real exec with
+`KYTY_GDS_LIMIT_CAP=1` still `ErrorDeviceLost` after the first live dispatches — stub **not** removed.
+See session 13 notes below.
+
+Previously: 2026-09-15 session 12 — **GUEST MIP9 ON A 256² IMAGE IS A REAL MIP-TAIL SLOT, NOT A DECODE TYPO.**
 `MaxMip=9` means highest mip *index* 9 (`levels = MaxMip+1 = 10`). Kyty's Standard64KB tiler packs
 mip8 at tail_xy=(0,12) and mip9 at (0,8) inside the same 64KB mip-tail block (footprint stays
 `0xb0000`). Vulkan can only host complete levels 0..8, so `Image::` clamps host mips; the old
@@ -3234,23 +3263,32 @@ Menus ~20–60 fps. In-match / 3D scene ~**1 fps** with **8k–10k draws** after
 
 ## Next steps
 
-0. **Fight round still black — run the wave64 CS or replace it faithfully.** The consumer is now traced: dynamic buffer 9 (18 MB; `0x1163770000` in frame 1073) is reinterpreted as the 1600x900 HDR scene input. Constant-zero buffer filling already stayed black and corrupted the HUD, so do not retry arbitrary fills. Implement Wave64 Stage 2 (step 2) or substitute a shader-specific algorithm that produces the real buffer/image outputs.
-1. **Skin corruption** (issue 4b) — the `fmt 98↔122` reinterpret-view fix is landed but **did not change the visuals**. Not a sample-site encoding bug. Next: chase the 4 revised hypotheses in issue 4b (wrong/stale source image → tiling → descriptor decode → stubbed-CS garbage). Start by tracing what writes `0x1156990000`.
-2. **Wave64 → wave32 lowering rework (Option A).** Stage 1 landed (−26% OpSelect, measured). Next: **Stage 1b** — at structurize time mark the structured-`if`-body entry exec as identity so the `s_and_saveexec`/`s_mov exec,<saved>` restores fold too (catches most of the remaining 1309 selects). The proposed `lane_count = 1` / two-subgroup LDS bridge is **ruled out on this RTX 3070**: a minimal one-readlane test TDRs despite valid SPIR-V and correctly initialized counters. Keep the two-half model unless a design avoids cross-subgroup waiting.
+0. **Hang CS (session 14 — DONE):** LDS `DS_APPEND`/`DS_CONSUME` no longer apply a GDS `m0` size
+   window. Stub removed from `run_ufc5.ps1` default; use `-StubHangCs` only for A/B. Keep
+   Waitcnt/Barrier ImageMemory (`97250b5`) and EXECUTE/SKIP hooks for diagnostics.
+1. **Fight round still black — hang CS now executes; re-check the consumer.** Dynamic buffer 9
+   (18 MB; `0x1163770000` in frame 1073) is reinterpreted as the 1600x900 HDR scene input. With
+   real occlusion CS output, verify whether the round still stays black; if so, chase buffer/image
+   producers downstream of this CS rather than re-stubbing.
+2. **Skin corruption** (issue 4b) — the `fmt 98↔122` reinterpret-view fix is landed but **did not change the visuals**. Not a sample-site encoding bug. Next: chase the 4 revised hypotheses in issue 4b (wrong/stale source image → tiling → descriptor decode → stubbed-CS garbage). Start by tracing what writes `0x1156990000`.
+3. **Wave64 → wave32 lowering rework (Option A).** Stage 1 landed (−26% OpSelect, measured). Next: **Stage 1b** — at structurize time mark the structured-`if`-body entry exec as identity so the `s_and_saveexec`/`s_mov exec,<saved>` restores fold too (catches most of the remaining 1309 selects). The proposed `lane_count = 1` / two-subgroup LDS bridge is **ruled out on this RTX 3070**: a minimal one-readlane test TDRs despite valid SPIR-V and correctly initialized counters. Keep the two-half model unless a design avoids cross-subgroup waiting.
    - Per-lane ALU: stop the 2×-per-invocation packing → 1 GCN thread = 1 SPIR-V invocation (kills the doubling on most of the shader).
    - Cross-lane ops: one `combine(subgroup0, subgroup1)` per wave through a single LDS slot + one barrier, computed once per loop edge — not twice per use. `readlane`→`subgroupShuffle`/LDS; `readfirstlane`→`subgroupBroadcastFirst`+LDS hop; `ballot`→two `subgroupBallot`+LDS halves; wave reduce→`subgroupAdd`/etc.
    - **Declare `GroupNonUniformArithmetic`** (currently not declared — reductions are hand-rolled 6-step shuffle trees ×2).
    - `exec` mask: recognize the `v_cmpx / s_cbranch_execz / s_mov_b64 exec,-1` idiom as a plain SPIR-V `if` and let the driver handle divergence; only emulate `exec` for the genuinely weird cases (`s_not_b64 exec` then continue, cross-mask value reuse).
    - Pin with `VK_EXT_subgroup_size_control` + `requiredSubgroupSize=32` + `FULL_SUBGROUPS`.
    - Expected: ~3–6× for this shader (tile ~0.67 s → ~0.1–0.2 s). Might survive with chunking; helps every compute-heavy Frostbite shader. If not enough, the fallback is a hand-written wave32 replacement of the occlusion-cull algorithm (detect the hash, substitute the pipeline) or an AMD wave64 GPU.
-2. **`input_num=0`** — fix at the source (PS `0x4c22cd8526171dbb` register-capture timing).
-3. **dualSrcBlend** — enable the feature; emit the dual-source PS output at Location 0 / Index 1.
-4. **Slideshow** — draw/submit cost on the 3D scene once the GPU stays alive.
+4. **`input_num=0`** — fix at the source (PS `0x4c22cd8526171dbb` register-capture timing).
+5. **dualSrcBlend** — enable the feature; emit the dual-source PS output at Location 0 / Index 1.
+6. **Slideshow** — draw/submit cost on the 3D scene once the GPU stays alive.
 
 ## Diagnostic env / flags
 
 ```
 $env:KYTY_SKIP_CS_HASH       = '0xea0aceac518ec52d'   # skip hang CS entirely — fast iteration (cap=1 no longer survives)
+$env:KYTY_EXECUTE_CS_HASH    = '0xea0aceac518ec52d'   # force real dispatch even when SKIP lists the hash (A/B; TDR risk)
+$env:KYTY_GDS_LIMIT_CAP      = '1'                    # cap hang-CS GDS work limit; still DeviceLost on RTX 3070 (session 13)
+$env:KYTY_CS_IDENTITY_HASH   = '0xea0aceac518ec52d'   # optional; hang CS always logs CsImageIdentity/CsAliasPair
 $env:KYTY_SHADER_DUMP_DIR    = 'D:\PS5\shader-dumps'
 $env:KYTY_DUMP_SHADER_HASH   = '0x…,0x…'              # dump .spv/.rdna2/.cfg.txt/.ir.txt for a hash (comma list)
 $env:KYTY_SHADER_CFG_STRATEGY= 'auto'                 # legacy | dispatch | auto (default). auto now falls back to dispatch on invalid legacy output.
