@@ -511,11 +511,41 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
-static void SetGraphicsDynamicParams(const GraphicContext& graphics, const HW::Context& ctx,
-                                     vk::CommandBuffer vk_buffer,
-                                     const ShaderVertexInputInfo& vs_input_info,
-                                     const RenderDepthInfo& depth, const RenderState& rendering) {
+// The resolved arguments of every dynamic-state call the draw path makes. Split out of
+// SetGraphicsDynamicParams so the register maths happens on the producer side and only this
+// struct has to reach the recorder: FACT-0035 measured HW::Context, ShaderVertexInputInfo and
+// RenderDepthInfo as 5408 of the old 6784-byte commit payload, all three read exactly once and
+// only by that function, so a queue carrying the raw inputs would hand back EXP-0031's +4.3%.
+struct GraphicsDynamicState {
+	static constexpr uint32_t ViewportSlots = std::size(HW::ScreenViewport {}.viewports);
+
+	uint32_t                                   viewport_count = 0;
+	std::array<vk::Viewport, ViewportSlots>    viewports {};
+	std::array<vk::Rect2D, ViewportSlots>      scissors {};
+	float                                      line_width = 1.0F;
+	std::array<float, 4>                       blend_constants {};
+	bool                                       depth_test_enable  = false;
+	bool                                       depth_write_enable = false;
+	vk::CompareOp                              depth_compare_op {};
+	bool                                       depth_bias_enable    = false;
+	float                                      bias_constant_factor = 0.0F;
+	float                                      bias_clamp           = 0.0F;
+	float                                      bias_slope_factor    = 0.0F;
+	bool                                       stencil_test_enable = false;
+	vk::StencilOpState                         stencil_front {};
+	vk::StencilOpState                         stencil_back {};
+	uint32_t                                   color_write_count = 0;
+	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write_enable {};
+};
+
+// Producer side: pure computation from guest registers, no recording. See FACT-0035 --
+// a queued draw carries this struct instead of the 5408 bytes of inputs it came from.
+static GraphicsDynamicState ResolveGraphicsDynamicParams(
+    const GraphicContext& graphics, const HW::Context& ctx,
+    const ShaderVertexInputInfo& vs_input_info, const RenderDepthInfo& depth,
+    const RenderState& rendering) {
 	KYTY_PROFILER_FUNCTION();
+	GraphicsDynamicState out {};
 
 	const auto&        vp  = ctx.GetScreenViewport();
 	const vk::Extent2D framebuffer_extent {rendering.width, rendering.height};
@@ -524,9 +554,11 @@ static void SetGraphicsDynamicParams(const GraphicContext& graphics, const HW::C
 	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
 		    return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
 	    });
-	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
-	std::array<vk::Viewport, viewport_slots> viewports {};
-	std::array<vk::Rect2D, viewport_slots>   scissors {};
+	constexpr uint32_t viewport_slots = GraphicsDynamicState::ViewportSlots;
+	// Written in place: `out` is already zero-initialized, which the clip_disable branch below
+	// relies on for viewport.x/y, and building locals first would copy 640 bytes per draw.
+	auto&          viewports      = out.viewports;
+	auto&          scissors       = out.scissors;
 	const uint32_t viewport_count = indexed_viewports ? viewport_slots : 1;
 	for (uint32_t i = 0; i < viewport_count; i++) {
 		const auto& guest    = vp.viewports[i];
@@ -557,8 +589,7 @@ static void SetGraphicsDynamicParams(const GraphicContext& graphics, const HW::C
 			scissor.extent = {0, 0};
 		}
 	}
-	vk_buffer.setViewportWithCount(viewport_count, viewports.data());
-	vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+	out.viewport_count = viewport_count;
 
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
@@ -571,20 +602,19 @@ static void SetGraphicsDynamicParams(const GraphicContext& graphics, const HW::C
 		}
 		line_width = 1.0f;
 	}
-	vk_buffer.setLineWidth(line_width);
-	const auto&      blend = ctx.GetBlendColor();
-	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
-	vk_buffer.setBlendConstants(blend_constants.data());
-	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	out.line_width = line_width;
+	const auto& blend    = ctx.GetBlendColor();
+	out.blend_constants  = {blend.red, blend.green, blend.blue, blend.alpha};
+	out.depth_test_enable  = depth.depth_test_enable;
+	out.depth_write_enable = depth.depth_write_enable;
+	out.depth_compare_op   = depth.depth_compare_op;
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
-	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
+	out.depth_bias_enable = depth_bias_enable;
 	if (depth_bias_enable) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
@@ -593,33 +623,71 @@ static void SetGraphicsDynamicParams(const GraphicContext& graphics, const HW::C
 		    guest_constant_factor, poly_offset, depth.desc.view_info.format);
 		const float slope_factor =
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
-		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+		out.bias_constant_factor = constant_factor;
+		out.bias_clamp           = poly_offset.clamp;
+		out.bias_slope_factor    = slope_factor;
 	}
 
-	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
+	out.stencil_test_enable = depth.stencil_test_enable;
 	if (depth.stencil_test_enable) {
-		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
-			vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
-			vk_buffer.setStencilCompareMask(face, state.compareMask);
-			vk_buffer.setStencilWriteMask(face, state.writeMask);
-			vk_buffer.setStencilReference(face, state.reference);
-		};
-		set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
-		set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
+		out.stencil_front = depth.stencil_front;
+		out.stencil_back  = depth.stencil_back;
 	}
 
+	for (uint32_t slot = 0; slot < rendering.num_color_attachments; slot++) {
+		out.color_write_enable[slot] = rendering.color_attachments[slot].image_view != nullptr;
+	}
+	out.color_write_count = rendering.num_color_attachments;
+	return out;
+}
+// Drain side: replays what Resolve computed. The only half that touches a command buffer, which
+// is what lets the producer stay out of the recording path (TASK-0016 design point 3).
+static void ApplyGraphicsDynamicParams(vk::CommandBuffer vk_buffer,
+                                       const GraphicsDynamicState& state) {
+	KYTY_PROFILER_FUNCTION();
+	vk_buffer.setViewportWithCount(state.viewport_count, state.viewports.data());
+	vk_buffer.setScissorWithCount(state.viewport_count, state.scissors.data());
+	vk_buffer.setLineWidth(state.line_width);
+	vk_buffer.setBlendConstants(state.blend_constants.data());
+	vk_buffer.setDepthTestEnable(state.depth_test_enable ? VK_TRUE : VK_FALSE);
+	vk_buffer.setDepthWriteEnable(state.depth_write_enable ? VK_TRUE : VK_FALSE);
+	vk_buffer.setDepthCompareOp(state.depth_compare_op);
+	vk_buffer.setDepthBiasEnable(state.depth_bias_enable ? VK_TRUE : VK_FALSE);
+	if (state.depth_bias_enable) {
+		vk_buffer.setDepthBias(state.bias_constant_factor, state.bias_clamp,
+		                       state.bias_slope_factor);
+	}
+	vk_buffer.setStencilTestEnable(state.stencil_test_enable ? VK_TRUE : VK_FALSE);
+	if (state.stencil_test_enable) {
+		const auto set_stencil = [&](vk::StencilFaceFlagBits face,
+		                             const vk::StencilOpState& face_state) {
+			vk_buffer.setStencilOp(face, face_state.failOp, face_state.passOp,
+			                       face_state.depthFailOp, face_state.compareOp);
+			vk_buffer.setStencilCompareMask(face, face_state.compareMask);
+			vk_buffer.setStencilWriteMask(face, face_state.writeMask);
+			vk_buffer.setStencilReference(face, face_state.reference);
+		};
+		set_stencil(vk::StencilFaceFlagBits::eFront, state.stencil_front);
+		set_stencil(vk::StencilFaceFlagBits::eBack, state.stencil_back);
+	}
 #if defined(__APPLE__)
 	// MoltenVK has no VK_EXT_color_write_enable; the pipeline is created without the
 	// eColorWriteEnableEXT dynamic state and relies on the static colorWriteMask instead.
 #else
-	vk::Bool32 enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	for (uint32_t slot = 0; slot < rendering.num_color_attachments; slot++) {
-		enable[slot] = rendering.color_attachments[slot].image_view != nullptr;
-	}
-	if (rendering.num_color_attachments != 0) {
-		vk_buffer.setColorWriteEnableEXT(rendering.num_color_attachments, enable);
+	if (state.color_write_count != 0) {
+		vk_buffer.setColorWriteEnableEXT(state.color_write_count,
+		                                 state.color_write_enable.data());
 	}
 #endif
+}
+
+// Unchanged behaviour for the inline path: resolve then apply, back to back.
+static void SetGraphicsDynamicParams(const GraphicContext& graphics, const HW::Context& ctx,
+                                     vk::CommandBuffer vk_buffer,
+                                     const ShaderVertexInputInfo& vs_input_info,
+                                     const RenderDepthInfo& depth, const RenderState& rendering) {
+	ApplyGraphicsDynamicParams(
+	    vk_buffer, ResolveGraphicsDynamicParams(graphics, ctx, vs_input_info, depth, rendering));
 }
 
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
