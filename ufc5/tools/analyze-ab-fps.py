@@ -67,11 +67,24 @@ class Run:
         return [w.fps for w in self.windows]
 
 
-def parse(path: str, since_bytes: int, tail: int | None) -> list[Window]:
+def parse(path: str, since_bytes: int, tail: int | None,
+          until_bytes: int | None = None) -> list[Window]:
+    """Read windows from a byte range of the log.
+
+    until_bytes matters more than it looks. The log is append-only and shared by every run, so
+    --since-bytes alone reads to end-of-file and silently swallows every LATER run too. Re-reading
+    a historical window without an upper bound produced a confident, wrong answer here once
+    already: two different experiments came back with identical tail pairs because both had
+    absorbed everything after them.
+    """
     with open(path, "rb") as handle:
         if since_bytes:
             handle.seek(since_bytes)
-        text = handle.read().decode("utf-8", "replace")
+        if until_bytes is not None:
+            span = max(until_bytes - since_bytes, 0)
+            text = handle.read(span).decode("utf-8", "replace")
+        else:
+            text = handle.read().decode("utf-8", "replace")
     windows: list[Window] = []
     for line in text.splitlines():
         match = LINE.search(line)
@@ -120,6 +133,108 @@ def bootstrap_ratio(a: list[float], b: list[float], iterations: int = 20000) -> 
     return (low, high)
 
 
+
+def paired_adjacent(runs, lo, hi):
+    """Effect estimated from ADJACENT arm pairs, which is what makes a rapid-alternation run
+    worth doing.
+
+    A long-arm A-B-A-B loads any drift in the machine onto whichever variant held the floor at
+    the time: in one observed arm the rate climbed 11.18 -> 11.70 fps with no flip in it, a 4%
+    trend across a single arm, which is larger than the effect being chased. Adjacent arms are
+    only ~30 s apart, so the drift between one arm and the next is small and mostly common to
+    both. Taking the ratio within each pair cancels it; taking the median across pairs then
+    resists the odd bad window.
+    """
+    ratios = []
+    for first, second in zip(runs, runs[1:]):
+        if first.variant == second.variant or not first.fps or not second.fps:
+            continue
+        a, b = first, second
+        if a.variant == hi:
+            a, b = b, a          # a is always the `lo` arm, b the `hi` arm
+        ratios.append(statistics.median(b.fps) / statistics.median(a.fps))
+    return ratios
+
+
+def trend_adjusted(runs, lo, hi):
+    """Least-squares fit of fps against (variant, window index), as a cross-check on the pairing.
+
+    Window index stands in for time. If the drift really is roughly linear over the run, the
+    variant coefficient is the effect with the trend taken out. Reported alongside the paired
+    estimate rather than instead of it: when two methods that fail differently agree, the answer
+    is probably real; when they disagree, neither should be quoted.
+    """
+    xs, ds, ys = [], [], []
+    index = 0
+    for run in runs:
+        for value in run.fps:
+            if run.variant in (lo, hi):
+                xs.append(float(index))
+                ds.append(1.0 if run.variant == hi else 0.0)
+                ys.append(value)
+            index += 1
+    n = len(ys)
+    if n < 6 or len(set(ds)) < 2:
+        return None
+    # Normal equations for y = b0 + b1*x + b2*d, solved by Gaussian elimination on a 3x3.
+    cols = [[1.0] * n, xs, ds]
+    a = [[sum(ci[k] * cj[k] for k in range(n)) for cj in cols] for ci in cols]
+    rhs = [sum(ci[k] * ys[k] for k in range(n)) for ci in cols]
+    for i in range(3):
+        pivot = max(range(i, 3), key=lambda r: abs(a[r][i]))
+        if abs(a[pivot][i]) < 1e-12:
+            return None
+        a[i], a[pivot] = a[pivot], a[i]
+        rhs[i], rhs[pivot] = rhs[pivot], rhs[i]
+        for r in range(i + 1, 3):
+            factor = a[r][i] / a[i][i]
+            for c in range(i, 3):
+                a[r][c] -= factor * a[i][c]
+            rhs[r] -= factor * rhs[i]
+    beta = [0.0, 0.0, 0.0]
+    for i in reversed(range(3)):
+        beta[i] = (rhs[i] - sum(a[i][c] * beta[c] for c in range(i + 1, 3))) / a[i][i]
+    base = statistics.fmean(v for v, d in zip(ys, ds) if d == 0.0)
+    if base <= 0:
+        return None
+    return {'effect': beta[2] / base, 'drift_per_window': beta[1]}
+
+
+def report_paired(runs, pooled, name_of):
+    usable = sorted((v for v in pooled if v is not None))
+    if len(usable) != 2:
+        return
+    lo, hi = usable
+    ratios = paired_adjacent(runs, lo, hi)
+    if len(ratios) < 2:
+        print()
+        print("Not enough alternations for a paired estimate: it needs at least two adjacent")
+        print("arm pairs. Run the variants in short alternating arms rather than long blocks.")
+        return
+    point = statistics.median(ratios)
+    rng = random.Random(20261008)
+    draws = sorted(statistics.median(rng.choices(ratios, k=len(ratios))) for _ in range(20000))
+    low = draws[int(0.025 * (len(draws) - 1))]
+    high = draws[int(0.975 * (len(draws) - 1))]
+    print()
+    print(f"Paired across {len(ratios)} adjacent arm pairs (drift cancels within a pair):")
+    print(f"  {name_of(hi)} vs {name_of(lo)}: {point - 1:+.1%} "
+          f"(95% CI {low - 1:+.1%} .. {high - 1:+.1%})")
+    print("  per-pair: " + ", ".join(f"{r - 1:+.1%}" for r in ratios))
+    fit = trend_adjusted(runs, lo, hi)
+    if fit is not None:
+        print(f"  cross-check, least squares with a linear time term: {fit['effect']:+.1%} "
+              f"(drift {fit['drift_per_window']:+.4f} fps per window)")
+        if abs(fit['effect'] - (point - 1)) > 0.02:
+            print("  THE TWO METHODS DISAGREE by more than 2 points. Do not quote either;")
+            print("  the drift is not behaving linearly and more alternations are needed.")
+    if low > 1.0 and high > 1.0:
+        print(f"  VERDICT: {name_of(hi)} is faster; the interval excludes zero.")
+    elif low < 1.0 and high < 1.0:
+        print(f"  VERDICT: {name_of(hi)} is slower; the interval excludes zero.")
+    else:
+        print("  VERDICT: UNRESOLVED -- the interval spans zero. More alternations would narrow it.")
+
 def describe(values: list[float]) -> str:
     if not values:
         return "n=0"
@@ -140,6 +255,9 @@ def main() -> int:
     parser.add_argument("--since-bytes", type=int, default=0,
                         help="byte offset to start from; the launch manifest records "
                              "fps_log_start_bytes for exactly this purpose")
+    parser.add_argument("--until-bytes", type=int, default=None,
+                        help="byte offset to stop at; without it the read runs to end of file and "
+                             "absorbs every later run in this shared append-only log")
     parser.add_argument("--tail", type=int, default=None,
                         help="use only the last N windows")
     parser.add_argument("--label", action="append", default=[], metavar="N=NAME",
@@ -161,7 +279,7 @@ def main() -> int:
             return "unlabelled(no control file)"
         return f"{variant}:{labels[variant]}" if variant in labels else str(variant)
 
-    windows = parse(args.log, args.since_bytes, args.tail)
+    windows = parse(args.log, args.since_bytes, args.tail, args.until_bytes)
     if not windows:
         print("no PresentRate windows found -- is KYTY_VRAM_TEST_FPS or KYTY_AB_CONTROL_FILE set?")
         return 1
@@ -223,6 +341,11 @@ def main() -> int:
         print("because it rests on too few repeats to be trusted as the resolution limit. Using")
         print(f"{MIN_BAND:.0%}; add more A-B-A repeats to earn a tighter threshold.")
         drift = MIN_BAND
+
+    # With several short alternating arms the paired estimate is the one to trust; the pooled
+    # comparison below cannot tell an effect from a trend.
+    if len(runs) >= 4:
+        report_paired(runs, pooled, name_of)
 
     usable = sorted((v for v in pooled if v is not None), key=lambda v: v)
     if len(usable) < 2:
