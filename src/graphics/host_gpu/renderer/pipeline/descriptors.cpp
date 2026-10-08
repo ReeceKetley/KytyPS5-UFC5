@@ -1404,6 +1404,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	ProfileDetailScope profile("cpu_commit_descriptors", 0, prepared_bindings.size());
 	KYTY_PROFILER_FUNCTION();
+	// TASK-0018: cpu_commit_descriptors is 21.3 ms/epoch, 83% of the commit phase and the largest
+	// named item in the frame (EXP-0034), but which of its four parts owns that was never
+	// measured -- and the first guess, a GetBarriers grid walk, was wrong: a whole-image
+	// transition already clears subresource_states. These sub-scopes split it into the prologue,
+	// the hazard assertion, the image transitions, the descriptor-write build and the driver
+	// call, so the next capture names the cost instead of inviting another guess.
 	auto   vk_buffer        = buffer.Handle();
 	size_t descriptor_count = 0;
 	size_t write_count      = 0;
@@ -1430,6 +1436,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
+	// A pure assertion: every branch inside ends in EXIT, so in normal operation this computes
+	// nothing and returns nothing. It is O(reads x bound_images) with a slot-map lookup per
+	// iteration, plus O(reads x stages x buffer_sources), all on the per-draw path.
+	{
+	ProfileDetailScope hazard_profile("cpu_commit_scalar_hazard", 0, m_bound_images.size());
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
@@ -1465,6 +1476,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 	}
+	}
+	ProfileDetailScope build_profile("cpu_commit_build_writes", 0, prepared_bindings.size());
 	m_descriptor_buffers.clear();
 	m_descriptor_images.clear();
 	m_descriptor_writes.clear();
@@ -1487,6 +1500,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
 		}
 
+		ProfileDetailScope transit_profile("cpu_commit_image_transit", 0,
+		                                   program.info.images.size());
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];
@@ -1534,6 +1549,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			binding.layout = image.backing.state.layout;
 		}
+		transit_profile.Finish();
 
 		m_image_occurrences.assign(descriptors.images.size(), 0);
 		for (const auto& binding: program.bindings.descriptors) {
@@ -1622,7 +1638,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		                        push_data.dwords.data());
 	}
 
+	build_profile.Finish();
 	if (!m_descriptor_writes.empty()) {
+		ProfileDetailScope push_profile("cpu_commit_push_descriptors", 0,
+		                                m_descriptor_writes.size());
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		// FACT-0030 check: descriptor buffers are only worth migrating to if the heap path is
 		// actually hot. Push descriptors already skip set allocation and updates, and the 3070
