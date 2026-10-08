@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/abControl.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -199,6 +200,21 @@ bool DrawCommitEnabled() noexcept {
 
 bool DrawCommitOnWorker() noexcept {
 	return g_draw_commit_worker;
+}
+
+// Skip dynamic-state setters whose value this command buffer already has. On by default.
+//
+// A-B variant 0 reverts to issuing all fifteen on every draw, and takes the uncached route
+// completely -- no comparison and no cache write -- so the baseline is the old behaviour rather
+// than the old behaviour plus bookkeeping, which would flatter the result. KYTY_DYNAMIC_STATE_CACHE=0
+// does the same at launch. Retire this hook and the branch once the result is recorded
+// (DEC-0005, WARN-0011).
+bool DynamicStateCacheEnabled() noexcept {
+	static const bool launch_default = [] {
+		const char* value = std::getenv("KYTY_DYNAMIC_STATE_CACHE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return AbVariant(launch_default ? 1 : 0) != 0;
 }
 
 void RenderExecutor::FinishDrawCommit() {
@@ -511,32 +527,12 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
-// The resolved arguments of every dynamic-state call the draw path makes. Split out of
-// SetGraphicsDynamicParams so the register maths happens on the producer side and only this
-// struct has to reach the recorder: FACT-0035 measured HW::Context, ShaderVertexInputInfo and
-// RenderDepthInfo as 5408 of the old 6784-byte commit payload, all three read exactly once and
-// only by that function, so a queue carrying the raw inputs would hand back EXP-0031's +4.3%.
-struct GraphicsDynamicState {
-	static constexpr uint32_t ViewportSlots = std::size(HW::ScreenViewport {}.viewports);
-
-	uint32_t                                   viewport_count = 0;
-	std::array<vk::Viewport, ViewportSlots>    viewports {};
-	std::array<vk::Rect2D, ViewportSlots>      scissors {};
-	float                                      line_width = 1.0F;
-	std::array<float, 4>                       blend_constants {};
-	bool                                       depth_test_enable  = false;
-	bool                                       depth_write_enable = false;
-	vk::CompareOp                              depth_compare_op {};
-	bool                                       depth_bias_enable    = false;
-	float                                      bias_constant_factor = 0.0F;
-	float                                      bias_clamp           = 0.0F;
-	float                                      bias_slope_factor    = 0.0F;
-	bool                                       stencil_test_enable = false;
-	vk::StencilOpState                         stencil_front {};
-	vk::StencilOpState                         stencil_back {};
-	uint32_t                                   color_write_count = 0;
-	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write_enable {};
-};
+// GraphicsDynamicState and its per-buffer cache live in graphicsDynamicState.h so CommandBuffer
+// can hold one. That header deliberately does not include the guest register block, so assert
+// here that its mirrored slot count still matches.
+static_assert(GraphicsDynamicState::ViewportSlots ==
+                  std::size(HW::ScreenViewport {}.viewports),
+              "GraphicsDynamicState::ViewportSlots must match HW::ScreenViewport");
 
 // Producer side: pure computation from guest registers, no recording. See FACT-0035 --
 // a queued draw carries this struct instead of the 5408 bytes of inputs it came from.
@@ -642,33 +638,96 @@ static GraphicsDynamicState ResolveGraphicsDynamicParams(
 }
 // Drain side: replays what Resolve computed. The only half that touches a command buffer, which
 // is what lets the producer stay out of the recording path (TASK-0016 design point 3).
-static void ApplyGraphicsDynamicParams(vk::CommandBuffer vk_buffer,
+// Drain side: replays what Resolve computed, skipping the setters whose value this command
+// buffer already has. All fifteen were re-issued on every one of 5570 draws per epoch, and
+// consecutive draws in a paused fight mostly share dynamic state.
+//
+// The cache lives on the CommandBuffer and is cleared in Begin(), because Vulkan dynamic state
+// does not survive vkBeginCommandBuffer. Comparisons are bitwise, so -0.0F and NaN compare
+// unequal and cost a redundant setter rather than a skipped one -- the error direction is wasted
+// work, never stale state. Colour-write is never cached; see graphicsDynamicState.h for why.
+static void ApplyGraphicsDynamicParams(CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
                                        const GraphicsDynamicState& state) {
 	KYTY_PROFILER_FUNCTION();
-	vk_buffer.setViewportWithCount(state.viewport_count, state.viewports.data());
-	vk_buffer.setScissorWithCount(state.viewport_count, state.scissors.data());
-	vk_buffer.setLineWidth(state.line_width);
-	vk_buffer.setBlendConstants(state.blend_constants.data());
-	vk_buffer.setDepthTestEnable(state.depth_test_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthWriteEnable(state.depth_write_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthCompareOp(state.depth_compare_op);
-	vk_buffer.setDepthBiasEnable(state.depth_bias_enable ? VK_TRUE : VK_FALSE);
-	if (state.depth_bias_enable) {
-		vk_buffer.setDepthBias(state.bias_constant_factor, state.bias_clamp,
-		                       state.bias_slope_factor);
+	auto&       cache  = buffer.DynamicCache();
+	const auto& last   = cache.applied;
+	// With the cache off, `fresh` is true at every test below, so all fifteen setters are issued
+	// and nothing is written back: the pre-cache behaviour exactly.
+	const bool  cached  = DynamicStateCacheEnabled();
+	const bool  fresh   = !cached || !cache.valid;
+	bool        changed = fresh;
+
+	const bool count_changed = fresh || state.viewport_count != last.viewport_count;
+	const auto used          = static_cast<size_t>(state.viewport_count);
+	if (count_changed || std::memcmp(state.viewports.data(), last.viewports.data(),
+	                                 used * sizeof(vk::Viewport)) != 0) {
+		vk_buffer.setViewportWithCount(state.viewport_count, state.viewports.data());
+		changed = true;
 	}
-	vk_buffer.setStencilTestEnable(state.stencil_test_enable ? VK_TRUE : VK_FALSE);
+	if (count_changed || std::memcmp(state.scissors.data(), last.scissors.data(),
+	                                 used * sizeof(vk::Rect2D)) != 0) {
+		vk_buffer.setScissorWithCount(state.viewport_count, state.scissors.data());
+		changed = true;
+	}
+	if (fresh || state.line_width != last.line_width) {
+		vk_buffer.setLineWidth(state.line_width);
+		changed = true;
+	}
+	if (fresh || state.blend_constants != last.blend_constants) {
+		vk_buffer.setBlendConstants(state.blend_constants.data());
+		changed = true;
+	}
+	if (fresh || state.depth_test_enable != last.depth_test_enable) {
+		vk_buffer.setDepthTestEnable(state.depth_test_enable ? VK_TRUE : VK_FALSE);
+		changed = true;
+	}
+	if (fresh || state.depth_write_enable != last.depth_write_enable) {
+		vk_buffer.setDepthWriteEnable(state.depth_write_enable ? VK_TRUE : VK_FALSE);
+		changed = true;
+	}
+	if (fresh || state.depth_compare_op != last.depth_compare_op) {
+		vk_buffer.setDepthCompareOp(state.depth_compare_op);
+		changed = true;
+	}
+	if (fresh || state.depth_bias_enable != last.depth_bias_enable) {
+		vk_buffer.setDepthBiasEnable(state.depth_bias_enable ? VK_TRUE : VK_FALSE);
+		changed = true;
+	}
+	if (state.depth_bias_enable) {
+		// A value compare alone is not enough: if bias was disabled last time, the values may
+		// never have been set on this buffer at all.
+		if (fresh || !last.depth_bias_enable ||
+		    state.bias_constant_factor != last.bias_constant_factor ||
+		    state.bias_clamp != last.bias_clamp ||
+		    state.bias_slope_factor != last.bias_slope_factor) {
+			vk_buffer.setDepthBias(state.bias_constant_factor, state.bias_clamp,
+			                       state.bias_slope_factor);
+			changed = true;
+		}
+	}
+	if (fresh || state.stencil_test_enable != last.stencil_test_enable) {
+		vk_buffer.setStencilTestEnable(state.stencil_test_enable ? VK_TRUE : VK_FALSE);
+		changed = true;
+	}
 	if (state.stencil_test_enable) {
-		const auto set_stencil = [&](vk::StencilFaceFlagBits face,
-		                             const vk::StencilOpState& face_state) {
-			vk_buffer.setStencilOp(face, face_state.failOp, face_state.passOp,
-			                       face_state.depthFailOp, face_state.compareOp);
-			vk_buffer.setStencilCompareMask(face, face_state.compareMask);
-			vk_buffer.setStencilWriteMask(face, face_state.writeMask);
-			vk_buffer.setStencilReference(face, face_state.reference);
-		};
-		set_stencil(vk::StencilFaceFlagBits::eFront, state.stencil_front);
-		set_stencil(vk::StencilFaceFlagBits::eBack, state.stencil_back);
+		// Same reasoning as the depth bias values.
+		if (fresh || !last.stencil_test_enable ||
+		    std::memcmp(&state.stencil_front, &last.stencil_front,
+		                sizeof(vk::StencilOpState)) != 0 ||
+		    std::memcmp(&state.stencil_back, &last.stencil_back,
+		                sizeof(vk::StencilOpState)) != 0) {
+			const auto set_stencil = [&](vk::StencilFaceFlagBits face,
+			                             const vk::StencilOpState& face_state) {
+				vk_buffer.setStencilOp(face, face_state.failOp, face_state.passOp,
+				                       face_state.depthFailOp, face_state.compareOp);
+				vk_buffer.setStencilCompareMask(face, face_state.compareMask);
+				vk_buffer.setStencilWriteMask(face, face_state.writeMask);
+				vk_buffer.setStencilReference(face, face_state.reference);
+			};
+			set_stencil(vk::StencilFaceFlagBits::eFront, state.stencil_front);
+			set_stencil(vk::StencilFaceFlagBits::eBack, state.stencil_back);
+			changed = true;
+		}
 	}
 #if defined(__APPLE__)
 	// MoltenVK has no VK_EXT_color_write_enable; the pipeline is created without the
@@ -679,15 +738,23 @@ static void ApplyGraphicsDynamicParams(vk::CommandBuffer vk_buffer,
 		                                 state.color_write_enable.data());
 	}
 #endif
+
+	// Only written when something moved, so the common draw pays comparisons and no 750-byte
+	// copy. When nothing changed the cache already equals `state`.
+	if (cached && changed) {
+		cache.applied = state;
+		cache.valid   = true;
+	}
 }
 
 // Unchanged behaviour for the inline path: resolve then apply, back to back.
 static void SetGraphicsDynamicParams(const GraphicContext& graphics, const HW::Context& ctx,
-                                     vk::CommandBuffer vk_buffer,
+                                     CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
                                      const RenderDepthInfo& depth, const RenderState& rendering) {
 	ApplyGraphicsDynamicParams(
-	    vk_buffer, ResolveGraphicsDynamicParams(graphics, ctx, vs_input_info, depth, rendering));
+	    buffer, vk_buffer,
+	    ResolveGraphicsDynamicParams(graphics, ctx, vs_input_info, depth, rendering));
 }
 
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
@@ -1491,8 +1558,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		} else {
 			CommitIndexBuffer(vk_buffer, packet.index_binding);
 		}
-		SetGraphicsDynamicParams(packet.buffer->GetGraphics(), packet.context, vk_buffer,
-		                         packet.vertex_input, packet.depth, packet.rendering);
+		SetGraphicsDynamicParams(packet.buffer->GetGraphics(), packet.context, *packet.buffer,
+		                         vk_buffer, packet.vertex_input, packet.depth, packet.rendering);
 		if (packet.feedback_enabled) {
 			vk_buffer.setAttachmentFeedbackLoopEnableEXT(packet.feedback);
 		}

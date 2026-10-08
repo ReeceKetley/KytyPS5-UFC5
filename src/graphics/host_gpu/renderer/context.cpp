@@ -90,6 +90,9 @@ void CommandBuffer::Begin() {
 	EXIT_IF(IsInvalid());
 	EXIT_IF(m_render_gpu_timer != UINT32_MAX || m_gap_gpu_timer != UINT32_MAX);
 	m_gap_ordinal = 0;
+	// Vulkan dynamic state does not survive vkBeginCommandBuffer, so nothing cached about the
+	// previous buffer may be trusted to let a setter be skipped.
+	m_dynamic_cache.Reset();
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};

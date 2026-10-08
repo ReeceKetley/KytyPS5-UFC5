@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/graphicsDynamicState.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -124,6 +125,9 @@ public:
 	// rare ones can force a sync point. KYTY_HANDLE_SITE_PROBE=<path> enables counting.
 	[[nodiscard]] vk::CommandBuffer Handle(
 	    std::source_location site = std::source_location::current()) const;
+	// Dynamic state actually applied to this buffer, so unchanged setters can be skipped. Reset
+	// in Begin(), because Vulkan dynamic state does not survive vkBeginCommandBuffer.
+	[[nodiscard]] GraphicsDynamicCache& DynamicCache() const noexcept { return m_dynamic_cache; }
 	// Global-barrier coalescing support. Handle() is the only way to obtain the raw buffer for
 	// recording, so it marks this flag; that over-approximates "something was recorded" in the
 	// safe direction, since a Handle() call that records nothing only costs a redundant barrier.
@@ -172,6 +176,7 @@ private:
 	mutable uint32_t    m_gap_ordinal = 0;
 	// Starts true so the first global barrier in each command buffer is always emitted.
 	mutable std::atomic_bool m_recorded_since_barrier {true};
+	mutable GraphicsDynamicCache m_dynamic_cache {};
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

@@ -150,6 +150,11 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 
 	auto& command_buffer = m_scheduler.Current();
 	auto  command        = command_buffer.Handle();
+	// This runs on the SAME CommandBuffer as the graphics draw path and sets viewport and
+	// scissor below, so the draw path's cache of applied dynamic state no longer describes the
+	// device. Without this reset the next draw would skip setViewportWithCount and inherit the
+	// blit's viewport. Any new dynamic-state setter added in this function is covered by it.
+	command_buffer.DynamicCache().Reset();
 	source.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
 	               command);
 	destination.Transit(ColorToMsDepthLayout, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {},
