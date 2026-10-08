@@ -17,6 +17,7 @@
 namespace Libs::Graphics {
 
 class Buffer;
+class CommandBuffer;
 class CommandScheduler;
 struct ImageTestAccess;
 
@@ -66,6 +67,14 @@ public:
 	                                   std::optional<ImageSubresourceRange> range);
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
+	// TASK-0011 Stage 1. Same as above, but takes the wrapper so CommandBuffer::Handle() is only
+	// called once the barriers are known non-empty. GetBarriers returns empty for roughly 93% of
+	// calls (barrier_image is 751.7/epoch against about 10300 Transit calls), and the vk handle
+	// form evaluates Handle() as an ARGUMENT, so the producer was touching the command buffer on
+	// every call including the no-ops. Deferring it is the cheapest part of getting the producer
+	// out of the recording path (FACT-0031).
+	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
+	             std::optional<ImageSubresourceRange> range, CommandBuffer& buffer);
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,

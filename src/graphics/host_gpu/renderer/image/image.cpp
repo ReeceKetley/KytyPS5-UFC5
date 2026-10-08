@@ -305,6 +305,33 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	ProfilePipelineBarrier2(command_buffer, dependency);
 }
 
+// Deferred-handle overload; see image.h. Mirrors Transit exactly except that the command
+// buffer handle is acquired only after GetBarriers proves work is needed.
+void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
+                    std::optional<ImageSubresourceRange> range, CommandBuffer& buffer) {
+	const auto transfer_access =
+	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	vk::PipelineStageFlags2 destination_stage {};
+	if (static_cast<bool>(destination_access & transfer_access)) {
+		destination_stage |= vk::PipelineStageFlagBits2::eTransfer;
+	}
+	if (!destination_access ||
+	    static_cast<bool>(destination_access & ~vk::AccessFlags2 {transfer_access})) {
+		destination_stage |=
+		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
+	}
+	const auto barriers =
+	    GetBarriers(destination_layout, destination_access, destination_stage, range);
+	if (barriers.empty()) {
+		return; // nothing to record, so never touch the command buffer
+	}
+	m_scheduler.EndRendering();
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
+	dependency.pImageMemoryBarriers    = barriers.data();
+	ProfilePipelineBarrier2(buffer.Handle(), dependency);
+}
+
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);

@@ -24,7 +24,45 @@ bool CommandBuffer::IsInvalid() const {
 	return m_buffer == nullptr;
 }
 
-vk::CommandBuffer CommandBuffer::Handle() const {
+namespace {
+const char* HandleProbePath() {
+	static const char* path = std::getenv("KYTY_HANDLE_SITE_PROBE");
+	return path;
+}
+void NoteHandleSite(const std::source_location& site) {
+	if (HandleProbePath() == nullptr) {
+		return;
+	}
+	struct Entry { const char* file; uint32_t line; uint64_t count; };
+	static Entry    entries[256] {};
+	static uint32_t used  = 0;
+	static uint64_t total = 0;
+	static uint64_t next  = 0;
+	const auto line = static_cast<uint32_t>(site.line());
+	uint32_t i = 0;
+	for (; i < used; i++) {
+		if (entries[i].line == line && entries[i].file == site.file_name()) break;
+	}
+	if (i == used && used < 256) { entries[used++] = {site.file_name(), line, 0}; }
+	if (i < used) { entries[i].count++; }
+	++total;
+	if (total < next) {
+		return;
+	}
+	next = total + 200000;
+	if (FILE* f = std::fopen(HandleProbePath(), "w")) {
+		std::fprintf(f, "total %llu\nsites %u\n", (unsigned long long)total, used);
+		for (uint32_t k = 0; k < used; k++) {
+			std::fprintf(f, "%llu %s:%u\n", (unsigned long long)entries[k].count,
+			             entries[k].file, entries[k].line);
+		}
+		std::fclose(f);
+	}
+}
+} // namespace
+
+vk::CommandBuffer CommandBuffer::Handle(std::source_location site) const {
+	NoteHandleSite(site);
 	if (DrawCommitEnabled() && !DrawCommitOnWorker()) {
 		m_context.GetRenderExecutor().FinishDrawCommit();
 	}

@@ -11,6 +11,7 @@
 
 #include <array>
 #include <atomic>
+#include <source_location>
 #include <optional>
 #include <span>
 #include <vector>
@@ -117,7 +118,12 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
-	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// TASK-0011 scoping: the defaulted source_location is evaluated at the CALL SITE, so the
+	// counter in context.cpp can attribute which of the ~94 Handle() callers are on the
+	// per-draw hot path. Only those must move into a chunk stream for threading to work;
+	// rare ones can force a sync point. KYTY_HANDLE_SITE_PROBE=<path> enables counting.
+	[[nodiscard]] vk::CommandBuffer Handle(
+	    std::source_location site = std::source_location::current()) const;
 	// Global-barrier coalescing support. Handle() is the only way to obtain the raw buffer for
 	// recording, so it marks this flag; that over-approximates "something was recorded" in the
 	// safe direction, since a Handle() call that records nothing only costs a redundant barrier.
