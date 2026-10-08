@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/productionProfile.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -151,14 +152,29 @@ void RenderContext::TickFrame() {
 	m_buffer_cache.TickFrame();
 }
 
+// Instrumented for TASK-0014. This runs inside guest_process_slice but outside the recording
+// scopes, which is exactly what analyze-production-profile.py reports as
+// translation_other_cpu_ms -- about 19% of epoch wall that had never been attributed. None of
+// these four phases carried a profiling scope, so they were invisible.
 void RenderContext::RunGarbageCollector() {
+	Libs::Graphics::ProfileCpuScope gc(m_command_scheduler, "gc_total");
 	if (m_fault_process_pending) {
+		Libs::Graphics::ProfileCpuScope phase(m_command_scheduler, "gc_fault_buffer");
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
-	m_texture_cache.ProcessDownloadImages();
-	m_texture_cache.RunGarbageCollector();
-	m_buffer_cache.RunGarbageCollector();
+	{
+		Libs::Graphics::ProfileCpuScope phase(m_command_scheduler, "gc_download_images");
+		m_texture_cache.ProcessDownloadImages();
+	}
+	{
+		Libs::Graphics::ProfileCpuScope phase(m_command_scheduler, "gc_texture_cache");
+		m_texture_cache.RunGarbageCollector();
+	}
+	{
+		Libs::Graphics::ProfileCpuScope phase(m_command_scheduler, "gc_buffer_cache");
+		m_buffer_cache.RunGarbageCollector();
+	}
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {

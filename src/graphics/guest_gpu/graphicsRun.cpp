@@ -310,6 +310,13 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
+	// Early out before taking a scope: this is called on every ProcessPm4 loop iteration and
+	// is usually idle, so a scope per call would cost more than it measures. When it does run,
+	// it executes work marshalled from other threads, which includes the readback downloads.
+	if (m_pending_commands.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	Libs::Graphics::ProfileCpuScope profile(m_renderer.GetCommandScheduler(), "cp_marshalled_commands");
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
 		{
@@ -441,11 +448,16 @@ void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operatio
 	}
 }
 
+// TASK-0014 instrumentation: these run inside guest_process_slice but outside the recording
+// scopes, so they land in translation_other_cpu_ms -- 39.6 ms/epoch of which EXP-0022
+// attributed only 11.2 to garbage collection. Neither carried a scope before.
 void CommandProcessor::BufferInit() {
+	Libs::Graphics::ProfileCpuScope profile(GetScheduler(), "cp_buffer_init");
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
 }
 
 void CommandProcessor::BufferFlush() {
+	Libs::Graphics::ProfileCpuScope profile(GetScheduler(), "cp_buffer_flush");
 	GetScheduler().Flush();
 }
 
@@ -945,6 +957,9 @@ void CommandProcessor::SuspendPm4() {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	// Total packet-dispatch cost. This OVERLAPS the recording scopes, so the dispatch overhead
+	// is cp_process_pm4 minus recording, not the raw figure.
+	Libs::Graphics::ProfileCpuScope profile(GetScheduler(), "cp_process_pm4");
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
