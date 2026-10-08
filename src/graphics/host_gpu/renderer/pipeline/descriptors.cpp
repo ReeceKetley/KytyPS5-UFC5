@@ -1360,6 +1360,44 @@ void RenderExecutor::ProfilePreparedBufferUses(std::span<PreparedBindings* const
 	}
 }
 
+namespace {
+struct DescriptorPathProbe {
+	uint64_t push = 0, heap = 0, push_writes = 0, heap_writes = 0, max_writes = 0, next = 0;
+};
+DescriptorPathProbe& DescPathProbe() {
+	static DescriptorPathProbe probe;
+	return probe;
+}
+const char* DescPathProbePath() {
+	static const char* path = std::getenv("KYTY_DESCRIPTOR_PATH_PROBE");
+	return path;
+}
+void NoteDescriptorPath(bool pushed, uint32_t writes) {
+	if (DescPathProbePath() == nullptr) {
+		return;
+	}
+	auto& p = DescPathProbe();
+	if (pushed) { p.push++; p.push_writes += writes; } else { p.heap++; p.heap_writes += writes; }
+	if (writes > p.max_writes) { p.max_writes = writes; }
+	const auto total = p.push + p.heap;
+	if (total < p.next) {
+		return;
+	}
+	p.next = total + 100000;
+	if (FILE* f = std::fopen(DescPathProbePath(), "w")) {
+		std::fprintf(f, "push %llu\nheap %llu\ntotal %llu\nheap_percent %llu\n"
+		             "mean_writes_push %.2f\nmean_writes_heap %.2f\nmax_writes %llu\n",
+		             (unsigned long long)p.push, (unsigned long long)p.heap,
+		             (unsigned long long)total,
+		             (unsigned long long)(total ? p.heap * 100 / total : 0),
+		             p.push ? (double)p.push_writes / p.push : 0.0,
+		             p.heap ? (double)p.heap_writes / p.heap : 0.0,
+		             (unsigned long long)p.max_writes);
+		std::fclose(f);
+	}
+}
+} // namespace
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -1586,6 +1624,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 
 	if (!m_descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
+		// FACT-0030 check: descriptor buffers are only worth migrating to if the heap path is
+		// actually hot. Push descriptors already skip set allocation and updates, and the 3070
+		// reports maxPushDescriptors = 32, so pipelines at or under that never touch the heap.
+		// KYTY_DESCRIPTOR_PATH_PROBE=<path> writes the split; counting only, no behaviour change.
+		NoteDescriptorPath(pipeline.uses_push_descriptors,
+		                   static_cast<uint32_t>(m_descriptor_writes.size()));
 		if (pipeline.uses_push_descriptors) {
 			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
 			                               static_cast<uint32_t>(m_descriptor_writes.size()),
