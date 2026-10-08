@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/renderer/abControl.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -30,6 +31,23 @@ vk::ImageUsageFlags& PendingTightUsageSlot() noexcept {
 }
 
 std::atomic<uint64_t> g_image_usage_upgrades {0};
+
+// TASK-0011 Stage 1 opt-out. KYTY_TRANSIT_LAZY_HANDLE=0 restores the pre-EXP-0029 behaviour, in
+// which the render-target transition sites acquired the command buffer handle as a call ARGUMENT,
+// before GetBarriers decided whether anything needed recording. It exists so the deferral can be
+// A-B tested on one binary: EXP-0029 read 9.18-9.45 fps against a ~10.2 baseline, which sits
+// inside the 7.8% single-run variance floor (EXP-0027), so its neutrality is unconfirmed. Note
+// that turning this off also restores the FALSE dirty marks that made barrier coalescing
+// over-conservative, so barrier_global should rise back toward 4286/epoch when it is 0.
+[[nodiscard]] bool TransitLazyHandleEnabled() noexcept {
+	static const bool launch_default = [] {
+		const char* value = std::getenv("KYTY_TRANSIT_LAZY_HANDLE");
+		return value == nullptr || value[0] != '0';
+	}();
+	// Variant 0 is eager (pre-EXP-0029), anything else is the deferred handle. With no A-B
+	// control file in use this is just the launch default. See abControl.h.
+	return AbVariant(launch_default ? 1 : 0) != 0;
+}
 
 [[nodiscard]] bool ImageHasContents(const VulkanImage& image) noexcept {
 	if (image.state.layout != vk::ImageLayout::eUndefined) {
@@ -309,6 +327,11 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 // buffer handle is acquired only after GetBarriers proves work is needed.
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range, CommandBuffer& buffer) {
+	if (!TransitLazyHandleEnabled()) {
+		// Handle() first, then decide -- the argument-evaluation order of the old call site.
+		Transit(destination_layout, destination_access, range, buffer.Handle());
+		return;
+	}
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::PipelineStageFlags2 destination_stage {};

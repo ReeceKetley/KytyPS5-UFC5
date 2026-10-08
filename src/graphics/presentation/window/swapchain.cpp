@@ -7,6 +7,8 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/abControl.h"
+#include "graphics/host_gpu/renderer/abControl.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -1026,28 +1028,38 @@ void Presenter::Impl::Present() {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
-		// Opt-in wall-clock present rate for the live VRAM pressure A/B. Reset the window when the
-		// trigger changes so a sample never mixes the two modes.
-		static const bool measure_vram_test = std::getenv("KYTY_VRAM_TEST_FPS") != nullptr;
+		// Opt-in wall-clock present rate, and the readout side of the single-launch A-B harness.
+		// The window is reset whenever the VRAM pressure trigger OR the A-B variant changes, so a
+		// logged sample never blends two settings; see renderer/abControl.h for why flipping inside
+		// one paused fight is the only way to resolve a change near the ~8% variance floor.
+		static const bool measure_vram_test =
+		    std::getenv("KYTY_VRAM_TEST_FPS") != nullptr || AbControlPath() != nullptr;
 		if (measure_vram_test) {
 			static auto start = std::chrono::steady_clock::now();
 			static uint64_t frames = 0;
 			static bool last_pressure = false;
+			// Read from the same control file as the feature under test, so a window cannot be
+			// attributed to the wrong setting. -1 means no control file: launch defaults everywhere.
+			static int32_t last_variant = AbVariant(-1);
 			std::FILE* trigger = std::fopen("D:/PS5/dumps/VRAM_PRESSURE_TEST", "rb");
 			const bool pressure = trigger != nullptr;
 			if (trigger != nullptr) std::fclose(trigger);
 			const auto now = std::chrono::steady_clock::now();
-			if (pressure != last_pressure) {
+			const auto variant = AbVariant(-1);
+			if (pressure != last_pressure || variant != last_variant) {
 				start = now;
 				frames = 0;
 				last_pressure = pressure;
+				last_variant = variant;
 			}
 			++frames;
 			const auto seconds = std::chrono::duration<double>(now - start).count();
 			if (seconds >= 10.0) {
 				if (std::FILE* log = std::fopen("D:/PS5/fps-pressure-test.txt", "a"); log != nullptr) {
-					std::fprintf(log, "PresentRate: pressure=%u frames=%llu seconds=%.3f fps=%.3f\n",
-					             pressure ? 1u : 0u, static_cast<unsigned long long>(frames),
+					std::fprintf(log,
+					             "PresentRate: pressure=%u variant=%d frames=%llu seconds=%.3f fps=%.3f\n",
+					             pressure ? 1u : 0u, variant,
+					             static_cast<unsigned long long>(frames),
 					             seconds, static_cast<double>(frames) / seconds);
 					std::fclose(log);
 				}

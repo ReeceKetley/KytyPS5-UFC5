@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Launch','Arm','ArmMaterializer','Status')] [string] $Action = 'Launch',
+    [ValidateSet('Launch','Arm','ArmMaterializer','AbSet','Status')] [string] $Action = 'Launch',
     [ValidateRange(1,10000)] [int] $FrameCount = 120,
     [ValidateRange(1,10000)] [int] $CpuDetailEvery = 16,
     [switch] $FineCpu,
@@ -30,6 +30,9 @@ param(
     [ValidatePattern('^[0-9a-fA-F]{16}$')] [string] $DescriptorShader = 'd3dcf81c43080fd0',
     [string] $DescriptorControlFile = 'D:\PS5\ufc5-descriptor-gather.control',
     [ValidateRange(0,4294967295)] [Nullable[long]] $StartFrame,
+    [switch] $Ab,
+    [ValidateRange(0,99)] [int] $AbVariant = 1,
+    [string] $AbControlFile = 'D:\PS5\ufc5-ab.control',
     [switch] $Build,
     [string] $BuildDirectory,
     [string] $BinDirectory = 'D:\PS5\Emulators\KytyPS5-Bin',
@@ -45,6 +48,16 @@ if ($FlatSrt) { $FlatSrtShader = $FlatSrtShader.ToLowerInvariant() }
 if ($Action -eq 'ArmMaterializer') {
     Set-Content -LiteralPath $MaterializerControlFile -Value 'on' -Encoding Ascii
     Write-Output "Materializer window armed: $MaterializerControlFile. Stops automatically after its launch-configured duration."
+    return
+}
+if ($Action -eq 'AbSet') {
+    # Flip the A-B variant in a RUNNING emulator. Both the feature under test and the present-rate
+    # sampler poll this one file, and the sampler resets its measurement window when the value
+    # changes, so the fps log self-attributes and no window blends two settings. That is what makes
+    # an A-B-A possible inside ONE paused fight, which is the only way past the ~8% single-run
+    # variance floor that scene variation between fights imposes (EXP-0027, EXP-0019).
+    Set-Content -LiteralPath $AbControlFile -Value "$AbVariant" -Encoding Ascii
+    Write-Output "A-B variant set to $AbVariant in $AbControlFile. Allow ~1 s for the poll, then 10 s+ per logged window."
     return
 }
 if ($Action -eq 'Arm') {
@@ -77,7 +90,7 @@ Copy-Item -LiteralPath $source -Destination $exe -Force
 $base = Join-Path $OutputDirectory ('production-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.csv')
 $names = @('KYTY_GPU_TIMING_CSV','KYTY_GPU_TIMING_CONTROL_FILE','KYTY_GPU_PROFILE_CONTROL_FILE',
            'KYTY_GPU_PROFILE_START_FRAME','KYTY_GPU_PROFILE_FRAME_COUNT','KYTY_GPU_PROFILE_CPU_DETAIL_EVERY','KYTY_VIDEO_OUT_1080P',
-           'KYTY_DETILE_CAPTURE_DIR','KYTY_DETILE_TRACE','KYTY_SPARSE_BDA','KYTY_VRAM_TEST_FPS')
+           'KYTY_DETILE_CAPTURE_DIR','KYTY_DETILE_TRACE','KYTY_SPARSE_BDA','KYTY_VRAM_TEST_FPS','KYTY_AB_CONTROL_FILE')
 $names += @('KYTY_GPU_PROFILE_FINE_CPU','KYTY_GPU_PROFILE_LIFETIME')
 $names += @('KYTY_DESCRIPTOR_GATHER_SHADER','KYTY_DESCRIPTOR_GATHER_CONTROL_FILE','KYTY_DESCRIPTOR_GATHER_CSV')
 $names += @('KYTY_FLAT_SRT_SHADER','KYTY_FLAT_SRT_CONTROL_FILE','KYTY_FLAT_SRT_CSV')
@@ -183,6 +196,12 @@ try {
     }
     $env:KYTY_VIDEO_OUT_1080P = if ($Output1080p) { '1' } else { '0' }
     $env:KYTY_VRAM_TEST_FPS = '1'
+    if ($Ab) {
+        Set-Content -LiteralPath $AbControlFile -Value "$AbVariant" -Encoding Ascii
+        $env:KYTY_AB_CONTROL_FILE = $AbControlFile
+    } else {
+        [Environment]::SetEnvironmentVariable('KYTY_AB_CONTROL_FILE',$null,'Process')
+    }
     foreach ($name in @('KYTY_GPU_TIMING_CONTROL_FILE','KYTY_DETILE_CAPTURE_DIR','KYTY_DETILE_TRACE')) {
         [Environment]::SetEnvironmentVariable($name,$null,'Process')
     }
@@ -219,6 +238,8 @@ try {
         vram_attribution_csv=if ($VramAttribution) { $base + '.vram-attribution.csv' } else { $null };
         materializer_diagnostics=[bool]$MaterializerDiagnostics; materializer_seconds=$MaterializerSeconds;
         materializer_control_file=if ($MaterializerDiagnostics) { $MaterializerControlFile } else { $null };
+        ab=[bool]$Ab; ab_initial_variant=if ($Ab) { $AbVariant } else { $null };
+        ab_control_file=if ($Ab) { $AbControlFile } else { $null };
         sparse_bda=$env:KYTY_SPARSE_BDA; prior_environment=$previous;
         kyty_environment=@(Get-ChildItem Env:KYTY* | Select-Object Name,Value);
         fps_log_start_bytes=if (Test-Path 'D:\PS5\fps-pressure-test.txt') { (Get-Item 'D:\PS5\fps-pressure-test.txt').Length } else { 0 } }
@@ -231,6 +252,11 @@ try {
         Write-Output 'Leave the detailed production profiler unarmed for the initial off/on timing comparison.'
     } elseif ($null -eq $StartFrame) { Write-Output 'Drive to the paused fight, then run this script with -Action Arm. Capture stops automatically.' }
     if ($BdaSync) { Write-Output "BDA sync starts $BdaSyncInitialMode. Control: $BdaSyncControlFile" }
+    if ($Ab) {
+        Write-Output "A-B harness on, variant $AbVariant. Control: $AbControlFile"
+        Write-Output 'Flip it without relaunching: .\profile-production.ps1 -Action AbSet -AbVariant <n>'
+        Write-Output 'Every PresentRate line in D:\PS5\fps-pressure-test.txt carries variant=<n>, and the window resets on a flip.'
+    }
 } finally {
     foreach ($name in $previous.Keys) { [Environment]::SetEnvironmentVariable($name,$previous[$name],'Process') }
 }
