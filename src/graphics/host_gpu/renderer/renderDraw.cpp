@@ -20,7 +20,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/renderer/abControl.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -200,23 +199,6 @@ bool DrawCommitEnabled() noexcept {
 
 bool DrawCommitOnWorker() noexcept {
 	return g_draw_commit_worker;
-}
-
-// TASK-0016 first increment. When the commit worker is off -- the default, and the only safe
-// setting given EXP-0020 -- recording happens inline and the 6792-byte CommitWork packet it was
-// built from is pure waste: one heap allocation plus about 13.6 KB of stores on each of 5570
-// draws per epoch, roughly 1.2% of wall (FACT-0032). Skipping it is the default.
-//
-// A-B variant 0 restores the packet on the inline path so the cost can be measured inside one
-// paused fight (DEC-0005, WARN-0011); KYTY_COMMIT_PACKET=1 does the same at launch. Once the
-// result is recorded, retire the variant hook and delete the variant-0 path -- a decided feature
-// must not stay wired to the single variant integer, or the next A-B flips two things at once.
-bool CommitPacketSkipEnabled() noexcept {
-	static const bool launch_default = [] {
-		const char* value = std::getenv("KYTY_COMMIT_PACKET");
-		return value == nullptr || value[0] == '0';
-	}();
-	return AbVariant(launch_default ? 1 : 0) != 0;
 }
 
 void RenderExecutor::FinishDrawCommit() {
@@ -1555,14 +1537,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		DrawCommitGate::Get().Enqueue(
 		    [work, record, view_over] { record(view_over(work)); });
 		m_commit_reset_bindings = true;
-		return;
-	}
-
-	if (!CommitPacketSkipEnabled()) {
-		// A-B variant 0 only: record inline but still pay for the packet, which is what the
-		// code did before this increment. Delete this branch once the result is recorded.
-		auto work = build_packet();
-		record(view_over(work));
 		return;
 	}
 
