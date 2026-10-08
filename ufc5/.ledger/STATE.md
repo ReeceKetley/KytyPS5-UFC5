@@ -11,7 +11,7 @@ clean as of 2026-10-08; everything is committed on `ufc5-v2`.
 
 ## Working
 
-- Paused-fight present rate is **10.2-11.1 fps depending on the pause**, up from 6.28 (EXP-0009):
+- Paused-fight present rate is **10.2-11.6 fps depending on the pause**, up from 6.28 (EXP-0009):
   compiled SRT + dirty BDA default-on took it to 9.26 (EXP-0012), barrier coalescing added ~10%
   (EXP-0013), and lazy submission a further +10-19% (EXP-0027). Live gameplay is at least as fast
   as paused (FACT-0014), so the paused fight is a CONSERVATIVE proxy.
@@ -36,6 +36,10 @@ clean as of 2026-10-08; everything is committed on `ufc5-v2`.
   a boundary. Launch with `-Ab`, flip with `-Action AbSet -AbVariant <n>`, read out with
   `analyze-ab-fps.py`, and always bracket X-Y-X. Resolution is ~0.5%, about 15x finer than the old
   relaunch floor. Use `tools/profile-production.ps1`, not the legacy `run_ufc5.ps1` (WARN-0008).
+- **The per-draw commit packet is gone, +4.3%** (EXP-0031, CI +3.3% to +5.9%, A-B-A-B in one
+  fight). A draw is recorded through a non-owning `DrawCommitView` instead of a 6792-byte
+  `CommitWork` that was `make_shared`'d on every draw even on the inline path that never used it.
+  `build_packet`/`view_over` remain for the deferred path only.
 - `KYTY_DISPATCH_RANGES_CSV=<path>` logs per-dispatch thread groups and every buffer/image range
   read or written (tagged bw/br/iw/ir). Off by default; diagnostic only.
 
@@ -55,11 +59,13 @@ clean as of 2026-10-08; everything is committed on `ufc5-v2`.
   `CommandBuffer::Handle()`. Instrumented adjacency does not prove nothing was recorded between two
   points (FACT-0019), and hazard-freedom does not imply recording-adjacency (EXP-0017).
 - Remaining per-draw cost sits in `draw_state_cpu` and `draw_bindings_cpu`: ~123 ms/epoch of a
-  ~246 ms wall (FACT-0015), still the largest single item -- but **local optimization is close to
-  exhausted**: three attempts returned at most 1.7% (EXP-0019). Those 1-2% results are now
-  MEASURABLE inside one scene (FACT-0033), which does not make them worth chasing -- 1% at a time
-  does not reach 30 fps from 11 -- but a change can no longer be called unmeasurable without
-  running it through the single-launch harness first.
+  ~246 ms wall (FACT-0015), still the largest single item. **Local optimization is NOT exhausted
+  after all.** EXP-0019 concluded it was, on three attempts returning at most 1.7%; EXP-0031 then
+  got +4.3% from deleting a single per-draw allocation. Those three attempts were never shown to
+  be small, only unmeasurable against the old 8% relaunch floor (FACT-0033). And analytic
+  memory-cost estimates on this path underestimate by about 4x, because they miss cold-block
+  read-for-ownership, working-set displacement and allocator cost (FACT-0034) -- so rule nothing
+  out here without measuring it.
 - Frame composition has shifted: recording ~48%, GPU batch ~30%, waits ~16% (FACT-0015). Pure CPU
   optimization cannot reach 30 fps alone; zeroing all instrumented CPU work still leaves ~84 ms.
 - Waits rose as CPU work fell, so further CPU wins buy less than the early ones did.
@@ -90,5 +96,5 @@ multi-session, and they likely have to be combined:
    trap that must be preserved.
 3. Close the pixel-matched proof gap on bounded LDS (WARN-0007, TASK-0003).
 
-Last updated 2026-10-08 after EXP-0030 and FACT-0033. Original `ledger.md` content is DEPRECATED
+Last updated 2026-10-08 after EXP-0031 and FACT-0034. Original `ledger.md` content is DEPRECATED
 historical notes; its process IDs and live-mode claims are snapshots, not current state.
