@@ -30,16 +30,28 @@ clean as of 2026-10-08; everything is committed on `ufc5-v2`.
   next bottleneck.
 - Compiled SRT and dirty-only BDA are default-on and validated: 27919 + 1093 shadow checks, zero
   mismatches (EXP-0011, FACT-0013). They cut recording 230.8 -> 129.8 ms/epoch.
+- **A-B must use SHORT ALTERNATING ARMS** (WARN-0013): long arms can report the WRONG SIGN,
+  because the machine drifts non-monotonically on a 1-2 minute timescale -- one arm climbed
+  11.18 -> 11.70 fps with no flip in it. Run 10 arms of 3 windows alternating; `analyze-ab-fps.py`
+  then estimates from adjacent pairs, which cancels drift, and cross-checks with a trend fit.
+  Always pass `--until-bytes` (the next launch's `fps_log_start_bytes`): the log is append-only
+  and shared, so an unbounded read silently absorbs every later run.
 - **A-B now happens inside one paused fight** (DEC-0005), which is what made the floor tractable.
   `KYTY_AB_CONTROL_FILE` holds one integer polled every 250 ms; the present-rate sampler reads the
   same file, tags every window `variant=<n>` and resets its window on a flip, so nothing straddles
   a boundary. Launch with `-Ab`, flip with `-Action AbSet -AbVariant <n>`, read out with
   `analyze-ab-fps.py`, and always bracket X-Y-X. Resolution is ~0.5%, about 15x finer than the old
   relaunch floor. Use `tools/profile-production.ps1`, not the legacy `run_ufc5.ps1` (WARN-0008).
-- **The per-draw commit packet is gone, +4.3%** (EXP-0031, CI +3.3% to +5.9%, A-B-A-B in one
-  fight). A draw is recorded through a non-owning `DrawCommitView` instead of a 6792-byte
-  `CommitWork` that was `make_shared`'d on every draw even on the inline path that never used it.
+- **The per-draw commit packet is gone, +5.4%** (EXP-0031, revised by NOTE-0055 from the pooled
+  +4.3%; paired CI +4.1% to +6.5%, least-squares cross-check also +5.4%). A draw is recorded
+  through a non-owning `DrawCommitView` instead of a 6792-byte `CommitWork` that was
+  `make_shared`'d on every draw even on the inline path that never used it.
   `build_packet`/`view_over` remain for the deferred path only.
+- **Only changed dynamic-state setters are issued, about +2%** (EXP-0032, paired +2.6% CI +1.2%
+  to +4.4%, cross-check +1.5%). All fifteen were re-issued on every draw. The cache lives on
+  CommandBuffer and is cleared in `Begin()`; colour-write is never cached and `blitHelper.cpp`
+  must reset it -- see the invariant in `graphicsDynamicState.h` before adding any setter.
+  `KYTY_DYNAMIC_STATE_CACHE=0` opts out.
 - `KYTY_DISPATCH_RANGES_CSV=<path>` logs per-dispatch thread groups and every buffer/image range
   read or written (tagged bw/br/iw/ir). Off by default; diagnostic only.
 
@@ -88,13 +100,15 @@ multi-session, and they likely have to be combined:
    headroom. Each draw removed saves per-draw CPU, GPU batch time and barrier records, so it pays
    three times. Start by instrumenting consecutive graphics draws the way the compute path was.
 2. **Parallel recording via secondary command buffers (TASK-0011)** -- the one threading approach
-   EXP-0020 does not rule out. Real scope is making the texture/buffer/pipeline caches concurrent,
-   not just splitting the buffer. Ideal 4-way is ~37% wall, roughly 14-16 fps, so not sufficient
-   alone. Stage 1 is **TASK-0016**, the ordered operation queue; its A-B prerequisite is
-   discharged (EXP-0030 confirmed EXP-0029 neutral at +0.0%, CI -0.6% to +0.5%). First increment
-   is the view refactor identified by FACT-0032, which also carries a `prepared->runtime` nulling
-   trap that must be preserved.
+   EXP-0020 does not rule out. Stage 1 is **TASK-0016**, the ordered operation queue; its A-B
+   prerequisite is discharged (EXP-0030). The view refactor and the dynamic-state split are
+   landed. **The remaining blocker is binding lifetime, not payload size** (FACT-0036): queued
+   draws held `PreparedBindings*` into the persistent `m_graphics_bindings`, which the next draw
+   overwrites -- sound only because at most one draw was ever in flight. `CommitBindings` also
+   issues image transitions from live cache state, and 98.7% of draws push descriptors
+   (EXP-0028), so the writes must be deep-copied into the arena. Real order: make the binding
+   result per-draw and cheap, then the arena and queue, then the worker.
 3. Close the pixel-matched proof gap on bounded LDS (WARN-0007, TASK-0003).
 
-Last updated 2026-10-08 after EXP-0031 and FACT-0034. Original `ledger.md` content is DEPRECATED
+Last updated 2026-10-08 after EXP-0032, FACT-0036 and WARN-0013. Original `ledger.md` content is DEPRECATED
 historical notes; its process IDs and live-mode claims are snapshots, not current state.
