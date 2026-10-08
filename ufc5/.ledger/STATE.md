@@ -11,10 +11,14 @@ extensive uncommitted work; do not discard it.
 
 ## Working
 
-- Paused-fight present rate is **~10.4 fps on a plain launch**, up from 6.28 (EXP-0009): compiled
-  SRT + dirty BDA default-on took it to 9.26 (EXP-0012), then global-barrier coalescing added
-  about +10% (EXP-0013). Live gameplay measured ~10 fps, correct and not stuttery (FACT-0014), so
-  the paused fight is a CONSERVATIVE proxy, not a flattering one.
+- Paused-fight present rate is **~10.2 fps on a plain launch**, up from 6.28 (EXP-0009): compiled
+  SRT + dirty BDA default-on took it to 9.26 (EXP-0012), barrier coalescing added ~10% (EXP-0013),
+  and lazy submission a further +10-19% (EXP-0027). Live gameplay is at least as fast as paused
+  (FACT-0014), so the paused fight is a CONSERVATIVE proxy.
+- **MENUS now run 54-60 fps, up from 40-41** (EXP-0027). Lazy submission helps far more there than
+  in the fight, because submission cost is per-submission regardless of the work it carries.
+- Lazy submission is default-on (`KYTY_SUBMIT_DRAW_THRESHOLD=0` opts out, default 64 draws per
+  submit). It cut queue submits 340 -> 46/epoch and foreground waits 52.73 -> 39.61 ms/epoch.
 - Global-barrier coalescing is on by default (`KYTY_BARRIER_COALESCE=0` opts out). It cut
   `EmitGlobalBarrier` by 68% per dispatch and barrier resource records by 33% (EXP-0013).
 - Bounded LDS already paid a large dividend (FACT-0009): epoch wall 736 -> 347 ms, waits 465 -> 33

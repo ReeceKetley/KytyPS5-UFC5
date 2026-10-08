@@ -61,7 +61,9 @@ public:
 	void ApplyContextStateOperation(ContextStateOperation operation);
 
 	void            BufferInit();
-	void            BufferFlush();
+	// The label distinguishes WHY we submitted: "cp_buffer_flush" is our own per-submission
+	// policy, "cp_flush_eop" is a guest end-of-pipe interrupt needing completion signalling.
+	void            BufferFlush(const char* reason = "cp_buffer_flush");
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }

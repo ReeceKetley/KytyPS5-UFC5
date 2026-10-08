@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -456,8 +457,35 @@ void CommandProcessor::BufferInit() {
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
 }
 
-void CommandProcessor::BufferFlush() {
-	Libs::Graphics::ProfileCpuScope profile(GetScheduler(), "cp_buffer_flush");
+// Lazy submission, EXP-0025. Every flush measured in a paused fight came from our own
+// per-submission policy (cp_buffer_flush, 329.6/epoch, 20.26 ms) and NONE from a guest
+// end-of-pipe request (cp_flush_eop, zero), while we recorded 16.9 draws per submit against
+// DXVK's documented 50-100 per command list. So accumulate across guest submissions.
+//
+// Safety: a guest EOP always submits, since that is the guest asking to observe completion.
+// Everything that waits submits on its own -- CommandScheduler::Wait calls Submit() when the
+// requested tick is the current one, and Finish() submits before waiting -- so deferring
+// cannot deadlock the readback path at bufferCache.cpp:276.
+//
+// KYTY_SUBMIT_DRAW_THRESHOLD=0 restores a submit per guest submission; default 64.
+static uint32_t SubmitDrawThreshold() {
+	static const uint32_t value = [] () -> uint32_t {
+		const char* raw = std::getenv("KYTY_SUBMIT_DRAW_THRESHOLD");
+		if (raw == nullptr) {
+			return 64;
+		}
+		return static_cast<uint32_t>(std::strtoul(raw, nullptr, 10));
+	}();
+	return value;
+}
+
+void CommandProcessor::BufferFlush(const char* reason) {
+	Libs::Graphics::ProfileCpuScope profile(GetScheduler(), reason);
+	const auto threshold = SubmitDrawThreshold();
+	if (threshold != 0 && std::strcmp(reason, "cp_flush_eop") != 0 &&
+	    GetScheduler().CurrentSubmitDrawCount() < threshold) {
+		return;
+	}
 	GetScheduler().Flush();
 }
 
