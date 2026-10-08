@@ -34,7 +34,10 @@ with path.open(newline='') as source, frozen.open('w', newline='') as target:
 result = analyzer.analyze(frozen, start_ns=start, end_ns=end)
 result['stages'] = []
 fps = Path(args.fps_log).read_bytes()
-pattern = re.compile(r'PresentRate: pressure=(\d+) frames=(\d+) seconds=([\d.]+) fps=([\d.]+)')
+# The optional variant= field is the single-launch A-B tag added in swapchain.cpp; it is
+# skipped here so this analysis keeps matching logs from both before and after it. Use
+# analyze-ab-fps.py when the variant is what you are comparing.
+pattern = re.compile(r'PresentRate: pressure=(\d+)(?: variant=-?\d+)? frames=(\d+) seconds=([\d.]+) fps=([\d.]+)')
 for a,b in zip(markers, markers[1:]):
     stage = analyzer.analyze(frozen, start_ns=int(a['host_ns']), end_ns=int(b['host_ns']))
     stage['stage'] = a['stage']

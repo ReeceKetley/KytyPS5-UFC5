@@ -47,7 +47,10 @@ def analyze(prefix, fps_log):
         writer.writeheader()
         writer.writerows(selected)
     fps = Path(fps_log).read_bytes()
-    pattern = re.compile(r'PresentRate: pressure=(\d+) frames=(\d+) seconds=([\d.]+) fps=([\d.]+)')
+    # The optional variant= field is the single-launch A-B tag added in swapchain.cpp; it is
+    # skipped here so this analysis keeps matching logs from both before and after it. Use
+    # analyze-ab-fps.py when the variant is what you are comparing.
+    pattern = re.compile(r'PresentRate: pressure=(\d+)(?: variant=-?\d+)? frames=(\d+) seconds=([\d.]+) fps=([\d.]+)')
     result = {'source': str(source), 'frozen': str(frozen), 'all_selected': aggregate(selected), 'stages': [],
         'limits': 'Only fully contained >=1.5-second CSV windows enter timings. Checks include edge rows. '
                   'BDA elapsed includes preemption/recording/upload work; shadow runs reference uploads. '

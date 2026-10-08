@@ -48,7 +48,10 @@ def analyze(prefix, fps_log):
         writer.writeheader()
         writer.writerows(selected)
     fps = Path(fps_log).read_bytes()
-    pattern = re.compile(r'PresentRate: pressure=(\d+) frames=(\d+) seconds=([\d.]+) fps=([\d.]+)')
+    # The optional variant= field is the single-launch A-B tag added in swapchain.cpp; it is
+    # skipped here so this analysis keeps matching logs from both before and after it. Use
+    # analyze-ab-fps.py when the variant is what you are comparing.
+    pattern = re.compile(r'PresentRate: pressure=(\d+)(?: variant=-?\d+)? frames=(\d+) seconds=([\d.]+) fps=([\d.]+)')
     result = {'source': str(source_path), 'frozen': str(frozen), 'stages': [],
         'checks_all_selected_shader_rows': sum(int(r['full_checks']) for r in selected if r['record_kind']=='shader'),
         'mismatches_all_selected_shader_rows': sum(int(r['full_mismatches']) for r in selected if r['record_kind']=='shader'),
