@@ -13,10 +13,15 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include <bit>
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -223,7 +228,7 @@ void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = 1;
 	dependency.pImageMemoryBarriers    = &barrier;
-	command.pipelineBarrier2(dependency);
+	ProfilePipelineBarrier2(command, dependency);
 	image.state = {stage, access, layout};
 	image.subresource_states.clear();
 }
@@ -240,8 +245,11 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	copy.extent         = {std::min(source.backing.extent.width, image.extent.width),
 	                       std::min(source.backing.extent.height, image.extent.height), 1};
 	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
+	auto* copy_scheduler = ProfileThread().scheduler;
+	const auto copy_timer = copy_scheduler ? copy_scheduler->StartGpuTimer("copy_present_image", copy_scheduler->GpuFrameHint()) : UINT32_MAX;
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	if (copy_scheduler) copy_scheduler->EndGpuTimer(copy_timer);
 }
 
 void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColorValue& color) {
@@ -301,7 +309,7 @@ private:
 struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
-	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
+	      present_scheduler(renderer, owner.graphic_ctx, "present"), frames(owner, present_scheduler) {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
@@ -490,7 +498,12 @@ void Swapchain::Destroy() {
 
 	{
 		Common::LockGuard queue_lock(graphics.queue_mutex);
+		auto* profiler = m_window.render_context ? &m_window.render_context->GetCommandScheduler() : nullptr;
+		const auto start = profiler && profiler->ProfileActive() ? ProfileClockNs() : 0;
+		const auto frame = start ? profiler->ProfileFrame() : 0;
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
+		if (start) profiler->ProfileEvent("queue_wait_idle", start, ProfileClockNs(),
+		    std::bit_cast<uint64_t>(graphics.queue), 0, std::source_location::current(), frame);
 	}
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
@@ -560,9 +573,14 @@ bool Swapchain::NeedsResize() const {
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	m_image_index     = static_cast<uint32_t>(-1);
+	auto* profiler = ProfileThread().scheduler;
+	const auto profile_start = profiler && profiler->ProfileActive() ? ProfileClockNs() : 0;
+	const auto profile_frame = profile_start ? profiler->ProfileFrame() : 0;
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
 	    &m_image_index);
+	if (profile_start) profiler->ProfileEvent("acquire_next_image_wait", profile_start, ProfileClockNs(),
+	    std::bit_cast<uint64_t>(m_handle), 0, std::source_location::current(), profile_frame);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -746,7 +764,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	to_transfer.subresourceRange.baseArrayLayer = 0;
 	to_transfer.subresourceRange.layerCount     = 1;
 	// Match the acquire wait stage so the layout transition cannot precede acquisition.
-	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	ProfilePipelineBarrier(vk_command, vk::PipelineStageFlagBits::eTransfer,
 	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
 	                           nullptr, 0, nullptr, 1, &to_transfer);
 
@@ -766,9 +784,12 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		region.dstOffsets[1].x               = static_cast<int>(m_extent.width);
 		region.dstOffsets[1].y               = static_cast<int>(m_extent.height);
 		region.dstOffsets[1].z               = 1;
+		auto* profiler = ProfileThread().scheduler;
+		const auto blit_timer = profiler ? profiler->StartGpuTimer("copy_present_blit", profiler->GpuFrameHint()) : UINT32_MAX;
 		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
 		                     &region, vk::Filter::eLinear);
+		if (profiler) profiler->EndGpuTimer(blit_timer);
 	} else {
 		const vk::ClearColorValue black {};
 		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
@@ -792,7 +813,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	to_present.subresourceRange.levelCount     = 1;
 	to_present.subresourceRange.baseArrayLayer = 0;
 	to_present.subresourceRange.layerCount     = 1;
-	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	ProfilePipelineBarrier(vk_command, vk::PipelineStageFlagBits::eTransfer,
 	                           draw_attachment ? vk::PipelineStageFlagBits::eColorAttachmentOutput
 	                                           : vk::PipelineStageFlagBits::eAllCommands,
 	                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
@@ -803,7 +824,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 			if (draw_system_overlay) {
 				to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
 				to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
-				vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+				ProfilePipelineBarrier(vk_command, vk::PipelineStageFlagBits::eColorAttachmentOutput,
 				                           vk::PipelineStageFlagBits::eColorAttachmentOutput,
 				                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0,
 				                           nullptr, 1, &to_present);
@@ -816,7 +837,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
 		to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
 		to_present.newLayout     = vk::ImageLayout::ePresentSrcKHR;
-		vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+		ProfilePipelineBarrier(vk_command, vk::PipelineStageFlagBits::eColorAttachmentOutput,
 		                           vk::PipelineStageFlagBits::eAllCommands,
 		                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
 		                           &to_present);
@@ -842,11 +863,16 @@ Swapchain::Status Swapchain::Present() {
 	present.pWaitSemaphores    = &ready;
 	present.waitSemaphoreCount = 1;
 
+	auto* profiler = ProfileThread().scheduler;
+	const auto start = profiler && profiler->ProfileActive() ? ProfileClockNs() : 0;
+	const auto frame = start ? profiler->ProfileFrame() : 0;
 	vk::Result result;
 	{
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
+	if (start) profiler->ProfileEvent("queue_present_cpu", start, ProfileClockNs(),
+	    std::bit_cast<uint64_t>(m_window.graphic_ctx.queue), 0, std::source_location::current(), frame);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -964,6 +990,8 @@ void Presenter::ClearLayer(int bus) {
 }
 
 void Presenter::Impl::Present() {
+	present_scheduler.SetProfileFrame(renderer.GetGpu().GetFrameNum());
+	ProfileCpuScope present_profile(present_scheduler, "present_cpu");
 	KYTY_PROFILER_FUNCTION();
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
@@ -998,6 +1026,35 @@ void Presenter::Impl::Present() {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
+		// Opt-in wall-clock present rate for the live VRAM pressure A/B. Reset the window when the
+		// trigger changes so a sample never mixes the two modes.
+		static const bool measure_vram_test = std::getenv("KYTY_VRAM_TEST_FPS") != nullptr;
+		if (measure_vram_test) {
+			static auto start = std::chrono::steady_clock::now();
+			static uint64_t frames = 0;
+			static bool last_pressure = false;
+			std::FILE* trigger = std::fopen("D:/PS5/dumps/VRAM_PRESSURE_TEST", "rb");
+			const bool pressure = trigger != nullptr;
+			if (trigger != nullptr) std::fclose(trigger);
+			const auto now = std::chrono::steady_clock::now();
+			if (pressure != last_pressure) {
+				start = now;
+				frames = 0;
+				last_pressure = pressure;
+			}
+			++frames;
+			const auto seconds = std::chrono::duration<double>(now - start).count();
+			if (seconds >= 10.0) {
+				if (std::FILE* log = std::fopen("D:/PS5/fps-pressure-test.txt", "a"); log != nullptr) {
+					std::fprintf(log, "PresentRate: pressure=%u frames=%llu seconds=%.3f fps=%.3f\n",
+					             pressure ? 1u : 0u, static_cast<unsigned long long>(frames),
+					             seconds, static_cast<double>(frames) / seconds);
+					std::fclose(log);
+				}
+				start = now;
+				frames = 0;
+			}
+		}
 		window.UpdateTitle();
 		return;
 	}

@@ -63,6 +63,8 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
+	// Advance after publication: a concurrent pass that saw no region must retry.
+	RegionManager::NoteRegionPublication();
 	return ptr;
 }
 

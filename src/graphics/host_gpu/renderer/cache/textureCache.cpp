@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/productionProfile.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include "common/alignment.h"
@@ -6,6 +7,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -14,22 +16,402 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <unordered_map>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <span>
+#include <string>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
 
 namespace {
+
+[[nodiscard]] bool DropTexturesEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* flag = std::getenv("KYTY_DROP_TEXTURES");
+		return flag != nullptr && std::strcmp(flag, "1") == 0;
+	}();
+	return enabled;
+}
+
+struct ColorMetaProfile {
+	FILE* file = nullptr;
+	uint64_t frame = UINT64_MAX;
+	uint64_t calls = 0;
+	uint64_t dirty = 0;
+	uint64_t requested_bytes = 0;
+	uint64_t decoded_slices = 0;
+	uint64_t uniform_clears = 0;
+	uint64_t nonuniform_slices = 0;
+	double readback_ms = 0;
+	std::unordered_set<uint64_t> ranges;
+
+	ColorMetaProfile() {
+		const char* path = std::getenv("KYTY_COLOR_META_PROFILE");
+		if (path != nullptr && *path != '\0') {
+			file = std::fopen(path, "w");
+			if (file != nullptr) {
+				std::fprintf(file, "frame,calls,dirty_readbacks,requested_bytes,readback_ms,"
+				                   "distinct_ranges,decoded_slices,uniform_clears,nonuniform_slices\n");
+			}
+		}
+	}
+
+	~ColorMetaProfile() {
+		Flush();
+		if (file != nullptr) {
+			std::fclose(file);
+		}
+	}
+
+	void Flush() {
+		if (file == nullptr || frame == UINT64_MAX) {
+			return;
+		}
+		std::fprintf(file, "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+		                   ",%.3f,%zu,%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+		             frame, calls, dirty, requested_bytes, readback_ms, ranges.size(),
+		             decoded_slices, uniform_clears, nonuniform_slices);
+		std::fflush(file);
+	}
+
+	void NextFrame(uint64_t current_frame) {
+		if (file == nullptr || frame == current_frame) {
+			return;
+		}
+		Flush();
+		frame = current_frame;
+		calls = dirty = requested_bytes = decoded_slices = uniform_clears = nonuniform_slices = 0;
+		readback_ms = 0;
+		ranges.clear();
+	}
+};
+
+ColorMetaProfile& GetColorMetaProfile() {
+	static thread_local ColorMetaProfile profile;
+	return profile;
+}
+
+struct ColorMetaTrace {
+	FILE* file = nullptr;
+	std::vector<GuestRange> ranges;
+
+	ColorMetaTrace() {
+		const char* path = std::getenv("KYTY_COLOR_META_TRACE");
+		if (path != nullptr && *path != '\0') {
+			file = std::fopen(path, "w");
+			if (file != nullptr) {
+				std::fprintf(file, "event,frame,address,size,value,detail\n");
+			}
+		}
+	}
+
+	~ColorMetaTrace() {
+		if (file != nullptr) {
+			std::fclose(file);
+		}
+	}
+};
+
+ColorMetaTrace& GetColorMetaTrace() {
+	static thread_local ColorMetaTrace trace;
+	return trace;
+}
+
+// Per-range evidence for color-metadata readbacks. A CMask slice can only clear from code 0
+// with a decodable render-target clear register, so failing that is known before reading.
+struct ColorMetaPrecheckProfile {
+	struct Sample {
+		uint64_t calls = 0, early_return = 0, dirty = 0;
+		uint64_t impossible = 0, dirty_impossible = 0;
+		uint64_t not_render_target = 0, no_clear_register = 0, undecodable_clear = 0;
+		uint64_t decoded_slices = 0, uniform_clears = 0, impossible_clears = 0;
+		uint64_t skipped = 0, skip_cpu_faults = 0;
+		uint32_t view_format = 0, clear_word = 0;
+		double   readback_ms = 0, impossible_readback_ms = 0;
+	};
+	using Key = std::tuple<uint32_t, uint64_t, uint64_t>;
+
+	std::mutex                            lock;
+	FILE*                                 file = nullptr;
+	std::chrono::steady_clock::time_point start   = std::chrono::steady_clock::now();
+	std::chrono::steady_clock::time_point flushed = start;
+	std::map<Key, Sample>                 ranges;
+
+	ColorMetaPrecheckProfile() {
+		const char* path = std::getenv("KYTY_CMASK_PRECHECK_CSV");
+		if (path != nullptr && *path != '\0') {
+			file = std::fopen(path, "w");
+			if (file != nullptr) {
+				std::fprintf(file, "window_end_s,window_s,kind,address,size,calls,early_return,dirty,"
+				                   "impossible,dirty_impossible,not_render_target,no_clear_register,"
+				                   "undecodable_clear,readback_ms,impossible_readback_ms,decoded_slices,"
+				                   "uniform_clears,impossible_clears,skipped,skip_cpu_faults,"
+				                   "view_format,clear_word\n");
+				std::fflush(file);
+			}
+		}
+	}
+
+	~ColorMetaPrecheckProfile() {
+		std::scoped_lock guard {lock};
+		Flush(std::chrono::steady_clock::now());
+		if (file != nullptr) {
+			std::fclose(file);
+		}
+	}
+
+	void Flush(std::chrono::steady_clock::time_point now) {
+		if (file == nullptr) {
+			return;
+		}
+		const auto seconds = [this](std::chrono::steady_clock::time_point at) {
+			return std::chrono::duration<double>(at - start).count();
+		};
+		const double window = std::chrono::duration<double>(now - flushed).count();
+		for (const auto& [key, s]: ranges) {
+			const auto& [kind, address, size] = key;
+			std::fprintf(file,
+			             "%.3f,%.3f,%s,0x%016" PRIx64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+			             ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+			             ",%.3f,%.3f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+			             ",%u,0x%08x\n",
+			             seconds(now), window,
+			             kind == static_cast<uint32_t>(ImageMetadataKind::Cmask) ? "cmask" : "dcc",
+			             address, size, s.calls, s.early_return, s.dirty, s.impossible,
+			             s.dirty_impossible, s.not_render_target, s.no_clear_register,
+			             s.undecodable_clear, s.readback_ms, s.impossible_readback_ms,
+			             s.decoded_slices, s.uniform_clears, s.impossible_clears, s.skipped,
+			             s.skip_cpu_faults, s.view_format, s.clear_word);
+		}
+		std::fflush(file);
+		ranges.clear();
+		flushed = now;
+	}
+
+	void Commit(const Key& key, const Sample& sample) {
+		std::scoped_lock guard {lock};
+		auto& s = ranges[key];
+		s.calls += sample.calls;
+		s.early_return += sample.early_return;
+		s.dirty += sample.dirty;
+		s.impossible += sample.impossible;
+		s.dirty_impossible += sample.dirty_impossible;
+		s.not_render_target += sample.not_render_target;
+		s.no_clear_register += sample.no_clear_register;
+		s.undecodable_clear += sample.undecodable_clear;
+		s.decoded_slices += sample.decoded_slices;
+		s.uniform_clears += sample.uniform_clears;
+		s.impossible_clears += sample.impossible_clears;
+		s.skipped += sample.skipped;
+		s.skip_cpu_faults += sample.skip_cpu_faults;
+		s.view_format = sample.view_format;
+		s.clear_word  = sample.clear_word;
+		s.readback_ms += sample.readback_ms;
+		s.impossible_readback_ms += sample.impossible_readback_ms;
+		const auto now = std::chrono::steady_clock::now();
+		if (now - flushed >= std::chrono::seconds(2)) {
+			Flush(now);
+		}
+	}
+};
+
+ColorMetaPrecheckProfile* GetColorMetaPrecheckProfile() {
+	static ColorMetaPrecheckProfile profile;
+	return profile.file != nullptr ? &profile : nullptr;
+}
+
+bool CmaskSkipImpossibleEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CMASK_SKIP_IMPOSSIBLE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+struct ColorMetaPrecheckScope {
+	ColorMetaPrecheckProfile*        profile = nullptr;
+	ColorMetaPrecheckProfile::Key    key {};
+	ColorMetaPrecheckProfile::Sample sample {};
+
+	~ColorMetaPrecheckScope() {
+		if (profile != nullptr) {
+			profile->Commit(key, sample);
+		}
+	}
+};
+
+// One row per detile dispatch. Slot and group counts match TileManager::Prepare/Record
+// for the detile direction: slot = family * 5 + countr_zero(bytes_per_element),
+// groups = ceil(width/8) x ceil(height/8) x depth.
+struct DetileTrace {
+	FILE*                              file = nullptr;
+	uint64_t                           frame = UINT64_MAX;
+	uint32_t                           call  = 0;
+	std::unordered_map<uint64_t, uint32_t> repeats;
+
+	DetileTrace() {
+		const char* path = std::getenv("KYTY_DETILE_TRACE");
+		if (path != nullptr && *path != '\0') {
+			file = std::fopen(path, "w");
+			if (file != nullptr) {
+				std::fprintf(file,
+				             "frame,call,repeat,image,addr,size,binding,buf_mod,cpu_dirty,"
+				             "maybe_cpu,gpu_mod,linear_bytes,dispatch,dispatches,family,bpe,"
+				             "slot,width,height,depth,pitch,gx,gy,gz,tiled_bytes,tail,reuse\n");
+			}
+		}
+	}
+
+	~DetileTrace() {
+		if (file != nullptr) {
+			std::fclose(file);
+		}
+	}
+};
+
+DetileTrace& GetDetileTrace() {
+	static DetileTrace trace;
+	return trace;
+}
+
+const char* DetileBindingName(TextureCache::BindingType binding) {
+	switch (binding) {
+		case TextureCache::BindingType::Texture: return "texture";
+		case TextureCache::BindingType::Storage: return "storage";
+		case TextureCache::BindingType::RenderTarget: return "rt";
+		case TextureCache::BindingType::DepthTarget: return "depth";
+		case TextureCache::BindingType::VideoOut: return "video";
+	}
+	return "other";
+}
+
+uint64_t HashGpuTiles(std::span<const GpuTileInfo> tiles) {
+	uint64_t hash = 0x9e3779b97f4a7c15ull;
+	const auto mix = [&hash](uint64_t value) {
+		hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+	};
+	mix(tiles.size());
+	for (const auto& tile: tiles) {
+		mix(static_cast<uint64_t>(tile.family));
+		mix(tile.bytes_per_element);
+		mix(tile.linear_offset);
+		mix(tile.linear_size);
+		mix(tile.tiled_offset);
+		mix(tile.tiled_size);
+		mix(tile.linear_slice_stride);
+		mix(tile.width);
+		mix(tile.height);
+		mix(tile.depth);
+		mix(tile.pitch);
+		mix(tile.tail_x);
+		mix(tile.tail_y);
+		mix(static_cast<uint64_t>(tile.tail));
+		mix(tile.tiled_width);
+		mix(tile.tiled_height);
+		mix(tile.surface_z);
+	}
+	return hash;
+}
+
+bool DetileReuseEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DETILE_REUSE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+void TraceDetileUpload(CommandScheduler& scheduler, ImageId id, const Image& image,
+                       TextureCache::BindingType binding, uint64_t guest_address,
+                       uint64_t guest_size, uint64_t linear_bytes,
+                       std::span<const GpuTileInfo> tiles, bool reuse) {
+	auto& trace = GetDetileTrace();
+	if (trace.file == nullptr || tiles.empty()) {
+		return;
+	}
+	const uint64_t frame = static_cast<uint64_t>(scheduler.Context().GetGpu().GetFrameNum());
+	if (frame != trace.frame) {
+		trace.frame = frame;
+		trace.call  = 0;
+		trace.repeats.clear();
+	}
+	const uint32_t repeat = trace.repeats[guest_address]++;
+	const uint32_t call   = trace.call++;
+	const int      buf_mod = image.IsBufferModified() ? 1 : 0;
+	const int      cpu_dirty = image.IsDefinitelyCpuDirty() ? 1 : 0;
+	const int      maybe_cpu = image.IsCpuDirty() && !image.IsDefinitelyCpuDirty() ? 1 : 0;
+	const int      gpu_mod = image.IsGpuModified() ? 1 : 0;
+	const auto     dispatches = static_cast<uint32_t>(tiles.size());
+	for (uint32_t index = 0; index < dispatches; index++) {
+		const auto& tile = tiles[index];
+		const uint32_t element =
+		    tile.bytes_per_element == 0 ? 0u : std::countr_zero(tile.bytes_per_element);
+		const uint32_t slot = static_cast<uint32_t>(tile.family) * 5u + element;
+		std::fprintf(trace.file,
+		             "%" PRIu64 ",%u,%u,%u,0x%016" PRIx64 ",%" PRIu64
+		             ",%s,%d,%d,%d,%d,%" PRIu64 ",%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%" PRIu64
+		             ",%u,%u\n",
+		             frame, call, repeat, id.index, guest_address, guest_size,
+		             DetileBindingName(binding), buf_mod, cpu_dirty, maybe_cpu, gpu_mod,
+		             linear_bytes, index, dispatches, static_cast<uint32_t>(tile.family),
+		             tile.bytes_per_element, slot, tile.width, tile.height, tile.depth, tile.pitch,
+		             (tile.width + 7u) / 8u, (tile.height + 7u) / 8u, tile.depth, tile.tiled_size,
+		             tile.tail ? 1u : 0u, reuse ? 1u : 0u);
+	}
+	std::fflush(trace.file);
+}
+
+// DispatchDirect runs on the guest GPU thread. Polling at most twice per second keeps
+// the experiment switchable in a live fight without touching the frame hot path.
+bool ColorMetaCpuFillEnabled() {
+	struct Control {
+		bool enabled = [] {
+			const char* flag = std::getenv("KYTY_COLOR_META_CPU_FILL");
+			return flag != nullptr && std::strcmp(flag, "1") == 0;
+		}();
+		std::string path = [] {
+			const char* value = std::getenv("KYTY_COLOR_META_CONTROL_FILE");
+			return value != nullptr ? std::string {value} : std::string {};
+		}();
+		std::chrono::steady_clock::time_point next_check {};
+	};
+	static Control control;
+	if (control.path.empty()) {
+		return control.enabled;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now < control.next_check) {
+		return control.enabled;
+	}
+	control.next_check = now + std::chrono::milliseconds {500};
+	if (FILE* file = std::fopen(control.path.c_str(), "r"); file != nullptr) {
+		char value[16] {};
+		if (std::fgets(value, sizeof(value), file) != nullptr) {
+			if (value[0] == '1' || std::strncmp(value, "on", 2) == 0) {
+				control.enabled = true;
+			} else if (value[0] == '0' || std::strncmp(value, "off", 3) == 0) {
+				control.enabled = false;
+			}
+		}
+		std::fclose(file);
+	}
+	return control.enabled;
+}
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 
@@ -223,6 +605,7 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	ProfileDetailScope profile("cpu_image_insert", info.data.address, info.data.size);
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
@@ -997,7 +1380,109 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 	return transfer;
 }
 
-void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+void TextureCache::ForgetDetileReuse(uint64_t address, uint64_t size) {
+	if (!DetileReuseEnabled() || size == 0 || address > UINT64_MAX - size) {
+		return;
+	}
+	const uint64_t end = address + size;
+	for (auto& entry: m_detile_reuse) {
+		if (entry.address != 0 && address < entry.address + entry.guest_size && entry.address < end) {
+			entry.address = 0;
+		}
+	}
+}
+
+void TextureCache::SweepDetileReuse() {
+	std::erase_if(m_detile_reuse, [this](DetileReuseEntry& entry) {
+		if (entry.address != 0) {
+			return false;
+		}
+		if (entry.linear_size <= m_detile_reuse_bytes) {
+			m_detile_reuse_bytes -= entry.linear_size;
+		} else {
+			m_detile_reuse_bytes = 0;
+		}
+		m_scheduler.DeferOperation(
+		    [buffer = std::move(entry.buffer)]() mutable { buffer.reset(); });
+		return true;
+	});
+}
+
+TileManager::Result TextureCache::FindDetileReuse(uint64_t address, uint64_t guest_size,
+                                                  uint64_t fingerprint, uint64_t linear_size) {
+	if (!DetileReuseEnabled()) {
+		return {};
+	}
+	SweepDetileReuse();
+	for (const auto& entry: m_detile_reuse) {
+		if (entry.address == address && entry.guest_size == guest_size &&
+		    entry.fingerprint == fingerprint && entry.linear_size == linear_size && entry.buffer) {
+			return {entry.buffer->Handle(), 0, entry.linear_size};
+		}
+	}
+	return {};
+}
+
+void TextureCache::RetainDetile(uint64_t address, uint64_t guest_size, uint64_t fingerprint,
+                                TileManager::Result linear) {
+	constexpr uint64_t kMinimumReuse = 8ull * 1024 * 1024;
+	constexpr uint64_t kReuseBudget  = 160ull * 1024 * 1024;
+	if (!DetileReuseEnabled() || address == 0 || linear.buffer == nullptr ||
+	    linear.size < kMinimumReuse) {
+		return;
+	}
+	SweepDetileReuse();
+	if (linear.size > UINT64_MAX - m_detile_reuse_bytes ||
+	    m_detile_reuse_bytes + linear.size > kReuseBudget) {
+		return;
+	}
+	for (const auto& entry: m_detile_reuse) {
+		if (entry.address == address && entry.guest_size == guest_size &&
+		    entry.fingerprint == fingerprint && entry.linear_size == linear.size) {
+			return;
+		}
+	}
+	const uint64_t copy_size = Common::AlignUp(linear.size, 4);
+	auto retained = std::make_unique<Buffer>(
+	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst, copy_size);
+	m_scheduler.EndRendering();
+	auto command = m_scheduler.Current().Handle();
+	vk::BufferMemoryBarrier barriers[2] {};
+	barriers[0].srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+	barriers[0].dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barriers[0].buffer              = linear.buffer;
+	barriers[0].offset              = linear.offset;
+	barriers[0].size                = copy_size;
+	barriers[1]                     = barriers[0];
+	barriers[1].srcAccessMask       = {};
+	barriers[1].dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	barriers[1].buffer              = retained->Handle();
+	barriers[1].offset              = 0;
+	barriers[1].size                = copy_size;
+	ProfilePipelineBarrier(command, vk::PipelineStageFlagBits::eAllCommands,
+	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 2, barriers, 0,
+	                        nullptr);
+	const vk::BufferCopy region {linear.offset, 0, copy_size};
+	const auto copy_timer = m_scheduler.StartGpuTimer("copy_detile_retain", m_scheduler.GpuFrameHint(), copy_size);
+	command.copyBuffer(linear.buffer, retained->Handle(), 1, &region);
+	m_scheduler.EndGpuTimer(copy_timer);
+	barriers[1].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eShaderRead;
+	ProfilePipelineBarrier(command, vk::PipelineStageFlagBits::eTransfer,
+	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1, &barriers[1],
+	                        0, nullptr);
+	m_detile_reuse_bytes += linear.size;
+	m_detile_reuse.push_back(
+	    {address, guest_size, fingerprint, linear.size, std::move(retained)});
+}
+
+void TextureCache::UploadImage(ImageId id, Image& image, Buffer& source, uint64_t source_offset) {
+	ProfileDetailScope profile("cpu_image_upload", image.info.data.address, image.info.data.size);
+	ProfileCpuScope transaction(m_scheduler, "upload_transaction", image.info.data.address, image.info.data.size, true);
+	source.ProfileAllocation("upload_source_allocation");
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
@@ -1022,8 +1507,23 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		}
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (!transfer.tiles.empty()) {
-			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
-			                        transfer.LinearSize(), transfer.tiles);
+			const auto linear_size = transfer.LinearSize();
+			const auto fingerprint = HashGpuTiles(transfer.tiles);
+			const auto reused      = transfer.swap_bgra16
+			                             ? TileManager::Result {}
+			                             : FindDetileReuse(info.data.address, info.data.size,
+			                                               fingerprint, linear_size);
+			TraceDetileUpload(m_scheduler, id, image, binding, info.data.address, info.data.size,
+			                  linear_size, transfer.tiles, reused.buffer != nullptr);
+			if (reused.buffer != nullptr) {
+				linear = reused;
+			} else {
+				linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size, linear_size,
+				                        transfer.tiles, info.data.address);
+				if (!transfer.swap_bgra16) {
+					RetainDetile(info.data.address, info.data.size, fingerprint, linear);
+				}
+			}
 		}
 		if (transfer.swap_bgra16) {
 			linear = m_tiler.SwapBgra16(linear);
@@ -1052,12 +1552,26 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	                                                        ? vk::ImageAspectFlagBits::eStencil
 	                                                        : vk::ImageAspectFlagBits::eDepth);
 	TileManager::Result linear {source.Handle(), source_offset, source.Size() - source_offset};
+	const auto transfer_bytes = image.depth_id ? 1u : DepthAspectTransferBytes(info.pixel_format);
 	if (info.IsTiled()) {
 		const auto tiles = BuildDepthTiles(info);
-		linear =
-		    m_tiler.Detile(source.Handle(), source_offset, info.data.size, info.data.size, tiles);
+		const bool plain = transfer_bytes == info.bytes_per_block;
+		const auto fingerprint = HashGpuTiles(tiles);
+		const auto reused =
+		    plain ? FindDetileReuse(info.data.address, info.data.size, fingerprint, info.data.size)
+		          : TileManager::Result {};
+		TraceDetileUpload(m_scheduler, id, image, binding, info.data.address, info.data.size,
+		                  info.data.size, tiles, reused.buffer != nullptr);
+		if (reused.buffer != nullptr) {
+			linear = reused;
+		} else {
+			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size, info.data.size,
+			                        tiles, info.data.address);
+			if (plain) {
+				RetainDetile(info.data.address, info.data.size, fingerprint, linear);
+			}
+		}
 	}
-	const auto transfer_bytes = image.depth_id ? 1u : DepthAspectTransferBytes(info.pixel_format);
 	if (transfer_bytes != info.bytes_per_block) {
 		const uint64_t texels_per_slice = static_cast<uint64_t>(info.pitch) * info.extent.height;
 		EXIT_NOT_IMPLEMENTED(info.bytes_per_block != sizeof(uint16_t) ||
@@ -1085,6 +1599,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 }
 
 void TextureCache::InitializeImage(ImageId id) {
+	ProfileDetailScope profile("cpu_image_initialize");
 	auto& image = m_slot_images[id];
 	if (image.info.data.Empty()) {
 		return;
@@ -1106,12 +1621,81 @@ void TextureCache::InitializeImage(ImageId id) {
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
-		UploadImage(image, *source, source_offset);
+		UploadImage(id, image, *source, source_offset);
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
+}
+
+void TextureCache::TraceColorMetaFill(uint64_t address, uint64_t size, uint32_t value,
+                                     bool gpu_path) {
+	auto& trace = GetColorMetaTrace();
+	if (trace.file != nullptr) {
+		std::fprintf(trace.file, "F,%" PRIu64 ",0x%016" PRIx64 ",%" PRIu64
+		                         ",0x%08" PRIx32 ",%s\n",
+		             static_cast<uint64_t>(m_scheduler.Context().GetGpu().GetFrameNum()), address,
+		             size, value,
+		             gpu_path ? "gpu" : "cpu");
+	}
+}
+
+void TextureCache::TraceColorMetaWrite(uint64_t address, uint64_t size,
+                                      const char* source, uint64_t source_address) {
+	auto& trace = GetColorMetaTrace();
+	if (trace.file == nullptr ||
+	    std::none_of(trace.ranges.begin(), trace.ranges.end(), [address, size](GuestRange range) {
+		    return address < range.address + range.size && range.address < address + size;
+	    })) {
+		return;
+	}
+	std::fprintf(trace.file, "W,%" PRIu64 ",0x%016" PRIx64 ",%" PRIu64
+	                         ",0x%016" PRIx64 ",%s\n",
+	             static_cast<uint64_t>(m_scheduler.Context().GetGpu().GetFrameNum()), address,
+	             size, source_address, source);
+}
+
+bool TextureCache::TryConsumeColorMetaUniformFill(uint64_t address, uint64_t size,
+                                                  uint32_t value) {
+	static bool last_enabled = false;
+	const bool enabled = ColorMetaCpuFillEnabled();
+	if (enabled != last_enabled) {
+		auto& trace = GetColorMetaTrace();
+		if (trace.file != nullptr) {
+			std::fprintf(trace.file, "T,%" PRIu64 ",0x0000000000000000,0,%u,%s\n",
+			             static_cast<uint64_t>(m_scheduler.Context().GetGpu().GetFrameNum()),
+			             static_cast<unsigned>(enabled), enabled ? "on" : "off");
+			std::fflush(trace.file);
+		}
+		last_enabled = enabled;
+	}
+	if (!enabled || (address & 0xfff) != 0 || (size & 0xfff) != 0) {
+		return false;
+	}
+	bool known_cmask = false;
+	{
+		std::scoped_lock lock {m_lock};
+		m_slot_images.ForEach([&](ImageId, const Image& image) {
+			const auto& metadata = image.info.metadata;
+			known_cmask |= image.registered && metadata.kind == ImageMetadataKind::Cmask &&
+			               metadata.range.address == address && metadata.range.size == size &&
+			               image.info.resources.levels == 1;
+		});
+	}
+	if (!known_cmask) {
+		return false;
+	}
+	m_buffer_cache.FillBufferFromProvenComputeFill(address, size, value);
+	auto& trace = GetColorMetaTrace();
+	if (trace.file != nullptr) {
+		std::fprintf(trace.file, "P,%" PRIu64 ",0x%016" PRIx64 ",%" PRIu64
+		                         ",0x%08" PRIx32 ",cpu-proven-fill\n",
+		             static_cast<uint64_t>(m_scheduler.Context().GetGpu().GetFrameNum()), address,
+		             size, value);
+		std::fflush(trace.file);
+	}
+	return true;
 }
 
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
@@ -1121,6 +1705,33 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		return;
 	}
 	const auto range = desc.info.metadata.range;
+	ProfileDetailScope metadata_profile("cpu_materialize_color_clear", range.address, range.size);
+	m_scheduler.ProfileBufferUse(desc.info.metadata.kind == ImageMetadataKind::Dcc ? "role_color_dcc" : "role_color_cmask",
+	    range.address, range.size, 0);
+	ColorMetaPrecheckScope precheck {.profile = GetColorMetaPrecheckProfile()};
+	const bool             skip_impossible = CmaskSkipImpossibleEnabled();
+	if (precheck.profile != nullptr || skip_impossible) {
+		const bool cmask = desc.info.metadata.kind == ImageMetadataKind::Cmask;
+		precheck.key = {static_cast<uint32_t>(desc.info.metadata.kind), range.address, range.size};
+		precheck.sample.calls      = 1;
+		precheck.sample.view_format = static_cast<uint32_t>(desc.view_info.format);
+		precheck.sample.clear_word  = desc.info.metadata.clear_word;
+		precheck.sample.skip_cpu_faults = m_buffer_cache.TakeSkippedReadbackFaults();
+		if (cmask) {
+			vk::ClearColorValue probe {};
+			if (desc.type != BindingType::RenderTarget) {
+				precheck.sample.not_render_target = 1;
+			} else if (!desc.info.metadata.clear_register_valid) {
+				precheck.sample.no_clear_register = 1;
+			} else if (!DecodePackedColorClear(desc.view_info.format, desc.info.metadata.clear_word,
+			                                   probe)) {
+				precheck.sample.undecodable_clear = 1;
+			}
+			precheck.sample.impossible = precheck.sample.not_render_target |
+			                             precheck.sample.no_clear_register |
+			                             precheck.sample.undecodable_clear;
+		}
+	}
 	{
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
@@ -1128,6 +1739,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
 		m_surface_metas.erase(range.address);
 		if (range.size == 0 || desc.info.resources.levels != 1) {
+			precheck.sample.early_return = 1;
 			return;
 		}
 	}
@@ -1146,10 +1758,53 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
+	auto& trace = GetColorMetaTrace();
+	if (trace.file != nullptr &&
+	    std::none_of(trace.ranges.begin(), trace.ranges.end(), [range](GuestRange known) {
+		    return known.address == range.address && known.size == range.size;
+	    })) {
+		trace.ranges.push_back(range);
+	}
+	auto& profile = GetColorMetaProfile();
+	if (profile.file != nullptr) {
+		profile.NextFrame(m_scheduler.Context().GetGpu().GetFrameNum());
+		profile.calls++;
+		profile.ranges.insert(range.address);
+	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+	// A CMask slice clears only from code 0 with a decodable render-target clear register, so
+	// when that fails no downloaded byte can change emulator state; the range stays
+	// GPU-modified and guest CPU reads still fault and download it.
+	if (skip_impossible && precheck.sample.impossible != 0 &&
+	    m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		m_buffer_cache.WatchSkippedReadback(range.address, range.size);
+		precheck.sample.dirty            = 1;
+		precheck.sample.dirty_impossible = 1;
+		precheck.sample.skipped          = 1;
+	} else if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		const auto before = std::chrono::steady_clock::now();
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		const auto elapsed_ms =
+		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before)
+		        .count();
+		if (profile.file != nullptr) {
+			profile.dirty++;
+			profile.requested_bytes += range.size;
+			profile.readback_ms += elapsed_ms;
+		}
+		precheck.sample.dirty = 1;
+		precheck.sample.dirty_impossible = precheck.sample.impossible;
+		precheck.sample.readback_ms = elapsed_ms;
+		precheck.sample.impossible_readback_ms = precheck.sample.impossible != 0 ? elapsed_ms : 0.0;
+		if (trace.file != nullptr) {
+			std::fprintf(trace.file, "R,%" PRIu64 ",0x%016" PRIx64 ",%" PRIu64
+			                         ",%u,%.3f\n",
+			             static_cast<uint64_t>(m_scheduler.Context().GetGpu().GetFrameNum()),
+			             range.address, range.size,
+			             static_cast<unsigned>(desc.info.metadata.kind), elapsed_ms);
+			std::fflush(trace.file);
+		}
 	}
 	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
@@ -1158,17 +1813,32 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
+		m_scheduler.ProfileBufferUse("cpu_consume_metadata_code", address, sizeof(code), code);
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
+		if (profile.file != nullptr) {
+			profile.decoded_slices++;
+		}
+		precheck.sample.decoded_slices++;
+		precheck.sample.impossible_clears += precheck.sample.impossible;
+		ProfileDetailScope scan_profile("cpu_metadata_uniform_scan", address, slice_size);
 		std::vector<uint8_t> bytes(slice_size);
 		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
 			EXIT("TextureCache: failed to read color metadata slice\n");
 		}
 		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
+			if (profile.file != nullptr) {
+				profile.nonuniform_slices++;
+			}
 			continue;
 		}
+		scan_profile.Finish();
+		if (profile.file != nullptr) {
+			profile.uniform_clears++;
+		}
+		precheck.sample.uniform_clears++;
 		{
 			std::scoped_lock lock {m_lock};
 			ClearImage(m_scheduler.Current(), id, view.format,
@@ -1181,11 +1851,13 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
 			m_buffer_cache.InvalidateMemory(address, slice_size);
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			m_scheduler.ProfileBufferUse("cpu_writer_metadata_expand", address, bytes.size(), 0);
 		}
 	}
 }
 
 void TextureCache::RefreshImage(ImageId id) {
+	ProfileDetailScope profile("cpu_image_refresh");
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
@@ -1244,6 +1916,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	ProfileDetailScope profile("cpu_image_find", desc.info.data.address, desc.info.data.size);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -1253,11 +1926,25 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		std::scoped_lock lock {m_lock};
 		return GetNullImage(desc);
 	}
+	// Test hack: sampled images stay 1x1 so freed textures are not allocated again.
+	// Render targets, depth and video-out still allocate, so a frame can present.
+	if (DropTexturesEnabled() &&
+	    (desc.type == BindingType::Texture || desc.type == BindingType::Storage)) {
+		std::scoped_lock lock {m_lock};
+		desc.view_info.type        = vk::ImageViewType::e2D;
+		desc.view_info.base_level  = 0;
+		desc.view_info.level_count = 1;
+		desc.view_info.base_layer  = 0;
+		desc.view_info.layer_count = 1;
+		return GetNullImage(desc);
+	}
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
 	{
+		ProfileDetailScope lock_profile("cpu_image_lock_acquire", desc.info.data.address);
 		std::scoped_lock lock {m_lock};
+		lock_profile.Finish();
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
@@ -1294,13 +1981,25 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
-			result         = InsertImage(desc.info);
+			ProfileDetailEvent("cache_image_miss", desc.info.data.address, desc.info.data.size);
+			vk::ImageUsageFlags pending {};
+			if (TightImageUsageEnabled()) {
+				if (desc.type == BindingType::Storage) {
+					pending = vk::ImageUsageFlagBits::eStorage;
+				} else if (desc.type == BindingType::RenderTarget ||
+				           desc.type == BindingType::VideoOut) {
+					pending = vk::ImageUsageFlagBits::eColorAttachment;
+				}
+			}
+			SetPendingTightUsage(pending);
+			result = InsertImage(desc.info);
+			SetPendingTightUsage({});
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
 			}
-		}
+		} else ProfileDetailEvent("cache_image_hit", desc.info.data.address, desc.info.data.size);
 		auto& image = m_slot_images[result];
 		if (view_mip >= 0) {
 			desc.view_info.base_level = static_cast<uint32_t>(view_mip);
@@ -1375,7 +2074,10 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	ProfileDetailScope profile("cpu_image_view_find", desc.info.data.address, desc.info.data.size);
+	ProfileDetailScope lock_profile("cpu_image_lock_acquire", desc.info.data.address);
 	std::scoped_lock lock {m_lock};
+	lock_profile.Finish();
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
 	if (!image.info.data.Empty()) {
@@ -1385,6 +2087,9 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	}
 	if (desc.type == BindingType::Storage) {
 		image.MarkGpuModified();
+		if (TightImageUsageEnabled()) {
+			image.EnsureUsage(vk::ImageUsageFlagBits::eStorage);
+		}
 	}
 	if (!image.info.data.Empty()) {
 		RefreshImage(id);
@@ -1412,6 +2117,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
+	m_scheduler.ProfileImageBinding(image.backing.image);
 	return image.FindView(desc.view_info);
 }
 
@@ -1427,9 +2133,13 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.render_target = true;
+	if (TightImageUsageEnabled()) {
+		image.EnsureUsage(vk::ImageUsageFlagBits::eColorAttachment);
+	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
+	m_scheduler.ProfileImageBinding(image.backing.image);
 	return image.FindView(desc.view_info);
 }
 
@@ -1457,6 +2167,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.info.HasStencil()) {
 		RefreshImage(AssociateStencil(id, desc.info.stencil));
 	}
+	m_scheduler.ProfileImageBinding(image.backing.image);
 	return image.FindView(desc.view_info);
 }
 
@@ -1636,6 +2347,7 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	ForgetDetileReuse(address, size);
 	InvalidateCpuAliases(address, size);
 }
 
@@ -1705,6 +2417,8 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 			EXIT("TextureCache: partial depth image download is unsupported\n");
 		}
 		DownloadDepth(image, destination, destination_offset);
+		m_scheduler.ProfileBufferUse("gpu_writer_image_download_conservative",
+		    destination.CpuAddress() + destination_offset, destination_size, std::bit_cast<uint64_t>(destination.Handle()));
 		return;
 	}
 
@@ -1717,17 +2431,23 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 			image.Download(texture.regions, linear.buffer, 0, linear.size);
 			m_tiler.SwapBgra16(linear,
 			                   {destination.Handle(), destination_offset, destination_size});
+			m_scheduler.ProfileBufferUse("gpu_writer_image_download_conservative",
+			    destination.CpuAddress() + destination_offset, destination_size, std::bit_cast<uint64_t>(destination.Handle()));
 			return;
 		}
 		for (auto& copy: texture.regions) {
 			copy.bufferOffset += destination_offset;
 		}
 		image.Download(texture.regions, destination.Handle(), destination_offset, destination_size);
+		m_scheduler.ProfileBufferUse("gpu_writer_image_download_conservative",
+		    destination.CpuAddress() + destination_offset, destination_size, std::bit_cast<uint64_t>(destination.Handle()));
 		return;
 	}
 
 	m_tiler.TileImage(image, texture.regions, destination.Handle(), destination_offset,
 	                  destination_size, texture.LinearSize(), texture.tiles, transform);
+	m_scheduler.ProfileBufferUse("gpu_writer_image_download_conservative",
+	    destination.CpuAddress() + destination_offset, destination_size, std::bit_cast<uint64_t>(destination.Handle()));
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
@@ -1829,7 +2549,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	barrier.offset              = offset;
 	barrier.size                = range.size;
 	m_scheduler.EndRendering();
-	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	ProfilePipelineBarrier(m_scheduler.Current().Handle(), vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
@@ -1844,6 +2564,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
+	ForgetDetileReuse(address, size);
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
 		if (image.info.data.address != address) {
@@ -1960,9 +2681,138 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+void TextureCache::TickFrame() {
+	std::scoped_lock lock {m_lock};
+	++m_gc_tick;
+}
+
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
-	const uint64_t   tick = m_gc_tick++;
+	// Ages are presented frames; see BufferCache::RunGarbageCollector. On an 8 GB card the
+	// pressured age is a fraction of one frame when the tick is a submission.
+	const uint64_t   tick = m_gc_tick;
+	// --- TEMPORARY DIAGNOSTIC (session 17): what is actually holding 7.4 GB of VRAM? ---------
+	// UFC 5 renders at 1068x600 and upscales to 1600x900, so a 7+ GB resident texture set is not
+	// a plausible working set. distinct_addresses vs images is the duplication test: if images
+	// greatly exceeds distinct_addresses we are keeping many host copies of the same guest memory.
+	// unevictable = GPU-modified AND tiled AND safe-to-download, the class the GC must skip.
+	// Writes D:/PS5/tex-census.txt every 2s. Remove once the question is answered.
+	{
+		static std::chrono::steady_clock::time_point next_report {};
+		const auto                                  now = std::chrono::steady_clock::now();
+		if (now >= next_report) {
+			next_report = now + std::chrono::seconds(2);
+			uint64_t images = 0;
+			uint64_t bytes = 0;
+			uint64_t gpu_mod = 0;
+			uint64_t gpu_mod_bytes = 0;
+			uint64_t unevictable = 0;
+			uint64_t unevictable_bytes = 0;
+			uint64_t vk_bytes = 0;
+			uint64_t sampled_bytes = 0;
+			uint64_t storage_bytes = 0;
+			uint64_t color_bytes = 0;
+			uint64_t both_bytes = 0;
+			std::unordered_map<uint64_t, uint32_t> by_address;
+			m_slot_images.ForEach([&](ImageId, const Image& image) {
+				if (!image.registered) {
+					return;
+				}
+				++images;
+				bytes += image.AccountedSize();
+				if (image.backing.allocation != nullptr) {
+					VmaAllocationInfo allocation {};
+					vmaGetAllocationInfo(m_graphics.allocator, image.backing.allocation, &allocation);
+					vk_bytes += allocation.size;
+				}
+				const bool storage = static_cast<bool>(image.backing.usage & vk::ImageUsageFlagBits::eStorage);
+				const bool color =
+				    static_cast<bool>(image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment);
+				const auto accounted = image.AccountedSize();
+				if (storage && color) {
+					both_bytes += accounted;
+				} else if (storage) {
+					storage_bytes += accounted;
+				} else if (color) {
+					color_bytes += accounted;
+				} else {
+					sampled_bytes += accounted;
+				}
+				++by_address[image.info.data.address];
+				if (image.IsGpuModified()) {
+					++gpu_mod;
+					gpu_mod_bytes += image.AccountedSize();
+					if (image.SafeToDownload() && image.info.IsTiled()) {
+						++unevictable;
+						unevictable_bytes += image.AccountedSize();
+					}
+				}
+			});
+			uint32_t worst = 0;
+			uint64_t worst_addr = 0;
+			for (const auto& [addr, count]: by_address) {
+				if (count > worst) {
+					worst      = count;
+					worst_addr = addr;
+				}
+			}
+			uint64_t vma_blocks = 0;
+			uint64_t vma_allocs = 0;
+			uint64_t drv_usage  = 0;
+			uint64_t drv_budget = 0;
+			uint64_t host_blocks = 0;
+			uint64_t host_allocs = 0;
+			uint64_t host_usage = 0;
+			uint64_t host_budget = 0;
+			m_graphics.ReportMemoryBreakdown(vma_blocks, vma_allocs, drv_usage, drv_budget,
+			                                 host_blocks, host_allocs, host_usage, host_budget);
+			if (std::FILE* f = std::fopen("D:/PS5/tex-census.txt", "a"); f != nullptr) {
+				std::fprintf(f,
+				             "TexCensus: images=%llu bytes=%lluMB | distinct_addr=%zu dup_factor=%.2f "
+				             "worst=0x%llx x%u | gpu_mod=%llu/%lluMB unevictable=%llu/%lluMB | "
+				             "accounted=%lluMB trigger=%lluMB critical=%lluMB | "
+				             "VMA blocks=%lluMB allocs=%lluMB | driver usage=%lluMB budget=%lluMB | "
+				             "host VMA=%lluMB allocs=%lluMB usage=%lluMB budget=%lluMB | "
+			             "buffers=%zu/%lluMB bda_table=%lluMB leaves=%llu | "
+			             "img_vk=%lluMB sampled=%lluMB storage=%lluMB color=%lluMB both=%lluMB "
+			             "tight=%u upgrades=%llu\n",
+				             static_cast<unsigned long long>(images),
+				             static_cast<unsigned long long>(bytes / (1024 * 1024)),
+				             by_address.size(),
+				             by_address.empty() ? 0.0
+				                                : static_cast<double>(images) /
+				                                      static_cast<double>(by_address.size()),
+				             static_cast<unsigned long long>(worst_addr), worst,
+				             static_cast<unsigned long long>(gpu_mod),
+				             static_cast<unsigned long long>(gpu_mod_bytes / (1024 * 1024)),
+				             static_cast<unsigned long long>(unevictable),
+				             static_cast<unsigned long long>(unevictable_bytes / (1024 * 1024)),
+				             static_cast<unsigned long long>(m_total_used_memory / (1024 * 1024)),
+				             static_cast<unsigned long long>(m_trigger_gc_memory / (1024 * 1024)),
+				             static_cast<unsigned long long>(m_critical_gc_memory / (1024 * 1024)),
+				             static_cast<unsigned long long>(vma_blocks / (1024 * 1024)),
+				             static_cast<unsigned long long>(vma_allocs / (1024 * 1024)),
+				             static_cast<unsigned long long>(drv_usage / (1024 * 1024)),
+				             static_cast<unsigned long long>(drv_budget / (1024 * 1024)),
+				             static_cast<unsigned long long>(host_blocks / (1024 * 1024)),
+				             static_cast<unsigned long long>(host_allocs / (1024 * 1024)),
+				             static_cast<unsigned long long>(host_usage / (1024 * 1024)),
+				             static_cast<unsigned long long>(host_budget / (1024 * 1024)),
+				             m_buffer_cache.RegisteredBufferCount(),
+			             static_cast<unsigned long long>(m_buffer_cache.RegisteredBufferBytes() / (1024 * 1024)),
+			             static_cast<unsigned long long>(m_buffer_cache.BdaTableAllocatedBytes() / (1024 * 1024)),
+			             static_cast<unsigned long long>(m_buffer_cache.BdaLeafCount()),
+			             static_cast<unsigned long long>(vk_bytes / (1024 * 1024)),
+			             static_cast<unsigned long long>(sampled_bytes / (1024 * 1024)),
+			             static_cast<unsigned long long>(storage_bytes / (1024 * 1024)),
+			             static_cast<unsigned long long>(color_bytes / (1024 * 1024)),
+			             static_cast<unsigned long long>(both_bytes / (1024 * 1024)),
+			             TightImageUsageEnabled() ? 1u : 0u,
+			             static_cast<unsigned long long>(ImageUsageUpgradeCount()));
+				std::fclose(f);
+			}
+		}
+	}
 	// Driver usage includes other caches and allocator reservations. Keep it
 	// separate from the owned-byte counter decremented during unregistration.
 	auto used_memory = m_graphics.CanReportMemoryUsage()
@@ -2019,6 +2869,91 @@ void TextureCache::RunGarbageCollector() {
 	collect(false);
 	if (used_memory >= m_critical_gc_memory) {
 		collect(true);
+	}
+	// Opt-in VRAM test. Every frame, drop every image not used this frame, including
+	// GPU-owned ones. Sampled lookups above return a 1x1 stand-in, so they stay gone.
+	if (DropTexturesEnabled() && tick > 0) {
+		static uint64_t dropped_on_tick = UINT64_MAX;
+		if (tick != dropped_on_tick) {
+			dropped_on_tick = tick;
+			std::vector<ImageId> cold;
+			m_lru_cache.ForEachItemBelow(tick - 1, [&](ImageId id) { cold.push_back(id); });
+			uint64_t freed_bytes = 0;
+			size_t   freed_count = 0;
+			for (const auto id: cold) {
+				auto* image = m_slot_images.try_get(id);
+				if (image == nullptr || !image->registered || image->depth_id) {
+					continue;
+				}
+				freed_bytes += image->AccountedSize();
+				FreeImage(id);
+				++freed_count;
+			}
+			uint64_t blocks = 0, allocs = 0, driver_usage = 0, driver_budget = 0;
+			uint64_t host_blocks = 0, host_allocs = 0, host_usage = 0, host_budget = 0;
+			m_graphics.ReportMemoryBreakdown(blocks, allocs, driver_usage, driver_budget,
+			                                 host_blocks, host_allocs, host_usage, host_budget);
+			if (std::FILE* log = std::fopen("D:/PS5/tex-drop.txt", "a"); log != nullptr) {
+				std::fprintf(log,
+				             "DropTextures: tick=%llu usage=%lluMB budget=%lluMB host=%lluMB "
+				             "freed=%zu/%lluMB cold=%zu\n",
+				             static_cast<unsigned long long>(tick),
+				             static_cast<unsigned long long>(driver_usage / (1024 * 1024)),
+				             static_cast<unsigned long long>(driver_budget / (1024 * 1024)),
+				             static_cast<unsigned long long>(host_usage / (1024 * 1024)),
+				             freed_count,
+				             static_cast<unsigned long long>(freed_bytes / (1024 * 1024)),
+				             cold.size());
+				std::fclose(log);
+			}
+		}
+	}
+	// Diagnostic pressure test. A trigger file lets one fight provide both sides of an A/B.
+	// Only retire clean, old images: GPU-owned tiled images cannot be downloaded safely, and
+	// downloading other GPU-owned images would introduce a GPU wait into the measurement.
+	if ((tick & 127u) == 0) {
+		std::FILE* trigger = std::fopen("D:/PS5/dumps/VRAM_PRESSURE_TEST", "rb");
+		if (trigger != nullptr) {
+			std::fclose(trigger);
+			uint64_t blocks = 0, allocs = 0, driver_usage = 0, driver_budget = 0;
+			uint64_t host_blocks = 0, host_allocs = 0, host_usage = 0, host_budget = 0;
+			m_graphics.ReportMemoryBreakdown(blocks, allocs, driver_usage, driver_budget,
+			                                 host_blocks, host_allocs, host_usage, host_budget);
+			const uint64_t margin = 128ull * 1024 * 1024;
+			if (driver_budget > margin && driver_usage > driver_budget - margin) {
+				std::vector<ImageId> candidates;
+				candidates.reserve(64);
+				size_t examined = 0;
+				const auto old_before = tick > 512 ? tick - 512 : uint64_t {0};
+				m_lru_cache.ForEachItemBelow(old_before, [&](ImageId id) {
+					if (++examined > 8192) return true;
+					const auto* image = m_slot_images.try_get(id);
+					if (image != nullptr && image->registered && !image->depth_id &&
+					    !image->IsGpuModified()) {
+						candidates.push_back(id);
+					}
+					return candidates.size() == 64;
+				});
+				uint64_t retired_bytes = 0;
+				for (const auto id: candidates) {
+					const auto* image = m_slot_images.try_get(id);
+					if (image == nullptr || !image->registered || image->IsGpuModified()) continue;
+					retired_bytes += image->AccountedSize();
+					FreeImage(id);
+				}
+				if (std::FILE* log = std::fopen("D:/PS5/tex-pressure-test.txt", "a"); log != nullptr) {
+					std::fprintf(log,
+					             "PressureSweep: tick=%llu usage=%lluMB budget=%lluMB examined=%zu "
+					             "retired=%zu/%lluMB\n",
+					             static_cast<unsigned long long>(tick),
+					             static_cast<unsigned long long>(driver_usage / (1024 * 1024)),
+					             static_cast<unsigned long long>(driver_budget / (1024 * 1024)),
+					             examined, candidates.size(),
+					             static_cast<unsigned long long>(retired_bytes / (1024 * 1024)));
+					std::fclose(log);
+				}
+			}
+		}
 	}
 }
 

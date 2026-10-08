@@ -10,11 +10,15 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <atomic>
 #include <optional>
 #include <span>
 #include <vector>
 
 namespace Libs::Graphics {
+
+[[nodiscard]] bool DrawCommitEnabled() noexcept;
+[[nodiscard]] bool DrawCommitOnWorker() noexcept;
 
 namespace HW {
 class Context;
@@ -114,6 +118,16 @@ public:
 	void EndRendering() const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// Global-barrier coalescing support. Handle() is the only way to obtain the raw buffer for
+	// recording, so it marks this flag; that over-approximates "something was recorded" in the
+	// safe direction, since a Handle() call that records nothing only costs a redundant barrier.
+	[[nodiscard]] bool RecordedSinceGlobalBarrier() const noexcept {
+		return m_recorded_since_barrier.load(std::memory_order_relaxed);
+	}
+	void ClearRecordedSinceGlobalBarrier() const noexcept {
+		m_recorded_since_barrier.store(false, std::memory_order_relaxed);
+	}
+
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -130,7 +144,10 @@ private:
 
 	void Begin();
 	void End() const;
+	void BeginGpuGap() const;
+	void EndGpuGap() const;
 
+	CommandScheduler&   m_scheduler;
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
 	vk::CommandBuffer   m_buffer          = nullptr;
@@ -143,6 +160,12 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable uint32_t    m_render_gpu_timer = UINT32_MAX;
+	mutable uint32_t    m_render_draw_start = 0;
+	mutable uint32_t    m_gap_gpu_timer = UINT32_MAX;
+	mutable uint32_t    m_gap_ordinal = 0;
+	// Starts true so the first global barrier in each command buffer is always emitted.
+	mutable std::atomic_bool m_recorded_since_barrier {true};
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
@@ -159,8 +182,13 @@ public:
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode);
+	// Join a draw whose Vulkan recording was handed to the commit thread.
+	void FinishDrawCommit();
 
-	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared,
+	                     bool allow_reuse = true);
+	void ProfilePreparedBufferUses(std::span<PreparedBindings* const> bindings,
+	                               const char* operation, uint64_t guest_submit);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
@@ -181,6 +209,15 @@ private:
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
+	enum class BindReuseBlock : uint8_t { None, Buffer, Image, Stream };
+	[[nodiscard]] bool TryReusePreparedBindings(const ShaderStageRuntime& runtime,
+	                                            PreparedBindings& prepared);
+	[[nodiscard]] BindReuseBlock BindReuseBlocker(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                                              const PreparedBindings& prepared);
+	void RememberPreparedBindings(PreparedBindings& prepared);
+	void RestoreReusedImages(PreparedBindings& prepared);
+	void RestoreReusedBuffers(PreparedBindings& prepared);
+	bool m_bind_reuse_scope = false;
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);
@@ -201,6 +238,7 @@ private:
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
+	bool                      m_commit_reset_bindings = false;
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,

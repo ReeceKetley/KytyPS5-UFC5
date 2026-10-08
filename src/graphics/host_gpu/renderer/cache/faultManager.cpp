@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/productionProfile.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 
 #include "common/assert.h"
@@ -117,7 +118,7 @@ void FaultManager::ProcessFaultBuffer() {
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;
 	dependency.pBufferMemoryBarriers    = &pre_barrier;
-	command.pipelineBarrier2(dependency);
+	ProfilePipelineBarrier2(command, dependency);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0, writes);
@@ -125,7 +126,7 @@ void FaultManager::ProcessFaultBuffer() {
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;
-	command.pipelineBarrier2(dependency);
+	ProfilePipelineBarrier2(command, dependency);
 
 	const auto area = m_current_area;
 	m_scheduler.DeferOperation([this, mapped, offset, area] {

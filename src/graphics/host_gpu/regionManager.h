@@ -78,6 +78,20 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+	// Adapted from GTA e5dd76e7. Publish the dirty hint before its epochs so
+	// readers of a new epoch cannot cache a stale clean hint.
+	[[nodiscard]] static uint64_t CpuDirtyEpoch() {
+		return s_cpu_dirty_epoch.load(std::memory_order_acquire);
+	}
+	static void NoteRegionPublication() {
+		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+	}
+	[[nodiscard]] uint64_t RegionCpuDirtyEpoch() const {
+		return m_cpu_dirty_epoch.load(std::memory_order_acquire);
+	}
+	[[nodiscard]] bool HasCpuDirty() const {
+		return m_has_cpu_dirty.load(std::memory_order_acquire);
+	}
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
@@ -104,6 +118,11 @@ public:
 			bits.UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu) {
+			m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
+			if constexpr (enable) {
+				m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+				s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+			}
 			UpdateProtection<!enable, false>();
 		} else {
 			UpdateProtection<enable, true>();
@@ -121,6 +140,7 @@ public:
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
+				m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
 				UpdateProtection<true, false>();
 			} else {
 				UpdateProtection<false, true>();
@@ -180,6 +200,9 @@ private:
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	std::atomic_bool m_has_cpu_dirty {true};
+	std::atomic<uint64_t> m_cpu_dirty_epoch {1};
+	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {0};
 };
 
 } // namespace Libs::Graphics

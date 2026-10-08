@@ -2,6 +2,8 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/bdaSyncPlan.h"
+#include "graphics/host_gpu/bdaSyncControl.h"
 
 #include <atomic>
 #include <chrono>
@@ -14,6 +16,14 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <filesystem>
+#include <fstream>
+
+static uint64_t bda_test_clock = 1'000'000'000ull;
+namespace Libs::Graphics {
+uint64_t ProfileClockNs() noexcept { return bda_test_clock; }
+uint64_t ProfileThreadId() noexcept { return 1; }
+}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -400,6 +410,139 @@ void TestCpuDirtyUpload() {
         "explicit CPU dirtiness did not release write protection");
   tracker.UntrackMemory(address, page_size * 2);
   Release(memory);
+}
+
+void TestBdaDirtySelection() {
+  using namespace Libs::Graphics;
+  TrackerHarness harness;
+  auto& tracker = harness.tracker;
+  constexpr auto page = TRACKER_PAGE_SIZE;
+  constexpr auto region = TRACKER_REGION_SIZE;
+  auto* memory = AllocateFixedGuestRange(region * 2, region);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  RangeSet mapped; mapped.Add(address, region * 2);
+  BdaSyncHistory history;
+  const auto initial = history.Build(tracker, mapped, 1, 1);
+  Check(initial.full && initial.dirty_spans.Contains(address, region * 2),
+        "untracked BDA memory was not conservatively dirty");
+  tracker.ForEachUploadRange(address, region * 2, false,
+    [](uint64_t,uint64_t) noexcept {}, []() noexcept {});
+  history.Commit(initial);
+  auto clean = history.Build(tracker, mapped, 1, 1);
+  Check(clean.dirty_spans.Empty(), "BDA snapshot consumed or invented CPU dirtiness");
+  history.Commit(clean);
+  Check(history.Build(tracker, mapped, 1, 1).unchanged, "clean BDA epochs did not skip a pass");
+  const auto before = RegionManager::CpuDirtyEpoch();
+  tracker.MarkRegionAsCpuModified(address + page, page);
+  tracker.MarkRegionAsCpuModified(address + 3 * page, page);
+  const auto changed = history.Build(tracker, mapped, 1, 1);
+  Check(RegionManager::CpuDirtyEpoch() > before && changed.dirty_bytes == 2 * page &&
+        changed.dirty_spans.Contains(address + page, page) &&
+        changed.dirty_spans.Contains(address + 3 * page, page) && changed.regions_skipped == 1,
+        "BDA selection missed dirty runs or rescanned an unchanged region");
+  Check(tracker.IsRegionCpuModified(address + page, page), "dirty BDA snapshot cleared CPU ownership");
+  tracker.ForEachUploadRange(address, region, false,
+    [](uint64_t,uint64_t) noexcept {}, []() noexcept {});
+  history.Commit(changed);
+  tracker.MarkRegionAsGpuModified(address + region, page);
+  Check(history.Build(tracker, mapped, 1, 1).unchanged &&
+        tracker.IsRegionGpuModified(address + region, page),
+        "CPU-only BDA epochs altered GPU ownership");
+  tracker.UnmarkRegionAsGpuModified(address + region, page);
+  tracker.UntrackMemory(address, region * 2); Release(memory);
+}
+
+void TestBdaInvalidationAndConcurrentWrite() {
+  using namespace Libs::Graphics;
+  TrackerHarness harness; auto& tracker = harness.tracker;
+  constexpr auto page = TRACKER_PAGE_SIZE;
+  constexpr auto region = TRACKER_REGION_SIZE;
+  auto* memory = AllocateFixedGuestRange(region, region);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(address, region, false,
+    [](uint64_t,uint64_t) noexcept {}, []() noexcept {});
+  RangeSet mapped; mapped.Add(address, page); mapped.Add(address + 3 * page, page);
+  BdaSyncHistory history;
+  history.Commit(history.Build(tracker, mapped, 1, 1));
+  tracker.MarkRegionAsCpuModified(address, page);
+  const auto snapshot = history.Build(tracker, mapped, 1, 1);
+  Check(snapshot.regions.size() == 1, "disjoint mapped spans captured a region epoch twice");
+  tracker.ForEachUploadRange(address, page, false,
+    [](uint64_t,uint64_t) noexcept {}, []() noexcept {});
+  std::binary_semaphore write_now{0}, write_done{0};
+  std::jthread writer([&] {
+    write_now.acquire(); tracker.MarkRegionAsCpuModified(address + 3 * page, page); write_done.release();
+  });
+  write_now.release(); write_done.acquire();
+  history.Commit(snapshot); // must retain the pre-write epoch, not the current one
+  const auto next = history.Build(tracker, mapped, 1, 1);
+  Check(!next.unchanged && next.dirty_spans.Contains(address + 3 * page, page),
+        "write after BDA snapshot was swallowed by history commit");
+  history.Commit(next);
+  Check(history.Build(tracker, mapped, 2, 1).full &&
+        history.Build(tracker, mapped, 2, 1).dirty_spans.Contains(address + 3 * page, page),
+        "new buffer registration failed to reconsider previously uncovered dirty pages");
+  tracker.MarkRegionAsCpuModified(address + 5 * page, page);
+  history.Commit(history.Build(tracker, mapped, 2, 1));
+  mapped.Add(address + 5 * page, page);
+  const auto remap = history.Build(tracker, mapped, 2, 2);
+  Check(remap.full && remap.dirty_spans.Contains(address + 5 * page, page),
+        "new mapped range failed to reconsider old CPU dirtiness");
+  history.Commit(remap);
+  mapped.Subtract(address + 5 * page, page);
+  Check(history.Build(tracker, mapped, 3, 3).full,
+        "unmap/unregister did not invalidate BDA history");
+  tracker.UntrackMemory(address, region); Release(memory);
+}
+
+void TestBdaLiveControlRecovery() {
+  using namespace Libs::Graphics;
+  const auto path = std::filesystem::temp_directory_path() /
+    ("kyty-bda-sync-test-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".control");
+  const auto csv = path.string() + ".csv";
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  _putenv_s("KYTY_BDA_SYNC_CONTROL_FILE", path.string().c_str());
+  _putenv_s("KYTY_BDA_SYNC_CSV", csv.c_str());
+#else
+  setenv("KYTY_BDA_SYNC_CONTROL_FILE", path.string().c_str(), 1);
+  setenv("KYTY_BDA_SYNC_CSV", csv.c_str(), 1);
+#endif
+  std::filesystem::remove(csv);
+  auto request=[&](const char* mode) { std::ofstream file(path); file << mode; file.close(); bda_test_clock+=1'000'000'000ull; };
+  auto last = BdaSyncAction::Reference;
+  bool raced=true, corrupt=false;
+  auto backend=[&](BdaSyncAction action) {
+    last=action; BdaSyncCounters counters; counters.reference_visits=2;
+    if (action==BdaSyncAction::Compare) {
+      counters.compared=true; counters.matched=!raced && !corrupt; counters.raced=raced;
+      counters.uncovered_upload_bytes=corrupt ? 4096 : 0;
+    }
+    return counters;
+  };
+  {
+    BdaSyncControl control;
+    request("off"); control.Run(1,backend);
+    Check(last==BdaSyncAction::Reference,"BDA off executed candidate");
+    request("on"); control.Run(1,backend);
+    Check(last==BdaSyncAction::Compare,"BDA on enabled without comparison");
+    control.Run(1,backend);
+    Check(last==BdaSyncAction::Reference,"raced BDA comparison verified candidate");
+    raced=false;
+    for(int i=0;i<62;++i) control.Run(1,backend);
+    Check(last==BdaSyncAction::Compare,"unverified BDA plan did not retry its comparison");
+    control.Run(1,backend);
+    Check(last==BdaSyncAction::Candidate,"matched BDA plan did not enable");
+    corrupt=true;
+    for(int i=0;i<447;++i) control.Run(1,backend);
+    Check(last==BdaSyncAction::Compare,"BDA on lost periodic validation");
+    request("on"); control.Run(1,backend);
+    Check(last==BdaSyncAction::Reference,"BDA mismatch re-enabled candidate");
+  }
+  std::ifstream output(csv); std::string text((std::istreambuf_iterator<char>(output)),{});
+  Check(text.find(",on,")!=std::string::npos && text.find(",3,1,1,1,1,1")!=std::string::npos,
+        "BDA controller did not record matched/raced/rejected checks separately");
+  output.close(); std::filesystem::remove(path); std::filesystem::remove(csv);
+  std::puts("BdaSync: dirty selection, invalidation, concurrent write and live recovery PASS");
 }
 
 void TestCleanUploadPreservesOwnership() {
@@ -1131,6 +1274,9 @@ int main(int argc, char **argv) {
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
   TestCleanUploadPreservesOwnership();
+  TestBdaDirtySelection();
+  TestBdaInvalidationAndConcurrentWrite();
+  TestBdaLiveControlRecovery();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();

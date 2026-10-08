@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/productionProfile.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -16,10 +17,135 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <atomic>
 #include <bit>
 
 namespace Libs::Graphics {
+
+// TASK-0006 probe: KYTY_RT_RESOLVE_PROBE=<path> counts how often ResolveRenderColorTarget is
+// called with the same inputs as the previous call for that slot. The function is 298 lines of
+// pure derivation from the render-target registers, runs about 1.85 times per draw, and is not
+// cached; if consecutive draws within a render pass share the key, most of that work is redundant.
+// Counting only -- no behaviour change. A byte compare of the POD register block can report a
+// false miss from padding, which is the conservative direction.
+namespace {
+struct RtResolveProbe {
+	HW::RenderTarget last[8] {};
+	uint32_t         last_mask[8] {};
+	uint32_t         last_slice[8] {};
+	bool             primed[8] {};
+	uint64_t         hit = 0, miss_regs = 0, miss_mask = 0, miss_slice = 0, first = 0;
+	uint64_t         next_publish = 0;
+};
+RtResolveProbe& Probe() {
+	static RtResolveProbe probe;
+	return probe;
+}
+const char* RtProbePath() {
+	static const char* path = std::getenv("KYTY_RT_RESOLVE_PROBE");
+	return path;
+}
+void NoteRtResolve(uint32_t slot, const HW::RenderTarget& rt, uint32_t mask, uint32_t slice) {
+	if (RtProbePath() == nullptr || slot >= 8) {
+		return;
+	}
+	auto& p = Probe();
+	if (!p.primed[slot]) {
+		p.primed[slot] = true;
+		p.first++;
+	} else if (std::memcmp(&p.last[slot], &rt, sizeof(rt)) != 0) {
+		p.miss_regs++;
+	} else if (p.last_mask[slot] != mask) {
+		p.miss_mask++;
+	} else if (p.last_slice[slot] != slice) {
+		p.miss_slice++;
+	} else {
+		p.hit++;
+	}
+	p.last[slot]       = rt;
+	p.last_mask[slot]  = mask;
+	p.last_slice[slot] = slice;
+	const auto total = p.hit + p.miss_regs + p.miss_mask + p.miss_slice + p.first;
+	if (total < p.next_publish) {
+		return;
+	}
+	p.next_publish = total + 50000;
+	if (FILE* f = std::fopen(RtProbePath(), "w")) {
+		std::fprintf(f, "hit %llu\nmiss_regs %llu\nmiss_mask %llu\nmiss_slice %llu\nfirst %llu\ntotal %llu\nhit_percent %llu\n",
+		             (unsigned long long)p.hit, (unsigned long long)p.miss_regs,
+		             (unsigned long long)p.miss_mask, (unsigned long long)p.miss_slice,
+		             (unsigned long long)p.first, (unsigned long long)total,
+		             (unsigned long long)(total ? p.hit * 100 / total : 0));
+		std::fclose(f);
+	}
+}
+// TASK-0006: memoize the pure register-derived part of ResolveRenderColorTarget. EXP-0018 measured
+// a 96% hit rate on the key below (3074708 of 3200001 calls), because the key tracks render passes
+// (about 262 per epoch) rather than draws (about 5570). The derivation is a pure function of the
+// render-target register block, the per-slot mask, the slice offset, ignore_target_mask and
+// exact_format -- verified by grepping the function for every external read. The image lookup and
+// BindRenderTarget are deliberately NOT cached: FindImage takes m_lock, can allocate or remap, and
+// BindRenderTarget feeds m_bound_images. thread_local so no lock reasoning is needed.
+// KYTY_RT_RESOLVE_CACHE=0 opts out.
+struct ColorResolveMemo {
+	HW::RenderTarget rt {};
+	RenderColorInfo  result {};
+	uint32_t         mask        = 0;
+	uint32_t         slice       = 0;
+	bool             ignore_mask = false;
+	bool             exact       = false;
+	bool             valid       = false;
+};
+thread_local ColorResolveMemo g_color_memo[8];
+
+bool ColorResolveCacheEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RT_RESOLVE_CACHE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool ColorResolveMemoHit(uint32_t slot, const HW::RenderTarget& rt, uint32_t mask, uint32_t slice,
+                         bool ignore_mask, bool exact, RenderColorInfo& out) {
+	if (!ColorResolveCacheEnabled() || slot >= 8) {
+		return false;
+	}
+	const auto& memo = g_color_memo[slot];
+	if (!memo.valid || memo.mask != mask || memo.slice != slice ||
+	    memo.ignore_mask != ignore_mask || memo.exact != exact ||
+	    std::memcmp(&memo.rt, &rt, sizeof(rt)) != 0) {
+		return false;
+	}
+	out = memo.result;
+	return true;
+}
+
+void StoreColorResolveMemo(uint32_t slot, const HW::RenderTarget& rt, uint32_t mask, uint32_t slice,
+                           bool ignore_mask, bool exact, const RenderColorInfo& result) {
+	if (!ColorResolveCacheEnabled() || slot >= 8) {
+		return;
+	}
+	auto& memo       = g_color_memo[slot];
+	memo.rt          = rt;
+	memo.result      = result;
+	memo.mask        = mask;
+	memo.slice       = slice;
+	memo.ignore_mask = ignore_mask;
+	memo.exact       = exact;
+	memo.valid       = true;
+}
+
+void InvalidateColorResolveMemo(uint32_t slot) {
+	if (slot < 8) {
+		g_color_memo[slot].valid = false;
+	}
+}
+
+} // namespace
 
 static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 	switch (info.format) {
@@ -48,11 +174,20 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	const auto& hw = buffer.GetRegisters();
 
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
+	ProfileDetailScope profile("cpu_resolve_color_target", rt.base.addr, rt_slot);
 	auto        mask    = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
+	NoteRtResolve(rt_slot, rt, mask, render_target_slice_offset);
 	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
 		mask = 0x0f;
 	}
 
+	// Memo hit still performs the image lookup and the bind; only the derivation is skipped.
+	if (ColorResolveMemoHit(rt_slot, rt, mask, render_target_slice_offset, ignore_target_mask,
+	                        exact_format, r)) {
+		r.image_id = m_context.GetTextureCache().FindImage(r.desc, exact_format);
+		BindRenderTarget(r.image_id);
+		return;
+	}
 	r             = {};
 	r.target_slot = rt_slot;
 
@@ -69,6 +204,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			}
 		}
 
+		InvalidateColorResolveMemo(rt_slot);
 		return;
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
@@ -334,8 +470,12 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
+	// Store BEFORE the lookup: FindImage takes desc by reference and may normalise it, so
+	// caching the post-call value and feeding it back would not match the uncached path.
+	StoreColorResolveMemo(rt_slot, rt, mask, render_target_slice_offset, ignore_target_mask,
+	                      exact_format, r);
+	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	BindRenderTarget(r.image_id);
 }
 

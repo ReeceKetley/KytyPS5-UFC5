@@ -97,6 +97,15 @@ struct GraphicContext {
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
+	// TEMPORARY DIAGNOSTIC (session 17): VMA block/allocation bytes vs the driver's process
+	// usage, to locate VRAM that is not accounted for by any cache.
+	void ReportMemoryBreakdown(uint64_t& block_bytes, uint64_t& allocation_bytes,
+	                           uint64_t& driver_usage, uint64_t& driver_budget,
+	                           uint64_t& host_block_bytes, uint64_t& host_allocation_bytes,
+	                           uint64_t& host_driver_usage, uint64_t& host_driver_budget) const;
+	// Exact driver device-local usage (not VMA's periodically refreshed estimate) and VMA
+	// device-local block bytes.
+	void                   SampleDeviceLocalUsage(uint64_t& driver, uint64_t& blocks) const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
@@ -112,6 +121,26 @@ private:
 	                            vk::ImageCreateFlags>,
 	                 std::pair<vk::Result, vk::ImageFormatProperties>>
 	    m_image_format_properties;
+};
+
+// Diagnostic: charges growth of driver-reported device-local usage that VMA blocks do not
+// explain to the Vulkan call kind it happened in. Enabled by KYTY_VRAM_ATTRIBUTION_CSV.
+// Only the outermost scope on a thread records; scopes overlapping another thread's are
+// reported under "overlapped" because their deltas cannot be separated.
+class VramAttributionScope {
+public:
+	VramAttributionScope(const GraphicContext& graphics, const char* kind) noexcept;
+	~VramAttributionScope();
+	KYTY_CLASS_NO_COPY(VramAttributionScope);
+
+private:
+	const GraphicContext* m_graphics   = nullptr;
+	const char*           m_kind       = nullptr;
+	uint64_t              m_driver     = 0;
+	uint64_t              m_blocks     = 0;
+	uint64_t              m_generation = 0;
+	bool                  m_nested     = false;
+	bool                  m_overlapped = false;
 };
 
 struct VulkanImageState {

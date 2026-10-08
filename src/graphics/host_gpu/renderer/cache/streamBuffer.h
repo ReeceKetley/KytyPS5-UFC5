@@ -57,6 +57,7 @@ public:
 	[[nodiscard]] int  StreamScore() const noexcept { return stream_score; }
 	void               Flush(uint64_t offset, uint64_t size);
 	void               Invalidate(uint64_t offset, uint64_t size);
+	void               ProfileAllocation(const char* kind);
 	void CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
 	              uint64_t destination_offset, uint64_t size,
 	              vk::AccessFlags source_before      = vk::AccessFlagBits::eMemoryWrite,
@@ -91,6 +92,7 @@ private:
 	VmaAllocation                 m_allocation = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
+	uint32_t                      m_memory_type = 0, m_memory_properties = 0;
 	std::span<uint8_t>            m_mapped;
 };
 
@@ -103,6 +105,8 @@ public:
 	                                                bool allow_wait = true);
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+	// Increments when Map rewinds the ring. Offsets from an older epoch are no longer live.
+	[[nodiscard]] uint64_t WrapEpoch() const noexcept { return m_wrap_epoch; }
 
 private:
 	friend struct StreamBufferTestAccess;
@@ -121,6 +125,7 @@ private:
 
 	uint64_t              m_offset      = 0;
 	uint64_t              m_mapped_size = 0;
+	uint64_t              m_wrap_epoch  = 0;
 	std::vector<Watch>    m_current_watches;
 	size_t                m_current_watch_cursor = 0;
 	std::optional<size_t> m_invalidation_mark;

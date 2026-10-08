@@ -63,6 +63,11 @@ if ($ExecuteHangCs) {
     Remove-Item Env:\KYTY_EXECUTE_CS_HASH -ErrorAction SilentlyContinue
 }
 $env:KYTY_SRT_LINEAR     = '1'
+# KYTY_CMASK_SKIP_IMPOSSIBLE  Skip CMask readbacks that cannot yield a clear (session 65:
+#                     output unchanged, no guest CPU faults; steadier pacing, no FPS gain).
+$env:KYTY_CMASK_SKIP_IMPOSSIBLE = '1'
+# KYTY_FUNCTION_LDS_BOUND  On by default in code; '0' restores 32KB/thread pixel-shader LDS
+#                     (session 65: frees ~2.1GB VRAM at 4K, detile back to replay speed).
 if ($NoStubImageClear) {
     $env:KYTY_STUB_CLEAR_IMAGES = '0'
     $Tag = "$Tag-no-stub-image-clear"

@@ -105,6 +105,8 @@ struct EmitterState {
 
 	const SpirvRequirements                          requirements;
 	uint32_t                                         lane_count              = 1;
+	// Nonzero only when every per-thread LDS address is statically bounded below this size.
+	uint32_t                                         function_lds_dwords     = 0;
 	uint32_t                                         lane_half               = 0;
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
@@ -172,6 +174,7 @@ uint32_t TypeStorageBufferElementPointer(EmitterState& state);
 uint32_t TypeStorageBufferU64Pointer(EmitterState& state);
 uint32_t TypeStorageBufferU64ElementPointer(EmitterState& state);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
+uint32_t TypePhysicalU64Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
 uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_class);

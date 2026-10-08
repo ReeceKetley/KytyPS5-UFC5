@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/productionProfile.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -260,6 +261,7 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
+	ProfileDetailScope profile("cpu_resolve_depth_target");
 	KYTY_PROFILER_FUNCTION();
 	const auto& hw          = buffer.GetRegisters();
 	const auto& z           = hw.GetDepthRenderTarget();
@@ -407,9 +409,11 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 		region.dstSubresource = region.srcSubresource;
 		region.extent = write_desc.info.extent;
 	}
+	const auto copy_timer = scheduler.StartGpuTimer("copy_depth", scheduler.GpuFrameHint(), destination.info.data.size);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                  count, regions.data());
+	scheduler.EndGpuTimer(copy_timer);
 	return true;
 }
 

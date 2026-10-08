@@ -25,6 +25,8 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "../ufc5/tools/detileReplayRunner.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -39,6 +41,7 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvOptimizer.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -150,6 +153,11 @@ static_assert(BlitHelper::ColorToMsDepthLayout ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
 struct BufferCacheTestAccess {
+  static void PretendBdaClean(BufferCache &cache, uint64_t mapping) {
+    BdaSyncPlan plan;
+    plan.epochs = {RegionManager::CpuDirtyEpoch(), cache.RegisterEpoch(), mapping};
+    cache.m_bda_history.Commit(plan);
+  }
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
 
@@ -1571,7 +1579,9 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
-CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
+CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64,
+                          Config::ShaderOptimizationType optimization =
+                              Config::ShaderOptimizationType::None) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   const auto uses_image =
@@ -1589,6 +1599,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     user_data[2] = static_cast<u32>(test.initial.size() * sizeof(u32));
   }
   ShaderRecompiler::CompileOptions options;
+  options.optimization_type = optimization;
   options.stage = ShaderType::Compute;
   options.dump_ir = true;
   auto compute_info = test.compute_info;
@@ -1678,7 +1689,9 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
-  CheckSpirvText(test, result.spirv);
+  if (optimization == Config::ShaderOptimizationType::None) {
+    CheckSpirvText(test, result.spirv);
+  }
   const auto *buffer_binding = ShaderRecompiler::IR::FindBinding(
       result.program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
   if (test.expected_buffer_resources) {
@@ -1745,7 +1758,9 @@ std::string StorageUint2DImageBindingName(bool atomic) {
   return "image_" + std::to_string(static_cast<uint32_t>(*binding));
 }
 
-CompiledShader CompileFragmentCase(const GraphicsCase &test) {
+CompiledShader CompileFragmentCase(const GraphicsCase &test,
+                                  Config::ShaderOptimizationType optimization =
+                                      Config::ShaderOptimizationType::None) {
   const auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   ShaderPixelInputInfo pixel_info{};
@@ -1771,6 +1786,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   }
 
   ShaderRecompiler::CompileOptions options;
+  options.optimization_type = optimization;
   options.stage = ShaderType::Pixel;
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
@@ -2152,6 +2168,56 @@ public:
     RenderExecutorTestAccess::DestroyDescriptorPipelines(
         context.GetRenderExecutor(), std::span {&pipeline, 1u});
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckProfileQueryCapacity() {
+    constexpr const char *name = "ProfileQueryCapacity";
+    for (uint32_t generation: {0u, 1u, GpuProfileTimerToken::GenerationMask}) {
+      for (uint32_t index = 0; index < GpuProfileTimerToken::Count; ++index) {
+        const auto token = GpuProfileTimerToken::Encode(generation, index);
+        Require(name, "token round trip", token != UINT32_MAX && GpuProfileTimerToken::Index(token) == index,
+            "timer index truncated or token equals disabled sentinel");
+      }
+    }
+    Require(name, "generation wrap", GpuProfileTimerToken::NextGeneration(GpuProfileTimerToken::GenerationMask) == 0,
+        "generation overflow overlaps index bits");
+    EnsureRuntimeContext();
+    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    HW::Context registers{}; HW::UserConfig config{}; HW::Shader shaders{};
+    scheduler.Begin(registers, config, shaders);
+    scheduler.SetProfileFrame(1);
+    scheduler.Flush();
+    Require(name, "profiling configured", scheduler.ProfileActive(), "set KYTY_GPU_TIMING_CSV and a window including epoch1");
+    vk::SemaphoreTypeCreateInfo type{};
+    type.semaphoreType = vk::SemaphoreType::eTimeline;
+    vk::SemaphoreCreateInfo create{}; create.pNext = &type;
+    vk::Semaphore gate = nullptr;
+    Require(name, "gate create", m_runtime_context.device.createSemaphore(&create, nullptr, &gate) == vk::Result::eSuccess,
+        "timeline create failed");
+    uint32_t max_index = 0;
+    for (uint32_t batch = 0; batch < 192; ++batch) {
+      const auto token = scheduler.StartGpuTimer("query_capacity_test", 1, batch);
+      Require(name, "in-flight page allocation", token != UINT32_MAX, "query pages exhausted with192 blocked submissions");
+      max_index = std::max(max_index, GpuProfileTimerToken::Index(token));
+      scheduler.EndGpuTimer(token);
+      SubmitInfo submit;
+      if (batch == 0) submit.AddWait(gate, 1);
+      scheduler.Flush(submit);
+    }
+    Require(name, "wide index exercised", max_index > 16383, "test did not exceed old14-bit index capacity");
+    vk::SemaphoreSignalInfo signal{}; signal.semaphore = gate; signal.value = 1;
+    Require(name, "gate release", m_runtime_context.device.signalSemaphore(&signal) == vk::Result::eSuccess, "host signal failed");
+    scheduler.Finish();
+    scheduler.SetProfileFrame(2);
+    for (uint32_t batch = 0; batch < 8; ++batch) {
+      const auto token = scheduler.StartGpuTimer("query_capacity_reuse", 2, batch);
+      Require(name, "completed page reuse", token != UINT32_MAX, "completed query pages were not recycled");
+      scheduler.EndGpuTimer(token);
+      scheduler.Flush();
+    }
+    scheduler.Finish();
+    m_runtime_context.device.destroySemaphore(gate);
+    std::printf("[host]    %-32s ok (192 in-flight batches, index %u)\n", name, max_index);
   }
 
   void CheckSchedulerTimeline() {
@@ -3925,6 +3991,116 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckBdaDirtySynchronization(bool profile_probe = false) {
+    constexpr const char *name = "BdaDirtySynchronization";
+    const uintptr_t base = profile_probe ? 0x1164b80000ull : 0x0000000200700000ull;
+    constexpr uint64_t bytes = 0x400000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, config, shaders);
+    if (profile_probe) { scheduler.SetProfileFrame(1); scheduler.Flush(); }
+    context.InitializeGpu(nullptr);
+    int64_t direct = -1;
+    Require(name, "allocate", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+        0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), bytes, 0x10000, 0, &direct) == 0,
+        "allocation failed");
+    void *memory = reinterpret_cast<void *>(base);
+    Require(name, "map", Libs::LibKernel::Memory::KernelMapDirectMemory(
+        &memory, bytes, 0x3, 0x10, direct, 0x10000) == 0 && memory == reinterpret_cast<void *>(base),
+        "mapping failed");
+    context.MapMemory(base, bytes);
+    auto &cache = context.GetBufferCache();
+    const auto Read = [&](uint64_t address) {
+      auto &buffer = cache.GetBuffer(cache.FindBuffer(address, 4));
+      auto readback = CreateHostBuffer(name, 4, vk::BufferUsageFlagBits::eTransferDst, {0});
+      const vk::BufferCopy copy{buffer.Offset(address), 0, 4};
+      auto command = scheduler.Current().Handle();
+      command.copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+      vk::BufferMemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = readback.buffer; barrier.size = 4;
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+      scheduler.Finish();
+      const auto value = ReadBuffer(name, readback, 1)[0];
+      DestroyBuffer(&readback);
+      return value;
+    };
+    const auto Write = [&](uint64_t address, uint32_t value) {
+      cache.InvalidateMemory(address, 4);
+      std::memcpy(reinterpret_cast<void *>(address), &value, 4);
+    };
+    RangeSet ranges;
+    ranges.Add(base, bytes);
+    uint64_t mapping = 1;
+    (void)cache.FindBuffer(base, 0x4000);
+    (void)cache.FindBuffer(base + 0x20000, 0x4000);
+    auto result = cache.SynchronizeBdaRanges(ranges, mapping, BdaSyncAction::Compare);
+    Require(name, "initial shadow", result.matched && result.reference_visits == 2 &&
+        result.candidate_visits == 2 && result.upload_bytes == 0x8000,
+        "initial selection missed actual uploads");
+    result = cache.SynchronizeBdaRanges(ranges, mapping, BdaSyncAction::Candidate);
+    Require(name, "region publication", result.candidate_visits == 0 && result.upload_bytes == 0,
+        "region publication caused a redundant upload");
+    // The first reference pass creates tracker regions after the snapshot;
+    // remember their published epochs before expecting the global fast skip.
+    result = cache.SynchronizeBdaRanges(ranges, mapping, BdaSyncAction::Candidate);
+    Require(name, "clean skip", result.unchanged_passes == 1 && result.candidate_visits == 0 && result.upload_bytes == 0,
+        "clean pass visited buffers");
+    Write(base + 0x100, 0x12345678);
+    Write(base + 0x2100, 0x87654321);
+    result = cache.SynchronizeBdaRanges(ranges, mapping, BdaSyncAction::Candidate);
+    Require(name, "dirty batching", result.candidate_visits == 1 && result.upload_calls == 2 && result.upload_bytes == 0x2000,
+        "dirty selection changed buffer batching or included a clean buffer");
+    Require(name, "native upload contents", Read(base + 0x100) == 0x12345678 && Read(base + 0x2100) == 0x87654321,
+        "candidate uploaded incorrect GPU bytes");
+    Write(base + 0x40100, 0xaabbccdd);
+    (void)cache.FindBuffer(base + 0x40000, 0x4000);
+    result = cache.SynchronizeBdaRanges(ranges, mapping, BdaSyncAction::Candidate);
+    Require(name, "registration invalidation", result.full_passes == 1 && result.candidate_visits == 1 &&
+        Read(base + 0x40100) == 0xaabbccdd, "new buffer remained unsynchronized");
+    ranges.Subtract(base + 0x20000, 0x4000);
+    Write(base + 0x20100, 0x11223344);
+    result = cache.SynchronizeBdaRanges(ranges, ++mapping, BdaSyncAction::Candidate);
+    Require(name, "unmapped exclusion", result.full_passes == 1 && result.candidate_visits == 0,
+        "unmapped dirty buffer selected");
+    ranges.Add(base + 0x20000, 0x4000);
+    result = cache.SynchronizeBdaRanges(ranges, ++mapping, BdaSyncAction::Candidate);
+    Require(name, "remapping invalidation", result.full_passes == 1 && result.candidate_visits == 1 &&
+        Read(base + 0x20100) == 0x11223344, "remapped buffer remained stale");
+    (void)cache.ObtainBuffer(base + 0x100, 4, true, false);
+    cache.FillBuffer(base + 0x100, 4, 0xfeedabcd, false);
+    result = cache.SynchronizeBdaRanges(ranges, mapping, BdaSyncAction::Candidate);
+    Require(name, "GPU ownership", result.upload_bytes == 0 && cache.IsRegionGpuModified(base + 0x100, 4) &&
+        Read(base + 0x100) == 0xfeedabcd, "CPU selection overwrote or published GPU-owned bytes");
+    if (profile_probe) {
+      scheduler.ProfileWriterOperationEnd();
+      cache.ReadMemory(base + 0x100, 4);
+      uint32_t published = 0;
+      Require(name, "profiled native readback", Libs::LibKernel::Memory::TryReadBacking(base + 0x100, &published, 4) &&
+          published == 0xfeedabcd && !cache.IsRegionGpuModified(base + 0x100, 4),
+          "writer diagnostics altered readback data or ownership");
+    }
+    Write(base + 0x2100, 0x55aa55aa);
+    BufferCacheTestAccess::PretendBdaClean(cache, mapping);
+    result = cache.SynchronizeBdaRanges(ranges, mapping, BdaSyncAction::Compare);
+    Require(name, "reference recovery", !result.matched && !result.raced && result.uncovered_upload_bytes == 0x1000 &&
+        Read(base + 0x2100) == 0x55aa55aa, "shadow mismatch did not preserve reference output");
+    context.UnmapMemory(base, bytes);
+    scheduler.Finish();
+    context.ShutdownGpu();
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, bytes) == 0, "unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct, bytes) == 0, "release failed");
+    if (profile_probe) scheduler.SetProfileFrame(2);
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -4379,6 +4555,7 @@ public:
 
       for (uint32_t tick = 0; tick < 160; tick++) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       Require(name, "age before pressure",
               cache.IsRegionRegistered(base, allocation_size),
@@ -4387,6 +4564,7 @@ public:
           cache, 0, std::numeric_limits<uint64_t>::max());
       const auto gc_submission_tick = scheduler.CurrentTick();
       cache.RunGarbageCollector();
+      cache.TickFrame();
       uint32_t first_before_completion = 0;
       uint32_t second_before_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + first_offset,
@@ -4431,6 +4609,7 @@ public:
         release_older_publication.release();
       });
       cache.RunGarbageCollector();
+      cache.TickFrame();
       gc_returned = true;
       release_publication.join();
       scheduler.WaitPriorityOperations(older_publication_tick);
@@ -4473,6 +4652,7 @@ public:
       }
       for (uint32_t tick = 0; tick < 160; tick++) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       constexpr uint64_t starvation_clean_offset =
           starvation_offset + starvation_count * starvation_stride;
@@ -4483,10 +4663,12 @@ public:
               "failed to create the clean starvation candidate");
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
       cache.RunGarbageCollector();
+      cache.TickFrame();
       Require(
           name, "normal-GC dirty bypass",
           cache.IsRegionRegistered(base + starvation_offset,
@@ -4502,6 +4684,7 @@ public:
       const auto starvation_retired =
           BufferCacheTestAccess::PageOwner(cache, base + starvation_offset);
       cache.RunGarbageCollector();
+      cache.TickFrame();
       Require(name, "critical-GC starvation cleanup",
               !cache.IsRegionRegistered(base + starvation_offset,
                                         sizeof(starvation_value)) &&
@@ -4526,6 +4709,7 @@ public:
           cache.FindBuffer(base + obtained_offset, residency_size);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       Require(name, "lookup-only owner identity",
               cache.FindBuffer(base + lookup_only_offset, residency_size) ==
@@ -4536,6 +4720,7 @@ public:
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
       cache.RunGarbageCollector();
+      cache.TickFrame();
       Require(name, "lookup versus acquisition residency",
               !cache.IsRegionRegistered(base + lookup_only_offset,
                                         residency_size) &&
@@ -4636,6 +4821,7 @@ public:
         const auto large_submission_tick = scheduler.CurrentTick();
         for (uint32_t tick = 0; tick <= 160; tick++) {
           cache.RunGarbageCollector();
+          cache.TickFrame();
         }
         // The capacity-sized case can wrap the ring; the oversized case must
         // keep its separate staging allocation alive through publication.
@@ -4697,6 +4883,7 @@ public:
                        grouped_second_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       Require(name, "per-owner fixed-ring retirement",
               !cache.IsRegionRegistered(base + grouped_first_offset,
@@ -4799,6 +4986,7 @@ public:
       const auto sparse_gc_tick = scheduler.CurrentTick();
       for (uint32_t tick = 0; tick <= 160; ++tick) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       Require(name, "sparse multi-owner GC submission",
               scheduler.CurrentTick() == sparse_gc_tick + 1 &&
@@ -4827,6 +5015,7 @@ public:
                        disjoint_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       Require(name, "disjoint synchronized retirement",
               !cache.IsRegionRegistered(base + disjoint_owner_offset,
@@ -4889,6 +5078,7 @@ public:
                        reacquire_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       Require(name, "reacquire synchronized retirement",
               !cache.IsRegionRegistered(base + reacquire_owner_offset,
@@ -16950,6 +17140,8 @@ private:
     }
     Require("VulkanHarness", "dispatch", m_physical_device != nullptr,
             "no Vulkan graphics+compute device with fragment barycentrics and 64-bit LDS/image atomics");
+    std::printf("VulkanHarness device: %s\n",
+                m_physical_device.getProperties().deviceName.data());
     m_physical_device.getMemoryProperties(&m_memory_properties);
 
     vk::PhysicalDeviceFeatures available_features{};
@@ -17475,8 +17667,11 @@ void CompareGraphicsWords(const GraphicsCase &test,
   Fail(test.name, "graphics readback", out.str());
 }
 
-void RunCase(VulkanHarness *vulkan, const TestCase &test) {
-  auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->SubgroupSize() : 64u);
+void RunCase(VulkanHarness *vulkan, const TestCase &test,
+             Config::ShaderOptimizationType optimization =
+                 Config::ShaderOptimizationType::None) {
+  auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->SubgroupSize() : 64u,
+                              optimization);
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7) &&
       !compiled.program.info.images.empty()) {
     Require(test.name, "resource specialization",
@@ -17604,12 +17799,14 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
-void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
+void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test,
+                     Config::ShaderOptimizationType optimization =
+                         Config::ShaderOptimizationType::None) {
   if (vulkan != nullptr && !vulkan->RasterizationSupported()) {
     vulkan->SkipRasterizationCases(1);
     return;
   }
-  auto compiled = CompileFragmentCase(test);
+  auto compiled = CompileFragmentCase(test, optimization);
   auto actual = vulkan->RenderFragment(test, compiled);
   CompareGraphicsWords(test, actual);
   std::printf("[graphics] %-31s ok\n", test.name);
@@ -32441,7 +32638,8 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   regs.cs_regs.num_thread_y = 1;
   regs.cs_regs.num_thread_z = 1;
   regs.cs_regs.wave_size = 32;
-  PipelineCache cache(graphics);
+  MasterSemaphore semaphore(graphics);
+  PipelineCache cache(graphics, semaphore);
   ShaderProgram at_limit;
   for (const auto units : {static_cast<uint16_t>(limit_units - 1u), limit_units,
                            uint16_t{112}, uint16_t{128}}) {
@@ -37100,7 +37298,138 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+  if (argc >= 2 && (std::strcmp(argv[1], "--detile-replay") == 0 ||
+                    std::strcmp(argv[1], "--detile-replay-self-test") == 0 ||
+                    std::strcmp(argv[1], "--detile-upload-pair") == 0)) {
+    if (argc < 3) {
+      std::fprintf(stderr, "Usage: --detile-replay FILE_OR_DIRECTORY [--iterations N] [--warmup N] [--csv FILE]\n");
+      return 1;
+    }
+    uint32_t iterations = 10, warmup = 3;
+    std::filesystem::path csv;
+    std::filesystem::path stencil;
+    std::filesystem::path profile_output;
+    const bool upload_pair = std::strcmp(argv[1], "--detile-upload-pair") == 0;
+    bool profile_queries = false;
+    for (int i = 3; i < argc; i += 2) {
+      if (i + 1 == argc) { std::fprintf(stderr, "missing replay option value\n"); return 1; }
+      if (std::strcmp(argv[i], "--csv") == 0) { csv = argv[i + 1]; continue; }
+      if (std::strcmp(argv[i], "--profile-output") == 0) { profile_output = argv[i + 1]; continue; }
+      if (std::strcmp(argv[i], "--stencil") == 0 && upload_pair) { stencil = argv[i + 1]; continue; }
+      if (std::strcmp(argv[i], "--profile-queries") == 0) { profile_queries = std::strcmp(argv[i+1], "1") == 0; continue; }
+      char *end = nullptr;
+      const auto value = std::strtoul(argv[i + 1], &end, 10);
+      if (end == argv[i + 1] || *end != '\0' || value > 10000 ||
+          (value == 0 && std::strcmp(argv[i], "--warmup") != 0)) {
+        std::fprintf(stderr, "invalid replay iteration count\n"); return 1;
+      }
+      if (std::strcmp(argv[i], "--iterations") == 0) iterations = value;
+      else if (std::strcmp(argv[i], "--warmup") == 0) warmup = value;
+      else { std::fprintf(stderr, "unknown replay option: %s\n", argv[i]); return 1; }
+    }
+    if (upload_pair && (stencil.empty() || profile_queries)) {
+      std::fprintf(stderr, "Usage: --detile-upload-pair DEPTH.kdr --stencil STENCIL.kdr [--iterations N] [--warmup N] [--csv FILE]\n");
+      return 1;
+    }
+    if (!profile_output.empty() && (upload_pair || profile_queries || csv.empty() ||
+                                   std::strcmp(argv[1], "--detile-replay-self-test") == 0)) {
+      std::fprintf(stderr, "--profile-output requires default replay and --csv; cannot combine with query stress/self-test\n");
+      return 1;
+    }
+    // The replay uses just two queries and waits before reusing them. Do not inherit
+    // the game's diagnostic query ring, which crashed in the stage-timing builds.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    if (!profile_queries) _putenv_s("KYTY_GPU_TIMING_CSV", "");
+    _putenv_s("KYTY_DETILE_CAPTURE_DIR", "");
+#else
+    if (!profile_queries) setenv("KYTY_GPU_TIMING_CSV", "", 1);
+    setenv("KYTY_DETILE_CAPTURE_DIR", "", 1);
+#endif
+    if (!profile_output.empty()) {
+      const auto set_profile_env = [](const char* name, const char* value) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+        _putenv_s(name, value);
+#else
+        setenv(name, value, 1);
+#endif
+      };
+      set_profile_env("KYTY_GPU_TIMING_CSV", profile_output.string().c_str());
+      set_profile_env("KYTY_GPU_PROFILE_CONTROL_FILE", "");
+      set_profile_env("KYTY_GPU_TIMING_CONTROL_FILE", "");
+      set_profile_env("KYTY_GPU_PROFILE_START_FRAME", "0");
+      set_profile_env("KYTY_GPU_PROFILE_FRAME_COUNT", "20001");
+      set_profile_env("KYTY_GPU_PROFILE_FINE_CPU", "0");
+      set_profile_env("KYTY_GPU_PROFILE_LIFETIME", "0");
+    }
+    const std::filesystem::path path(argv[2]);
+    const bool self_test = std::strcmp(argv[1], "--detile-replay-self-test") == 0;
+    if (self_test) {
+      std::string error;
+      if (!MakeDetileReplayFixtures(path, error)) {
+        std::fprintf(stderr, "[replay self-test] %s\n", error.c_str()); return 1;
+      }
+      const auto capture_directory = (path / "gpu-capture").string();
+      const auto control_file = (path / "capture-control.txt").string();
+      std::ofstream control(control_file);
+      control << "on";
+      control.close();
+      if (!control) { std::fprintf(stderr, "cannot create self-test control file\n"); return 1; }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+      _putenv_s("KYTY_DETILE_CAPTURE_DIR", capture_directory.c_str());
+      _putenv_s("KYTY_DETILE_CAPTURE_CONTROL_FILE", control_file.c_str());
+#else
+      setenv("KYTY_DETILE_CAPTURE_DIR", capture_directory.c_str(), 1);
+      setenv("KYTY_DETILE_CAPTURE_CONTROL_FILE", control_file.c_str(), 1);
+#endif
+    }
+    VulkanHarness vulkan;
+    if (upload_pair) return RunDetileUploadPair(vulkan.RuntimeContext(), vulkan.RuntimeRenderer(),
+                                               path, stencil, iterations, warmup, csv);
+    return RunDetileReplayFiles(vulkan.RuntimeContext(), vulkan.RuntimeRenderer(),
+                                path, iterations, warmup, csv, self_test, profile_queries, !profile_output.empty());
+  }
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--shader-optimization-only") == 0) {
+    VulkanHarness vulkan;
+    const std::vector<TestCase> cases = {IntegerAddSubMul(),
+                                         BitwiseOps(),
+                                         VectorCompareF64Edges(),
+                                         VectorCompareExecWaveMasks(32),
+                                         VectorCompareExecWaveMasks(64),
+                                         PackedMinMaxF16NanAndSignedZeroEdges(),
+                                         BufferWorkgroupPublication(32),
+                                         BufferWorkgroupPublication(64),
+                                         DsAtomic64Contention(true, 32),
+                                         DsAtomic64Contention(true, 64),
+                                         BvhIntersections(true, true, 1)};
+    for (const auto mode : {Config::ShaderOptimizationType::None,
+                            Config::ShaderOptimizationType::Size,
+                            Config::ShaderOptimizationType::Performance}) {
+      std::printf("Shader optimization mode: %d\n", static_cast<int>(mode));
+      for (const auto &test : cases) {
+        auto baseline = CompileCase(test, vulkan.SubgroupSize());
+        auto optimized = CompileCase(test, vulkan.SubgroupSize(), mode);
+        auto expected = baseline.spirv;
+        std::string diagnostics;
+        Require(test.name, "SPIR-V optimization",
+                ShaderRecompiler::Spirv::Optimize(expected, mode, diagnostics),
+                diagnostics);
+        Require(test.name, "compiler optimization option",
+                optimized.spirv == expected,
+                "compiler did not apply the requested optimizer mode");
+        std::printf("[optimization] %s mode=%d words=%zu->%zu\n", test.name,
+                    static_cast<int>(mode), baseline.spirv.size(),
+                    optimized.spirv.size());
+        RunCase(&vulkan, test, mode);
+      }
+      for (const auto &test :
+           {GraphicsPositionWExport(), GraphicsPackedHalfCentroid(),
+            GraphicsSmoothRawInputAlias()}) {
+        RunGraphicsCase(&vulkan, test, mode);
+      }
+    }
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeLdsLimit(vulkan);
@@ -37683,6 +38012,21 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--profile-query-capacity-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckProfileQueryCapacity();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-sync-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBdaDirtySynchronization();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--writer-trace-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBdaDirtySynchronization(true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {

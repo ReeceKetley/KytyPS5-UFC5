@@ -28,9 +28,11 @@ struct TextureBinding {
 
 struct PreparedBindings {
 	struct BufferSource {
-		uint64_t address = 0;
-		uint64_t size    = 0;
+		uint64_t address      = 0;
+		uint64_t size         = 0;
 		BufferId id;
+		bool     stream_copy  = false;
+		uint64_t content_hash = 0;
 	};
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
@@ -45,7 +47,22 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	std::vector<uint32_t>                 shader_data;
+	// KYTY_BIND_REUSE keeps the last guest snapshot and the Vulkan objects built from it.
+	bool                                                     reuse_hit          = false;
+	bool                                                     reuse_valid        = false;
+	uint64_t                                                 reuse_shader_hash  = 0;
+	uint64_t                                                 reuse_stream_epoch = 0;
+	std::vector<ShaderRecompiler::IR::DescriptorValue>      reuse_buffers;
+	std::vector<ShaderRecompiler::IR::DescriptorValue>      reuse_images;
+	std::vector<ShaderRecompiler::IR::DescriptorValue>      reuse_samplers;
+	std::vector<uint32_t>                                    reuse_user_data;
+	std::vector<uint32_t>                                    reuse_flattened_srt;
+	std::vector<std::pair<uint64_t, uint64_t>>              reuse_reads;
+	ShaderRecompiler::IR::UniformFill                        reuse_fill {};
+	std::vector<vk::Image>                                   reuse_vulkan_images;
 };
+
+[[nodiscard]] bool BindReuseEnabled() noexcept;
 
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);

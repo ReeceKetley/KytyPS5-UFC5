@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/productionProfile.h"
+#include <bit>
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include "common/alignment.h"
@@ -6,6 +8,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -59,6 +62,11 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
+	ProfileDetailScope allocation_profile("cpu_buffer_allocate", cpu_address, size);
+	// Selected-window identity for native allocation/residency joins. VMA can reuse
+	// a VkDeviceMemory block, so record both the constructor bounds and binding.
+	ProfileCpuScope native_allocation_profile(scheduler, "buffer_native_allocate", cpu_address,
+	                                          size, true);
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
@@ -67,8 +75,14 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.usage       = flags;
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	// Pooled blocks also carry DEVICE_ADDRESS, and the BDA page table adds the in-page offset
+	// to the buffer address, so suballocated BDA buffers need no extra alignment.
+	static const bool bda_suballocate = [] {
+		const char* value = std::getenv("KYTY_BDA_SUBALLOC");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
 	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+	    with_bda && !bda_suballocate ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
@@ -79,9 +93,13 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+	vk::Result        result        = vk::Result::eSuccess;
+	{
+		VramAttributionScope vram(graphics, with_bda ? "buffer_create_bda" : "buffer_create");
+		result = static_cast<vk::Result>(vmaCreateBuffer(
+		    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+		    &allocation_info, &native_buffer, &m_allocation, &allocation_result));
+	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
 	}
@@ -97,15 +115,20 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
+	m_memory_type = allocation_result.memoryType;
+	m_memory_properties = properties;
 	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};
 	}
+	native_allocation_profile.SetIdentity(std::bit_cast<uint64_t>(Handle()), Size());
+	ProfileAllocation("buffer_allocation");
 }
 
 Buffer::~Buffer() {
 	if (m_buffer != nullptr) {
+		VramAttributionScope vram(*m_graphics, "buffer_destroy");
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }
@@ -120,6 +143,7 @@ bool Buffer::IsInBounds(uint64_t address, uint64_t size) const noexcept {
 }
 
 void Buffer::Flush(uint64_t offset, uint64_t size) {
+	ProfileCpuScope profile(Scheduler(), IsCoherent() || size == 0 ? "host_flush_noop" : "host_flush", std::bit_cast<uint64_t>(Handle()), size);
 	EXIT_IF(m_mapped.empty() || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
 		const auto result =
@@ -129,12 +153,34 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 }
 
 void Buffer::Invalidate(uint64_t offset, uint64_t size) {
+	ProfileCpuScope profile(Scheduler(), IsCoherent() || size == 0 ? "host_invalidate_noop" : "host_invalidate", std::bit_cast<uint64_t>(Handle()), size);
 	EXIT_IF(m_usage != MemoryUsage::Download || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
 		const auto result =
 		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
 		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 	}
+}
+
+void Buffer::ProfileAllocation(const char* kind) {
+	if (!Scheduler().ProfileActive()) return;
+	const auto now = ProfileClockNs();
+	Scheduler().ProfileEvent(kind, now, now, std::bit_cast<uint64_t>(Handle()), Size(), std::source_location::current());
+	// Companion metadata row: resource carries VkMemoryPropertyFlags, bytes carries
+	// memoryTypeIndex. Transaction identity associates it with the preceding buffer.
+	Scheduler().ProfileEvent("allocation_memory_properties", now, now, m_memory_properties,
+	    m_memory_type, std::source_location::current());
+	VmaAllocationInfo info {};
+	vmaGetAllocationInfo(Graphics().allocator, m_allocation, &info);
+	// These are Vulkan bindings, not evidence of current physical residency.
+	// Native handles must be joined within their captured creation lifetimes.
+	Scheduler().ProfileEvent("allocation_memory_binding", now, now,
+	    std::bit_cast<uint64_t>(info.deviceMemory), info.offset, std::source_location::current());
+	Scheduler().ProfileEvent("allocation_memory_extent", now, now,
+	    std::bit_cast<uint64_t>(Handle()), info.size, std::source_location::current());
+	Scheduler().ProfileEvent("allocation_host_mapping", now, now,
+	    reinterpret_cast<uint64_t>(info.pMappedData), static_cast<uint64_t>(Usage()),
+	    std::source_location::current());
 }
 
 vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::AccessFlags source,
@@ -178,10 +224,16 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 		before_stage |= vk::PipelineStageFlagBits::eHost;
 	}
 	const auto native = command.Handle();
-	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
+	ProfilePipelineBarrier(native, before_stage, vk::PipelineStageFlagBits::eTransfer,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
+	Scheduler().ProfileBufferUse("gpu_reader_copy", source.CpuAddress() + source_offset, size,
+	    std::bit_cast<uint64_t>(source.Handle()));
+	Scheduler().ProfileBufferUse("gpu_writer_copy_exact", CpuAddress() + destination_offset, size,
+	    std::bit_cast<uint64_t>(Handle()));
+	const auto copy_timer = Scheduler().StartGpuTimer("copy_buffer", Scheduler().GpuFrameHint(), size);
 	native.copyBuffer(source.Handle(), Handle(), 1, &copy);
+	Scheduler().EndGpuTimer(copy_timer);
 	const vk::BufferMemoryBarrier after[] = {
 	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, source_after),
 	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, destination_after),
@@ -190,7 +242,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	if (static_cast<bool>((source_after | destination_after) & host_access)) {
 		after_stage |= vk::PipelineStageFlagBits::eHost;
 	}
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, after_stage,
+	ProfilePipelineBarrier(native, vk::PipelineStageFlagBits::eTransfer, after_stage,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
 }
 
@@ -204,13 +256,15 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 	            vk::AccessFlagBits::eTransferWrite);
 	const auto native = command.Handle();
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	ProfilePipelineBarrier(native, vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr);
+	Scheduler().ProfileBufferUse("gpu_writer_fill_exact", CpuAddress() + offset, size,
+	    std::bit_cast<uint64_t>(Handle()), value);
 	native.fillBuffer(Handle(), offset, size, value);
 	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
 	                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	ProfilePipelineBarrier(native, vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 }
@@ -271,6 +325,7 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	}
 
 	if (wrap) {
+		++m_wrap_epoch;
 		m_invalidation_mark    = invalidation_mark;
 		m_current_watch_cursor = 0;
 		std::swap(m_previous_watches, m_current_watches);

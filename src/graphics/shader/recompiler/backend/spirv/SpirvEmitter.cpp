@@ -7,10 +7,211 @@
 
 #include <algorithm>
 #include <array>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <string>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 namespace {
+
+struct StorageAccessBounds {
+	uint32_t              constant_ops = 0;
+	uint32_t              dynamic_ops  = 0;
+	uint64_t              max_end      = 0;
+	std::set<std::string> dynamic_producers;
+
+	void Note(IR::Value address, uint32_t offset, uint32_t bytes) {
+		address = address.Resolve();
+		if (address.IsImmediate()) {
+			constant_ops++;
+			max_end = std::max(max_end, uint64_t {address.U32()} + offset + bytes);
+			return;
+		}
+		dynamic_ops++;
+		const auto* producer = address.TryInstruction();
+		dynamic_producers.emplace(producer != nullptr
+		                              ? std::string(IR::ValueOpcodeName(producer->GetOpcode()))
+		                              : std::string("?"));
+	}
+
+	[[nodiscard]] std::string Format(const char* name) const {
+		std::string producers;
+		for (const auto& producer: dynamic_producers) {
+			producers += producers.empty() ? "" : "|";
+			producers += producer;
+		}
+		char text[160];
+		std::snprintf(text, sizeof(text), " %s_const=%u %s_dyn=%u %s_max_const_end=%" PRIu64, name,
+		              constant_ops, name, dynamic_ops, name, max_end);
+		return std::string(text) + " " + name + "_dyn_from=" + (producers.empty() ? "-" : producers);
+	}
+};
+
+std::string FormatExpression(IR::Value value, int depth) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		if (value.GetType() != IR::Type::U32) {
+			return "imm";
+		}
+		char text[16];
+		std::snprintf(text, sizeof(text), "0x%x", value.U32());
+		return text;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		return "?";
+	}
+	auto text = std::string(IR::ValueOpcodeName(inst->GetOpcode()));
+	if (inst->NumArgs() == 0) {
+		return text;
+	}
+	if (depth == 0) {
+		return text + "(..)";
+	}
+	text += "(";
+	for (size_t index = 0; index < inst->NumArgs(); index++) {
+		text += index == 0 ? "" : ",";
+		text += FormatExpression(inst->Arg(index), depth - 1);
+	}
+	return text + ")";
+}
+
+// Largest byte address (exclusive of the access) or nullopt when not statically bounded.
+// LaneId is SubgroupLocalInvocationId (+32 for the high half), and subgroup masks cap it at 128.
+std::optional<uint64_t> BoundedLdsAddress(IR::Value address, uint32_t lane_limit) {
+	address = address.Resolve();
+	if (address.IsImmediate()) {
+		return address.GetType() == IR::Type::U32 ? std::optional<uint64_t>(address.U32())
+		                                          : std::nullopt;
+	}
+	const auto* inst = address.TryInstruction();
+	if (inst == nullptr) {
+		return std::nullopt;
+	}
+	if (inst->GetOpcode() == IR::ValueOpcode::LaneId) {
+		return lane_limit - 1u;
+	}
+	if (inst->GetOpcode() == IR::ValueOpcode::ShiftLeftLogical32 && inst->NumArgs() == 2) {
+		const auto shift = inst->Arg(1).Resolve();
+		const auto base  = inst->Arg(0).Resolve();
+		const auto* lane = base.TryInstruction();
+		if (shift.IsImmediate() && shift.GetType() == IR::Type::U32 && shift.U32() < 8u &&
+		    lane != nullptr && lane->GetOpcode() == IR::ValueOpcode::LaneId) {
+			return uint64_t {lane_limit - 1u} << shift.U32();
+		}
+	}
+	return std::nullopt;
+}
+
+// Size per-thread LDS of workgroup-less stages to the proven reach (KYTY_FUNCTION_LDS_BOUND=0
+// restores the fixed 8192-dword array).
+uint32_t ProvenFunctionLdsDwords(const Emitter::EmitterState& state) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FUNCTION_LDS_BOUND");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled || !state.requirements.function_lds ||
+	    ShaderWorkgroupInput(state.program.stage, state.input_info) != nullptr) {
+		return 0;
+	}
+	const uint32_t lane_limit = 128u + (state.lane_count == 2 ? 32u : 0u);
+	uint64_t       max_end    = 0;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			const auto opcode = inst.GetOpcode();
+			const bool address_op =
+			    IR::AddressOpcodeInfoOf(opcode).access != IR::AddressAccess::None;
+			const bool shared_op = IR::SharedAccessOf(opcode) != IR::SharedAccess::None;
+			if (!address_op && !shared_op) {
+				continue;
+			}
+			const auto& mem = state.program.memory_info[inst.Flags<IR::MemoryFlags>().index];
+			if (address_op) {
+				if (mem.kind == IR::ResourceKind::FlatLocal) {
+					return 0;
+				}
+				continue;
+			}
+			if (mem.kind != IR::ResourceKind::Lds) {
+				continue;
+			}
+			if (mem.secondary_offset != 0 || inst.NumArgs() == 0) {
+				return 0;
+			}
+			const auto address = BoundedLdsAddress(inst.Arg(0), lane_limit);
+			if (!address.has_value()) {
+				return 0;
+			}
+			const auto bytes =
+			    std::max({mem.data_dwords, IR::SharedComponentCount(opcode), 4u}) * 4u;
+			max_end = std::max(max_end, *address + mem.offset + bytes);
+		}
+	}
+	const auto dwords = (max_end + 3u) / 4u;
+	return dwords == 0 || dwords >= 8192u ? 0u : static_cast<uint32_t>(dwords);
+}
+
+// KYTY_SHADER_STORAGE_LOG=<path>: per-thread Function-storage sizes and static access bounds.
+void LogFunctionStorage(const Emitter::EmitterState& state) {
+	using Emitter::LdsDwordCount;
+	static const char* path = std::getenv("KYTY_SHADER_STORAGE_LOG");
+	if (path == nullptr || path[0] == '\0' ||
+	    (!state.requirements.function_scratch && !state.requirements.function_lds)) {
+		return;
+	}
+	const auto&         program = state.program;
+	StorageAccessBounds scratch, flat_local, lds;
+	std::string         lds_ops;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto opcode = inst.GetOpcode();
+			if (IR::AddressOpcodeInfoOf(opcode).access != IR::AddressAccess::None) {
+				const auto& mem = program.memory_info[inst.Flags<IR::MemoryFlags>().index];
+				if (mem.kind == IR::ResourceKind::Scratch || mem.kind == IR::ResourceKind::FlatLocal) {
+					auto& bounds = mem.kind == IR::ResourceKind::Scratch ? scratch : flat_local;
+					bounds.Note(inst.Arg(1), mem.offset, mem.data_dwords * 4u);
+				}
+			} else if (IR::SharedAccessOf(opcode) != IR::SharedAccess::None) {
+				const auto& mem = program.memory_info[inst.Flags<IR::MemoryFlags>().index];
+				if (mem.kind == IR::ResourceKind::Lds) {
+					const auto bytes = std::max(mem.data_dwords, IR::SharedComponentCount(opcode)) * 4u;
+					lds.Note(inst.Arg(0), mem.offset, bytes);
+					char head[128];
+					std::snprintf(head, sizeof(head), "  lds_op %s off=%u sec=%u bytes=%u addr=",
+					              std::string(IR::ValueOpcodeName(opcode)).c_str(), mem.offset,
+					              mem.secondary_offset, bytes);
+					lds_ops += head + FormatExpression(inst.Arg(0), 6).substr(0, 1500) + "\n";
+				}
+			}
+		}
+	}
+	const uint32_t scratch_bytes =
+	    state.requirements.function_scratch ? program.scratch_dwords * 4u * state.lane_count : 0u;
+	const uint32_t lds_bytes = state.requirements.function_lds ? LdsDwordCount(state) * 4u : 0u;
+	const auto line = [&]() {
+		char head[256];
+		std::snprintf(head, sizeof(head),
+		              "hash=%016" PRIx64 " stage=%u wave=%u lanes=%u scratch_dwords=%u"
+		              " lds_dwords=%u fn_scratch=%d fn_lds=%d per_thread_bytes=%u",
+		              program.shader_hash, static_cast<unsigned>(program.stage), program.wave_size,
+		              state.lane_count, program.scratch_dwords, LdsDwordCount(state),
+		              state.requirements.function_scratch ? 1 : 0,
+		              state.requirements.function_lds ? 1 : 0, scratch_bytes + lds_bytes);
+		return std::string(head) + scratch.Format("scratch") + flat_local.Format("flat") +
+		       lds.Format("lds") + "\n" + lds_ops;
+	}();
+	static std::mutex           lock;
+	const std::lock_guard guard(lock);
+	if (auto* file = std::fopen(path, "a"); file != nullptr) {
+		std::fputs(line.c_str(), file);
+		std::fclose(file);
+	}
+}
 
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
@@ -342,6 +543,8 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
 	        : 1u;
+	state.function_lds_dwords = ProvenFunctionLdsDwords(state);
+	LogFunctionStorage(state);
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,

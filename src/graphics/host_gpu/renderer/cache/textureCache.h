@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <map>
+#include <memory>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -44,6 +45,8 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	[[nodiscard]] bool TryConsumeColorMetaUniformFill(uint64_t address, uint64_t size,
+	                                                  uint32_t value);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -70,6 +73,7 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	void TickFrame();
 	void RunGarbageCollector();
 
 private:
@@ -140,11 +144,16 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
+	void                        TraceColorMetaFill(uint64_t address, uint64_t size, uint32_t value,
+	                                               bool gpu_path);
+	void                        TraceColorMetaWrite(uint64_t address, uint64_t size,
+	                                                const char* source,
+	                                                uint64_t source_address = 0);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
-	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void UploadImage(ImageId id, Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, ImageDownload transfer);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
@@ -161,6 +170,19 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
+	struct DetileReuseEntry {
+		uint64_t                address     = 0;
+		uint64_t                guest_size  = 0;
+		uint64_t                fingerprint = 0;
+		uint64_t                linear_size = 0;
+		std::unique_ptr<Buffer> buffer;
+	};
+	void ForgetDetileReuse(uint64_t address, uint64_t size);
+	void SweepDetileReuse();
+	[[nodiscard]] TileManager::Result FindDetileReuse(uint64_t address, uint64_t guest_size,
+	                                                  uint64_t fingerprint, uint64_t linear_size);
+	void RetainDetile(uint64_t address, uint64_t guest_size, uint64_t fingerprint,
+	                  TileManager::Result linear);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 
 	GraphicContext&                                   m_graphics;
@@ -183,6 +205,8 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	std::vector<DetileReuseEntry> m_detile_reuse;
+	uint64_t                      m_detile_reuse_bytes = 0;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

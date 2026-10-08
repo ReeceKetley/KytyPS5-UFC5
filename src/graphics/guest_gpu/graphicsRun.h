@@ -65,6 +65,8 @@ private:
 		bool                      command_complete  = false;
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
+		// Requeued because WAIT_REG_MEM was not satisfied. Cleared when the slice is retried.
+		bool                      wait_blocked      = false;
 		uint64_t                  flip_request_id   = 0;
 	};
 

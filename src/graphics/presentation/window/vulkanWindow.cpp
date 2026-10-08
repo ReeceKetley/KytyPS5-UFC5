@@ -1041,7 +1041,17 @@ WindowContext::~WindowContext() {
 	render_context.reset();
 
 	if (graphic_ctx.device != nullptr) {
+		const char* profile_path = std::getenv("KYTY_GPU_TIMING_CSV");
+		const auto wait_begin = profile_path && *profile_path ? ProfileClockNs() : 0;
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
+		if (wait_begin) {
+			const auto wait_end = ProfileClockNs();
+			if (FILE* trace = std::fopen((std::string(profile_path) + ".lifecycle.csv").c_str(), "a")) {
+				std::fprintf(trace, "device_wait_idle,unknown,%llu,%llu,%llu,%u,shutdown:%s:%u\n",
+				    wait_begin, wait_end, ProfileThreadId(), graphic_ctx.queue_family, __FILE__, __LINE__);
+				std::fclose(trace);
+			}
+		}
 		graphic_ctx.DestroyAllocator();
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;

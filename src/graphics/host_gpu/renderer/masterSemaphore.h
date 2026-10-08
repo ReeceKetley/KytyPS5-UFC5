@@ -5,10 +5,12 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
+#include <source_location>
 
 namespace Libs::Graphics {
 
 struct GraphicContext;
+class CommandScheduler;
 
 class MasterSemaphore {
 public:
@@ -29,10 +31,12 @@ public:
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
 
 	void Refresh();
-	void Wait(uint64_t tick);
+	void Wait(uint64_t tick, std::source_location site = std::source_location::current());
+	void SetProfiler(CommandScheduler* scheduler) noexcept { m_profiler = scheduler; }
 
 private:
 	GraphicContext&       m_graphics;
+	CommandScheduler*     m_profiler = nullptr;
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};

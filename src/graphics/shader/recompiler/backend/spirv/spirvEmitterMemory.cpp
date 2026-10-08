@@ -987,12 +987,52 @@ void DefineGetBdaPointer(EmitterState& state) {
 	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
 	                                  ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
 	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
-	const auto entry_pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferU64ElementPointer(state),
-	                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
-	                          page);
-	const auto base = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
+	uint32_t base;
+	if (BufferCache::SparseBdaEnabled()) {
+		const auto root_index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), page,
+		                               ConstantU32(state, BufferCache::BDA_LEAF_BITS));
+		const auto root_pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferU64ElementPointer(state),
+		                          root_pointer, state.bda_pagetable_variable,
+		                          ConstantU32(state, 0), root_index);
+		const auto leaf_base = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, type, leaf_base, root_pointer);
+		const auto leaf_exists = Binary(state, spv::OpINotEqual, TypeBool(state), leaf_base,
+		                                ConstantDeviceAddress(state, 0));
+		const auto leaf_label = state.builder.AllocateId();
+		const auto absent_label = state.builder.AllocateId();
+		const auto leaf_merge = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelectionMerge, leaf_merge,
+		                          spv::SelectionControlMaskNone);
+		state.builder.AddFunction(spv::OpBranchConditional, leaf_exists, leaf_label,
+		                          absent_label);
+		EmitLabel(state, leaf_label);
+		const auto leaf_offset = Binary(state, spv::OpShiftLeftLogical, type,
+		    Unary(state, spv::OpUConvert, type,
+		          Binary(state, spv::OpBitwiseAnd, TypeU32(state), page,
+		                 ConstantU32(state, BufferCache::BDA_LEAF_ENTRIES - 1))),
+		    ConstantDeviceAddress(state, 3));
+		const auto leaf_address = Binary(state, spv::OpIAdd, type, leaf_base, leaf_offset);
+		const auto leaf_pointer = Unary(state, spv::OpConvertUToPtr,
+		                                TypePhysicalU64Pointer(state), leaf_address);
+		const auto leaf_value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, type, leaf_value, leaf_pointer,
+		                          spv::MemoryAccessAlignedMask, 8u);
+		state.builder.AddFunction(spv::OpBranch, leaf_merge);
+		EmitLabel(state, absent_label);
+		state.builder.AddFunction(spv::OpBranch, leaf_merge);
+		EmitLabel(state, leaf_merge);
+		base = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpPhi, type, base, leaf_value, leaf_label,
+		                          ConstantDeviceAddress(state, 0), absent_label);
+	} else {
+		const auto entry_pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferU64ElementPointer(state),
+		                          entry_pointer, state.bda_pagetable_variable,
+		                          ConstantU32(state, 0), page);
+		base = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
+	}
 	const auto missing =
 	    Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantDeviceAddress(state, 0));
 	const auto fault_label     = state.builder.AllocateId();

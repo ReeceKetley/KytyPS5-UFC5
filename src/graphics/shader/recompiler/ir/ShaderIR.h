@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -526,9 +527,32 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
+struct CompiledSrtPlan;
+
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
+	struct FlatSrtRecipe {
+		struct Operand {
+			enum Kind { Reference, Immediate, UserData } kind = Reference;
+			Value reference;
+			uint64_t value = 0; // Literal bits or absolute user-data register.
+			uint32_t memo_index = 0;
+		};
+		std::array<Operand, 5> operands; // low, high, offset, records, word3; original order.
+		int64_t immediate_offset = 0;
+		bool buffer = false, eligible = false;
+	};
+	struct DescriptorGather {
+		struct Word {
+			uint32_t value = 0; // Literal value or absolute user-data register.
+			uint32_t memo_index = 0;
+			bool user_data = false;
+		};
+		std::array<Word, 8> words {};
+		uint32_t dword_count = 0;
+		bool eligible = false;
+	};
 	struct EvaluationContext {
 		struct Entry {
 			uint64_t value      = 0;
@@ -554,6 +578,15 @@ struct ResourcePlan {
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
+	// Built from the immutable extracted sources; stores no runtime descriptor bytes.
+	std::vector<DescriptorGather>       descriptor_gathers;
+	mutable bool descriptor_gather_verified = false;
+	mutable bool descriptor_gather_rejected = false;
+	mutable uint64_t descriptor_gather_full_checks = 0;
+	// Immutable address-read structure only. Runtime bytes/memo generations are never cached here.
+	std::vector<FlatSrtRecipe> flat_srt_recipes;
+	mutable bool flat_srt_verified = false, flat_srt_rejected = false;
+	mutable uint64_t flat_srt_full_checks = 0;
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;
@@ -561,6 +594,11 @@ struct ResourcePlan {
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
+	// Immutable compiled graph, created only when the opt-in experiment requests it.
+	mutable bool compiled_srt_built = false, compiled_srt_verified = false, compiled_srt_rejected = false;
+	mutable uint64_t compiled_srt_full_checks = 0;
+	mutable uint64_t compiled_srt_sequence = 0;
+	mutable std::shared_ptr<const CompiledSrtPlan> compiled_srt;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
@@ -571,6 +609,8 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
+	// ResolveInvariantPhi depends only on the immutable plan, so per-draw evaluation reuses it.
+	mutable std::unordered_map<const Inst*, Value> invariant_phis;
 };
 
 struct Program: ResourcePlan {

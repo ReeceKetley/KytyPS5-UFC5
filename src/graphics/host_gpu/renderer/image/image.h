@@ -45,6 +45,10 @@ struct ImageBinding {
 	bool             shader_write  = false;
 };
 
+[[nodiscard]] bool TightImageUsageEnabled() noexcept;
+void                 SetPendingTightUsage(vk::ImageUsageFlags usage) noexcept;
+[[nodiscard]] uint64_t ImageUsageUpgradeCount() noexcept;
+
 class Image final {
 public:
 	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
@@ -52,6 +56,9 @@ public:
 	KYTY_CLASS_NO_COPY(Image);
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
+	// Sampled images omit storage and color-attachment usage. The first use that
+	// needs either flag rebuilds the Vulkan image and copies contents across.
+	void EnsureUsage(vk::ImageUsageFlags required);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,

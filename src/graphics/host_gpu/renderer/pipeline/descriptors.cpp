@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/productionProfile.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include "common/alignment.h"
@@ -33,10 +34,15 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
 #include <vector>
+#include <xxhash.h>
 
 #ifdef min
 #undef min
@@ -114,9 +120,12 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+	ProfileDetailScope profile("cpu_native_storage_buffer", source.address, source.size);
 	buffer_offset = 0;
 
-	const auto& [address, size, id] = source;
+	const auto address = source.address;
+	const auto size    = source.size;
+	const auto id      = source.id;
 	if (address == 0 || size == 0) {
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
@@ -540,6 +549,11 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
+	ProfileDetailScope profile("cpu_resolve_texture");
+	if (profile.Active()) {
+		ProfileCpuScope fingerprint(*ProfileThread().scheduler, "profile_fingerprint_cpu");
+		profile.SetIdentity(ProfileFingerprint(value.dwords.data(), value.dword_count * sizeof(uint32_t)));
+	}
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -733,6 +747,7 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
                                              std::span<const uint32_t> data) {
+	ProfileDetailScope profile("cpu_binding_native_upload", 0, data.size_bytes());
 	EXIT_IF(data.empty());
 	auto& command_buffer = context.GetCommandScheduler().Current();
 	EXIT_IF(command_buffer.IsInvalid());
@@ -769,12 +784,337 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+namespace {
+
+struct ReuseStats {
+	uint64_t                                  hit            = 0;
+	uint64_t                                  miss_shader    = 0;
+	uint64_t                                  miss_snapshot  = 0;
+	uint64_t                                  miss_buffer    = 0;
+	uint64_t                                  miss_image     = 0;
+	uint64_t                                  miss_stream    = 0;
+	uint64_t                                  demote         = 0;
+	std::chrono::steady_clock::time_point     stamp {};
+};
+
+ReuseStats& BindReuseStats() {
+	static ReuseStats stats;
+	return stats;
+}
+
+void PublishBindReuseStats() {
+	auto&      stats = BindReuseStats();
+	const auto now   = std::chrono::steady_clock::now();
+	if (stats.stamp.time_since_epoch().count() != 0 &&
+	    now - stats.stamp < std::chrono::seconds(2)) {
+		return;
+	}
+	stats.stamp = now;
+	auto* file  = std::fopen("D:/PS5/bind-reuse.txt", "w");
+	if (file == nullptr) {
+		return;
+	}
+	const auto total = stats.hit + stats.miss_shader + stats.miss_snapshot + stats.miss_buffer +
+	                   stats.miss_image + stats.miss_stream;
+	const auto percent = total == 0 ? uint64_t {0} : (stats.hit * 100) / total;
+	std::fprintf(file,
+	             "hit %llu\nmiss_shader %llu\nmiss_snapshot %llu\nmiss_buffer %llu\n"
+	             "miss_image %llu\nmiss_stream %llu\ndemote %llu\nhit_percent %llu\n",
+	             static_cast<unsigned long long>(stats.hit),
+	             static_cast<unsigned long long>(stats.miss_shader),
+	             static_cast<unsigned long long>(stats.miss_snapshot),
+	             static_cast<unsigned long long>(stats.miss_buffer),
+	             static_cast<unsigned long long>(stats.miss_image),
+	             static_cast<unsigned long long>(stats.miss_stream),
+	             static_cast<unsigned long long>(stats.demote),
+	             static_cast<unsigned long long>(percent));
+	std::fclose(file);
+}
+
+bool ViewStillLive(const Image& image, vk::ImageView view) {
+	if (view == nullptr) {
+		return false;
+	}
+	for (const auto& cached: image.views) {
+		if (cached.view == view) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void NoteBindReuseDemote() {
+	BindReuseStats().demote++;
+	PublishBindReuseStats();
+}
+
+} // namespace
+
+bool BindReuseEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* flag   = std::getenv("KYTY_BIND_REUSE");
+		const char* commit = std::getenv("KYTY_DRAW_COMMIT_THREAD");
+		const bool  on     = flag != nullptr && std::strcmp(flag, "1") == 0 &&
+		                !(commit != nullptr && std::strcmp(commit, "1") == 0);
+		if (on) {
+			LOGF("KYTY_BIND_REUSE: reusing identical draw bindings\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+bool RenderExecutor::TryReusePreparedBindings(const ShaderStageRuntime& runtime,
+                                              PreparedBindings& prepared) {
+	const auto& program = *runtime.program;
+	if (program.stage == ShaderType::Compute) {
+		return false;
+	}
+	const bool same_shader = prepared.reuse_valid &&
+	                         prepared.reuse_shader_hash == program.shader_hash &&
+	                         prepared.images.size() == program.info.images.size() &&
+	                         prepared.samplers.size() == program.info.samplers.size() &&
+	                         prepared.buffer_sources.size() == program.bindings.memory_offset_count &&
+	                         prepared.shader_data.size() == program.bindings.ShaderDataDwords() &&
+	                         prepared.reuse_vulkan_images.size() == prepared.images.size();
+	auto& stats = BindReuseStats();
+	if (!same_shader) {
+		stats.miss_shader++;
+		PublishBindReuseStats();
+		return false;
+	}
+	const auto& snapshot = *runtime.resources;
+	if (prepared.reuse_buffers != snapshot.buffers || prepared.reuse_images != snapshot.images ||
+	    prepared.reuse_samplers != snapshot.samplers ||
+	    prepared.reuse_user_data != snapshot.user_data ||
+	    prepared.reuse_flattened_srt != snapshot.flattened_srt ||
+	    prepared.reuse_reads != snapshot.specialization_reads ||
+	    prepared.reuse_fill != snapshot.uniform_fill) {
+		stats.miss_snapshot++;
+		PublishBindReuseStats();
+		return false;
+	}
+	switch (BindReuseBlocker(program, prepared)) {
+		case BindReuseBlock::None:
+			stats.hit++;
+			PublishBindReuseStats();
+			return true;
+		case BindReuseBlock::Buffer: stats.miss_buffer++; break;
+		case BindReuseBlock::Image: stats.miss_image++; break;
+		case BindReuseBlock::Stream: stats.miss_stream++; break;
+	}
+	PublishBindReuseStats();
+	return false;
+}
+
+RenderExecutor::BindReuseBlock
+RenderExecutor::BindReuseBlocker(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                 const PreparedBindings& prepared) {
+	auto& cache = m_context.GetBufferCache();
+	bool  needs_epoch = prepared.flattened_srt.buffer != nullptr ||
+	                   prepared.shader_data_buffer.buffer != nullptr;
+	for (const auto& source: prepared.buffer_sources) {
+		needs_epoch = needs_epoch || source.stream_copy;
+	}
+	if (needs_epoch &&
+	    cache.GetUtilityBuffer(MemoryUsage::Stream).WrapEpoch() != prepared.reuse_stream_epoch) {
+		return BindReuseBlock::Stream;
+	}
+	if (prepared.buffers.size() != prepared.buffer_sources.size()) {
+		return BindReuseBlock::Buffer;
+	}
+	const auto& layout = program.bindings;
+	if (layout.memory_offset_count != 0) {
+		if (layout.descriptors.empty() ||
+		    layout.descriptors.front().resources.size() != prepared.buffer_sources.size()) {
+			return BindReuseBlock::Buffer;
+		}
+		const auto& resources = layout.descriptors.front().resources;
+		for (uint32_t i = 0; i < prepared.buffer_sources.size(); ++i) {
+			const auto& source = prepared.buffer_sources[i];
+			if (source.address == 0 || source.size == 0) {
+				continue;
+			}
+			const auto& info = program.info.buffers[resources[i]];
+			if (info.formatted) {
+				return BindReuseBlock::Buffer;
+			}
+			if (source.stream_copy) {
+				if (info.written || source.size > BufferCache::CACHING_PAGESIZE ||
+				    cache.IsRegionGpuModified(source.address, source.size) ||
+				    !cache.IsRegionCpuModified(source.address, source.size) ||
+				    XXH3_64bits(reinterpret_cast<const void*>(source.address),
+				                static_cast<size_t>(source.size)) != source.content_hash) {
+					return BindReuseBlock::Buffer;
+				}
+				continue;
+			}
+			if (cache.IsRegionCpuModified(source.address, source.size) ||
+			    !cache.BufferCovers(source.id, source.address, source.size)) {
+				return BindReuseBlock::Buffer;
+			}
+		}
+	}
+	auto& textures = m_context.GetTextureCache();
+	for (uint32_t i = 0; i < prepared.images.size(); ++i) {
+		const auto& binding = prepared.images[i];
+		const auto* image   = textures.m_slot_images.try_get(binding.image_id);
+		if (image == nullptr || image->backing.image != prepared.reuse_vulkan_images[i] ||
+		    !ViewStillLive(*image, binding.image_view)) {
+			return BindReuseBlock::Image;
+		}
+		for (const auto view: binding.mip_views) {
+			if (!ViewStillLive(*image, view)) {
+				return BindReuseBlock::Image;
+			}
+		}
+		if (image->info.data.Empty()) {
+			continue;
+		}
+		if (!image->registered || image->depth_id || image->binding.needs_rebind ||
+		    image->IsCpuDirty() || image->IsBufferModified() ||
+		    image->track_addr != image->info.data.address ||
+		    image->track_addr_end != image->info.data.End()) {
+			return BindReuseBlock::Image;
+		}
+		if (image->info.HasStencil()) {
+			const auto& stencil = image->info.stencil;
+			const auto& data    = binding.desc.info.data;
+			if (stencil.size != 0 && data.size != 0 && data.address >= stencil.address &&
+			    data.End() <= stencil.End()) {
+				return BindReuseBlock::Image;
+			}
+		}
+	}
+	return BindReuseBlock::None;
+}
+
+void RenderExecutor::RememberPreparedBindings(PreparedBindings& prepared) {
+	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	const auto& program  = *prepared.runtime->program;
+	const auto& snapshot = *prepared.runtime->resources;
+	auto&       cache    = m_context.GetBufferCache();
+	const auto  stream_handle = cache.GetUtilityBuffer(MemoryUsage::Stream).Handle();
+	for (uint32_t i = 0; i < prepared.buffer_sources.size(); ++i) {
+		auto& source       = prepared.buffer_sources[i];
+		source.stream_copy = source.address != 0 && i < prepared.buffers.size() &&
+		                     prepared.buffers[i].buffer == stream_handle;
+		source.content_hash = 0;
+		if (source.stream_copy) {
+			source.content_hash = XXH3_64bits(reinterpret_cast<const void*>(source.address),
+			                                   static_cast<size_t>(source.size));
+		}
+	}
+	prepared.reuse_vulkan_images.resize(prepared.images.size());
+	auto& textures = m_context.GetTextureCache();
+	for (uint32_t i = 0; i < prepared.images.size(); ++i) {
+		const auto* image = textures.m_slot_images.try_get(prepared.images[i].image_id);
+		if (image == nullptr) {
+			prepared.reuse_valid = false;
+			return;
+		}
+		prepared.reuse_vulkan_images[i] = image->backing.image;
+	}
+	prepared.reuse_shader_hash  = program.shader_hash;
+	prepared.reuse_stream_epoch = cache.GetUtilityBuffer(MemoryUsage::Stream).WrapEpoch();
+	prepared.reuse_buffers      = snapshot.buffers;
+	prepared.reuse_images       = snapshot.images;
+	prepared.reuse_samplers     = snapshot.samplers;
+	prepared.reuse_user_data    = snapshot.user_data;
+	prepared.reuse_flattened_srt = snapshot.flattened_srt;
+	prepared.reuse_reads        = snapshot.specialization_reads;
+	prepared.reuse_fill         = snapshot.uniform_fill;
+	prepared.reuse_valid        = true;
+}
+
+void RenderExecutor::RestoreReusedImages(PreparedBindings& prepared) {
+	auto& textures = m_context.GetTextureCache();
+	for (auto& binding: prepared.images) {
+		auto&      image   = textures.GetImage(binding.image_id);
+		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+		textures.TouchImage(image);
+		image.usage.storage |= storage;
+		image.usage.texture |= !storage;
+		if (!storage) {
+			continue;
+		}
+		if (!image.info.data.Empty()) {
+			textures.CommitGpuWrite(image);
+		} else {
+			image.MarkGpuModified();
+		}
+		textures.TrackImageDownload(binding.image_id, image);
+	}
+}
+
+void RenderExecutor::RestoreReusedBuffers(PreparedBindings& prepared) {
+	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	const auto& program = *prepared.runtime->program;
+	const auto& layout  = program.bindings;
+	if (layout.memory_offset_count == 0) {
+		return;
+	}
+	auto& cache    = m_context.GetBufferCache();
+	auto& textures = m_context.GetTextureCache();
+	const auto& snapshot = *prepared.runtime->resources;
+	for (uint32_t i = 0; i < layout.memory_offset_count; ++i) {
+		const auto  resource = layout.descriptors.front().resources[i];
+		const auto& source   = prepared.buffer_sources[i];
+		const bool  written  = program.info.buffers[resource].written && source.address != 0;
+		if (written) {
+			const bool uniform_fill = program.stage == ShaderType::Compute &&
+			                          snapshot.uniform_fill.kind ==
+			                              ShaderRecompiler::IR::UniformFillKind::Buffer &&
+			                          snapshot.uniform_fill.resource == resource;
+			textures.TraceColorMetaWrite(source.address, source.size,
+			                             uniform_fill ? "compute-uniform-fill"
+			                                          : program.stage == ShaderType::Compute
+			                                                ? "compute-storage"
+			                                                : "graphics-storage",
+			                             program.shader_hash);
+		}
+		if (!source.stream_copy && source.address != 0 &&
+		    !cache.RetainBuffer(source.id, source.address, source.size)) {
+			EXIT("bind reuse lost a buffer\n");
+		}
+		if (written) {
+			textures.InvalidateMemoryFromGPU(source.address, source.size);
+			cache.NoteShaderWrite(source.address, source.size);
+			textures.TraceColorMetaWrite(source.address, source.size, "writable-buffer-bound");
+		}
+	}
+}
+
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
-                                     PreparedBindings& prepared) {
+                                     PreparedBindings& prepared, bool allow_reuse) {
+	ProfileDetailScope profile("cpu_prepare_stage_bindings", runtime.program ? runtime.program->shader_hash : 0);
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
+	prepared.reuse_hit = false;
+	if (allow_reuse && m_bind_reuse_scope && TryReusePreparedBindings(runtime, prepared)) {
+		prepared.runtime   = &runtime;
+		prepared.reuse_hit = true;
+		ProfileDetailEvent("binding_reused", runtime.program->shader_hash);
+		for (const auto& binding: prepared.images) {
+			BindImage(binding.image_id,
+			          binding.desc.type == TextureCache::BindingType::Storage);
+		}
+		return;
+	}
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
+	ProfileDetailEvent("binding_rebuilt", program.shader_hash, program.info.images.size() + program.info.buffers.size());
+	if (profile.Active()) {
+		ProfileCpuScope fingerprint(*ProfileThread().scheduler, "profile_fingerprint_cpu");
+		uint64_t key = program.shader_hash;
+		for (const auto* descriptors: {&snapshot.buffers, &snapshot.images, &snapshot.samplers})
+			for (const auto& descriptor: *descriptors)
+				key = ProfileFingerprint(descriptor.dwords.data(), descriptor.dword_count * sizeof(uint32_t), key);
+		key = ProfileFingerprint(snapshot.user_data.data(), snapshot.user_data.size() * sizeof(uint32_t), key);
+		key = ProfileFingerprint(snapshot.flattened_srt.data(), snapshot.flattened_srt.size() * sizeof(uint32_t), key);
+		profile.SetIdentity(key, program.info.images.size() + program.info.buffers.size());
+	}
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
@@ -806,6 +1146,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 }
 
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+	ProfileDetailScope profile("cpu_binding_find_buffers", prepared.runtime ? prepared.runtime->program->shader_hash : 0);
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
@@ -833,6 +1174,7 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
+	ProfileDetailScope profile("cpu_binding_rebind_buffers", prepared.runtime ? prepared.runtime->program->shader_hash : 0);
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program   = *prepared.runtime->program;
@@ -852,6 +1194,19 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	};
 	for (uint32_t i = 0; i < layout.memory_offset_count; i++) {
 		const auto resource = layout.descriptors.front().resources[i];
+		const auto& source = prepared.buffer_sources[i];
+		if (program.info.buffers[resource].written && source.address != 0) {
+			const bool uniform_fill = program.stage == ShaderType::Compute &&
+			                          snapshot.uniform_fill.kind ==
+			                              ShaderRecompiler::IR::UniformFillKind::Buffer &&
+			                          snapshot.uniform_fill.resource == resource;
+			m_context.GetTextureCache().TraceColorMetaWrite(
+			    source.address, source.size,
+			    uniform_fill ? "compute-uniform-fill"
+			                 : program.stage == ShaderType::Compute ? "compute-storage"
+			                                                         : "graphics-storage",
+			    program.shader_hash);
+		}
 		uint32_t buffer_offset = 0;
 		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
 		                                               program.info.buffers[resource],
@@ -869,6 +1224,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 }
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
+	ProfileDetailScope profile("cpu_binding_rebind_images", prepared.runtime ? prepared.runtime->program->shader_hash : 0);
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
@@ -917,16 +1273,21 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
+	ProfileDetailScope profile("cpu_prepare_graphics_bindings", 0, stages.size());
 	bool uses_dma = false;
 	for (auto* stage: stages) {
-		FindBuffers(*stage);
+		if (!stage->reuse_hit) {
+			FindBuffers(*stage);
+		}
 		uses_dma |= stage->runtime->program->info.uses_dma;
 	}
 	if (uses_dma) {
 		m_context.PrepareBda();
 	}
 	for (auto* stage: stages) {
-		RebindImages(*stage);
+		if (!stage->reuse_hit) {
+			RebindImages(*stage);
+		}
 	}
 	auto& cache = m_context.GetTextureCache();
 	for (auto& target: colors) {
@@ -943,10 +1304,59 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			BindRenderTarget(target.image_id);
 		}
 	}
+	if (m_bind_reuse_scope) {
+		for (auto* stage: stages) {
+			if (stage->reuse_hit &&
+			    BindReuseBlocker(*stage->runtime->program, *stage) != BindReuseBlock::None) {
+				stage->reuse_hit = false;
+				NoteBindReuseDemote();
+				PrepareBindings(*stage->runtime, *stage, false);
+				FindBuffers(*stage);
+				RebindImages(*stage);
+			}
+		}
+	}
+	for (auto* stage: stages) {
+		if (stage->reuse_hit) {
+			RestoreReusedImages(*stage);
+		}
+	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
 	for (auto* stage: stages) {
-		RebindBuffers(*stage);
+		if (stage->reuse_hit) {
+			RestoreReusedBuffers(*stage);
+		} else {
+			RebindBuffers(*stage);
+		}
+	}
+	if (BindReuseEnabled()) {
+		for (auto* stage: stages) {
+			if (!stage->reuse_hit) {
+				RememberPreparedBindings(*stage);
+			}
+			stage->reuse_hit = false;
+		}
+	}
+}
+
+void RenderExecutor::ProfilePreparedBufferUses(std::span<PreparedBindings* const> bindings,
+                                              const char* operation, uint64_t guest_submit) {
+	auto& scheduler = m_context.GetCommandScheduler();
+	if (!scheduler.ProfileLifetime()) return;
+	const bool compute = std::strcmp(operation, "compute") == 0;
+	for (const auto* prepared: bindings) {
+		const auto& program = *prepared->runtime->program;
+		if (program.has_address_writes) scheduler.ProfileUnknownWriter(program.shader_hash, guest_submit);
+		for (uint32_t i = 0; i < prepared->buffer_sources.size(); ++i) {
+			const auto& source = prepared->buffer_sources[i];
+			const auto resource = program.bindings.descriptors.front().resources[i];
+			const bool written = program.info.buffers[resource].written;
+			const auto handle = i < prepared->buffers.size() ? std::bit_cast<uint64_t>(prepared->buffers[i].buffer) : 0;
+			scheduler.ProfileBufferUse(written ? compute ? "gpu_writer_compute_declared" : "gpu_writer_graphics_declared"
+			                                  : compute ? "gpu_reader_compute" : "gpu_reader_graphics",
+			    source.address, source.size, handle, program.shader_hash, guest_submit);
+		}
 	}
 }
 
@@ -954,6 +1364,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
+	ProfileDetailScope profile("cpu_commit_descriptors", 0, prepared_bindings.size());
 	KYTY_PROFILER_FUNCTION();
 	auto   vk_buffer        = buffer.Handle();
 	size_t descriptor_count = 0;
@@ -1031,7 +1442,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		if (descriptors.gds.buffer != nullptr) {
 			buffer.EndRendering();
 			const auto barrier = MakeGdsDependency(descriptors.gds.buffer);
-			vk_buffer.pipelineBarrier(
+			ProfilePipelineBarrier(vk_buffer,
 			    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
 			        vk::PipelineStageFlagBits::eAllGraphics |
 			        vk::PipelineStageFlagBits::eComputeShader,

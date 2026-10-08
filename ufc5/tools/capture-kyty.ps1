@@ -29,7 +29,8 @@ namespace KytyCapture {
 "@
 }
 
-$proc = Get-Process kyty_emulator -ErrorAction SilentlyContinue | Select-Object -First 1
+$proc = Get-Process -Name 'kyty_emulator*' -ErrorAction SilentlyContinue |
+    Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
 if (-not $proc) { throw 'kyty_emulator is not running' }
 $hwnd = $proc.MainWindowHandle
 if ($hwnd -eq [IntPtr]::Zero) { throw 'kyty_emulator has no main window' }

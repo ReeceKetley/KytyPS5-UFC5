@@ -1,4 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/flatSrtControl.h"
+#include "graphics/host_gpu/renderer/pipeline/compiledSrtExperiment.h"
+#include "graphics/host_gpu/renderer/productionProfile.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -11,6 +14,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -23,6 +27,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -33,11 +39,444 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <unordered_set>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
 
 namespace {
+
+// Bounded UFC5 descriptor experiment. No renderer policy, guest reads or Vulkan
+// work is removed; only immutable, pure descriptor words are evaluated directly.
+template <bool Flat>
+bool MaterializeEvaluationExperiment(const ShaderRecompiler::IR::ResourcePlan& plan,
+                                     const ShaderRecompiler::IR::SrtRuntime& runtime,
+                                     ShaderRecompiler::IR::ResourceSnapshot& resources,
+                                     ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	using namespace ShaderRecompiler::IR;
+	static const uint64_t target = [] {
+		const auto* hash = std::getenv(Flat ? "KYTY_FLAT_SRT_SHADER" : "KYTY_DESCRIPTOR_GATHER_SHADER");
+		return hash ? std::strtoull(hash, nullptr, 16) : 0xd3dcf81c43080fd0ull;
+	}();
+	static const bool configured = std::getenv(Flat ? "KYTY_FLAT_SRT_CONTROL_FILE" : "KYTY_DESCRIPTOR_GATHER_CONTROL_FILE") != nullptr;
+	if (!configured || plan.shader_hash != target) {
+		if constexpr (Flat) return MaterializeEvaluationExperiment<false>(plan, runtime, resources, specialization);
+		else return MaterializeResources(plan, runtime, resources, specialization);
+	}
+	struct Control {
+		std::string path = std::getenv(Flat ? "KYTY_FLAT_SRT_CONTROL_FILE" : "KYTY_DESCRIPTOR_GATHER_CONTROL_FILE");
+		DescriptorEvaluationMode mode = DescriptorEvaluationMode::Off;
+		DescriptorEvaluationStats stats;
+		FlatSrtEvaluationStats flat_stats;
+		uint64_t materializations = 0, fast = 0, blocked = 0, cpu_ns = 0, sequence = 0;
+		bool failed = false;
+		uint64_t window_start = ProfileClockNs(), next_poll = 0, next_report = 0;
+		FILE* csv = [] {
+			const auto* path = std::getenv(Flat ? "KYTY_FLAT_SRT_CSV" : "KYTY_DESCRIPTOR_GATHER_CSV");
+			FILE* file = path ? std::fopen(path, "a") : nullptr;
+			if (file && std::ftell(file) == 0) {
+				std::fprintf(file, "host_ns,thread,shader,mode,window_ms,materializations,fast_materializations,blocked_materializations,cpu_ms,descriptor_calls,eligible_calls,fallback_calls,eligible_words,descriptor_checks,descriptor_mismatches,full_checks,full_mismatches,raw_calls,raw_eligible,raw_fallback,recipe_evaluations,user_data_evaluations,memo_hits,reference_shadow_ms,candidate_shadow_ms\n");
+				std::fflush(file);
+			}
+			return file;
+		}();
+		const char* Name() const {
+			return mode == DescriptorEvaluationMode::Off ? "off" :
+			       mode == DescriptorEvaluationMode::Shadow ? "shadow" : "on";
+		}
+		void Report(uint64_t now) {
+			if (csv && materializations) {
+				std::fprintf(csv, "%llu,%llu,0x%016llx,%s,%.3f,%llu,%llu,%llu,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f\n",
+				    static_cast<unsigned long long>(now), static_cast<unsigned long long>(ProfileThreadId()),
+				    static_cast<unsigned long long>(target), Name(), (now-window_start)/1e6,
+				    static_cast<unsigned long long>(materializations), static_cast<unsigned long long>(fast),
+				    static_cast<unsigned long long>(blocked), cpu_ns/1e6,
+				    static_cast<unsigned long long>(stats.calls), static_cast<unsigned long long>(stats.eligible),
+				    static_cast<unsigned long long>(stats.fallback), static_cast<unsigned long long>(stats.words),
+				    static_cast<unsigned long long>(stats.descriptor_checks), static_cast<unsigned long long>(stats.descriptor_mismatches),
+				    static_cast<unsigned long long>(Flat ? flat_stats.full_checks : stats.full_checks),
+				    static_cast<unsigned long long>(Flat ? flat_stats.full_mismatches : stats.full_mismatches),
+				    static_cast<unsigned long long>(flat_stats.raw_calls), static_cast<unsigned long long>(flat_stats.eligible),
+				    static_cast<unsigned long long>(flat_stats.fallback), static_cast<unsigned long long>(flat_stats.recipe_evaluations),
+				    static_cast<unsigned long long>(flat_stats.user_data_evaluations), static_cast<unsigned long long>(flat_stats.memo_hits),
+				    flat_stats.reference_ns / 1e6, flat_stats.candidate_ns / 1e6);
+				std::fflush(csv);
+			}
+			stats = {};
+			flat_stats = {};
+			materializations = fast = blocked = cpu_ns = 0;
+			window_start = now;
+			next_report = now + 2'000'000'000ull;
+		}
+		~Control() { Report(ProfileClockNs()); if (csv) std::fclose(csv); }
+	};
+	static thread_local Control control;
+	const auto now = ProfileClockNs();
+	if (now >= control.next_poll) {
+		control.next_poll = now + 500'000'000ull;
+		if (FILE* file = std::fopen(control.path.c_str(), "r")) {
+			char text[32] {};
+			if (std::fgets(text, sizeof(text), file)) {
+				auto requested = control.mode;
+				if (std::strncmp(text, "off", 3) == 0) requested = DescriptorEvaluationMode::Off;
+				else if (std::strncmp(text, "shadow", 6) == 0) requested = DescriptorEvaluationMode::Shadow;
+				else if (std::strncmp(text, "on", 2) == 0) requested = DescriptorEvaluationMode::Fast;
+				if (control.failed) requested = DescriptorEvaluationMode::Off;
+				if (requested != control.mode) {
+					control.Report(now);
+					control.mode = requested;
+					std::fprintf(stderr, "[%s] mode=%s shader=0x%016llx thread=%llu\n", Flat ? "flat-srt" : "descriptor-gather", control.Name(),
+					    static_cast<unsigned long long>(target), static_cast<unsigned long long>(ProfileThreadId()));
+					std::fflush(stderr);
+				}
+			}
+			std::fclose(file);
+		}
+	}
+	if (now >= control.next_report) control.Report(now);
+	++control.materializations;
+	++control.sequence;
+	const auto begin = ProfileClockNs();
+	bool result;
+	if (control.mode == DescriptorEvaluationMode::Shadow && !control.failed &&
+	    ((Flat ? plan.flat_srt_full_checks : plan.descriptor_gather_full_checks) == 0 || (control.sequence & 63u) == 0)) {
+		if constexpr (Flat) result = ShadowFlatSrtMaterializeResources(plan, runtime, resources, specialization, control.flat_stats);
+		else result = ShadowMaterializeResources(plan, runtime, resources, specialization, control.stats);
+	} else {
+		auto mode = control.mode;
+		if (mode == DescriptorEvaluationMode::Fast && (!(Flat ? plan.flat_srt_verified : plan.descriptor_gather_verified) || control.failed)) {
+			mode = DescriptorEvaluationMode::Off;
+			++control.blocked;
+		}
+		if (mode == DescriptorEvaluationMode::Fast) ++control.fast;
+		if constexpr (Flat) {
+			auto candidate_runtime = runtime;
+			candidate_runtime.compiled_flat_srt = mode == DescriptorEvaluationMode::Fast;
+			candidate_runtime.flat_srt_stats = &control.flat_stats;
+			result = MaterializeResources(plan, candidate_runtime, resources, specialization);
+		} else result = MaterializeResources(plan, runtime, resources, specialization, mode, &control.stats);
+	}
+	control.cpu_ns += ProfileClockNs() - begin;
+	if ((Flat ? plan.flat_srt_rejected : plan.descriptor_gather_rejected) && !control.failed) {
+		control.failed = true;
+		std::fprintf(stderr, "[%s] MISMATCH: experiment rejected; reverting to reference\n", Flat ? "flat-srt" : "descriptor-gather");
+		std::fflush(stderr);
+		control.Report(ProfileClockNs());
+		control.mode = DescriptorEvaluationMode::Off;
+	}
+	return result;
+}
+
+bool MaterializeDescriptorExperiment(const ShaderRecompiler::IR::ResourcePlan& plan,
+                                     const ShaderRecompiler::IR::SrtRuntime& runtime,
+                                     ShaderRecompiler::IR::ResourceSnapshot& resources,
+                                     ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	using namespace ShaderRecompiler::IR;
+	// Route to the compiled evaluator whenever it is configured OR running on its default-on
+	// setting; otherwise MaterializeCompiledSrtExperiment would never be reached (DEC-0004).
+	static const bool compiled_configured =
+	    std::getenv("KYTY_COMPILED_SRT_CONTROL_FILE") != nullptr || CompiledSrtDefaultEnabled();
+	if (compiled_configured) return MaterializeCompiledSrtExperiment(plan, runtime, resources, specialization);
+	static const auto* configured = std::getenv("KYTY_FLAT_SRT_CONTROL_FILE");
+	if (!configured) return MaterializeEvaluationExperiment<false>(plan, runtime, resources, specialization);
+	static std::atomic<bool> rejected = false;
+	struct Control {
+		struct Aggregate {
+			FlatSrtEvaluationStats stats;
+			uint64_t calls=0, fast=0, blocked=0, compared=0, reference=0, no_recipe=0;
+			uint64_t cpu=0, fast_cpu=0, reference_cpu=0, shadow_cpu=0, fast_recipes=0;
+		};
+		std::unordered_map<uint64_t, Aggregate> shaders;
+		std::unordered_map<const ResourcePlan*, uint64_t> sequences;
+		std::string path = configured;
+		DescriptorEvaluationMode mode = DescriptorEvaluationMode::Off;
+		bool all = false;
+		uint64_t target = 0xd3dcf81c43080fd0ull;
+		uint64_t window_start=ProfileClockNs(), next_poll=0, next_report=0;
+		FILE* csv=nullptr;
+		Control() {
+			if (const char* setting=std::getenv("KYTY_FLAT_SRT_SHADER")) {
+				all=std::strcmp(setting,"all")==0;
+				if (!all) target=std::strtoull(setting,nullptr,16);
+			}
+			if (const char* output=std::getenv("KYTY_FLAT_SRT_CSV")) csv=std::fopen(output,"a");
+			if (csv && std::ftell(csv)==0) {
+				std::fprintf(csv,"host_ns,thread,shader,mode,window_ms,materializations,fast_materializations,blocked_materializations,cpu_ms,descriptor_calls,eligible_calls,fallback_calls,eligible_words,descriptor_checks,descriptor_mismatches,full_checks,full_mismatches,raw_calls,raw_eligible,raw_fallback,recipe_evaluations,user_data_evaluations,memo_hits,reference_shadow_ms,candidate_shadow_ms,record_kind,scope,shadow_materializations,reference_materializations,no_recipe_materializations,fast_cpu_ms,reference_cpu_ms,shadow_cpu_ms,fast_recipe_evaluations\n");
+				std::fflush(csv);
+			}
+		}
+		const char* Name() const { return mode==DescriptorEvaluationMode::Off ? "off" : mode==DescriptorEvaluationMode::Shadow ? "shadow" : "on"; }
+		void Row(uint64_t now, const std::string& shader, const char* kind, const Aggregate& a) {
+			if (!csv) return;
+			const auto scope=all ? std::string("all") : fmt::format("{:016x}",target);
+			std::fprintf(csv,"%llu,%llu,%s,%s,%.3f,%llu,%llu,%llu,%.6f,0,0,0,0,0,0,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%s,%s,%llu,%llu,%llu,%.6f,%.6f,%.6f,%llu\n",
+			    static_cast<unsigned long long>(now),static_cast<unsigned long long>(ProfileThreadId()),shader.c_str(),Name(),(now-window_start)/1e6,
+			    static_cast<unsigned long long>(a.calls),static_cast<unsigned long long>(a.fast),static_cast<unsigned long long>(a.blocked),a.cpu/1e6,
+			    static_cast<unsigned long long>(a.stats.full_checks),static_cast<unsigned long long>(a.stats.full_mismatches),
+			    static_cast<unsigned long long>(a.stats.raw_calls),static_cast<unsigned long long>(a.stats.eligible),static_cast<unsigned long long>(a.stats.fallback),
+			    static_cast<unsigned long long>(a.stats.recipe_evaluations),static_cast<unsigned long long>(a.stats.user_data_evaluations),static_cast<unsigned long long>(a.stats.memo_hits),
+			    a.stats.reference_ns/1e6,a.stats.candidate_ns/1e6,kind,scope.c_str(),
+			    static_cast<unsigned long long>(a.compared),static_cast<unsigned long long>(a.reference),static_cast<unsigned long long>(a.no_recipe),
+			    a.fast_cpu/1e6,a.reference_cpu/1e6,a.shadow_cpu/1e6,static_cast<unsigned long long>(a.fast_recipes));
+		}
+		void Report(uint64_t now) {
+			Aggregate total;
+			for (const auto& [hash,a]:shaders) {
+				Row(now,fmt::format("0x{:016x}",hash),"shader",a);
+#define SUM_FIELD(field) total.field+=a.field
+				SUM_FIELD(calls); SUM_FIELD(fast); SUM_FIELD(blocked); SUM_FIELD(compared); SUM_FIELD(reference); SUM_FIELD(no_recipe);
+				SUM_FIELD(cpu); SUM_FIELD(fast_cpu); SUM_FIELD(reference_cpu); SUM_FIELD(shadow_cpu); SUM_FIELD(fast_recipes);
+				SUM_FIELD(stats.raw_calls); SUM_FIELD(stats.eligible); SUM_FIELD(stats.fallback); SUM_FIELD(stats.recipe_evaluations);
+				SUM_FIELD(stats.user_data_evaluations); SUM_FIELD(stats.memo_hits); SUM_FIELD(stats.full_checks); SUM_FIELD(stats.full_mismatches);
+				SUM_FIELD(stats.reference_ns); SUM_FIELD(stats.candidate_ns);
+#undef SUM_FIELD
+			}
+			if (total.calls) Row(now,"all","summary",total);
+			if (csv) std::fflush(csv);
+			shaders.clear(); window_start=now; next_report=now+2'000'000'000ull;
+		}
+		~Control() { Report(ProfileClockNs()); if (csv) std::fclose(csv); }
+	};
+	static thread_local Control control;
+	const auto now=ProfileClockNs();
+	if (now>=control.next_poll) {
+		control.next_poll=now+500'000'000ull;
+		if (FILE* file=std::fopen(control.path.c_str(),"r")) {
+			char text[96]{}, mode_text[16]{}, scope_text[32]{};
+			if (std::fgets(text,sizeof(text),file)) {
+				const int count=std::sscanf(text,"%15s %31s",mode_text,scope_text);
+				auto requested=control.mode; bool valid=count>=1;
+				if (std::strcmp(mode_text,"off")==0) requested=DescriptorEvaluationMode::Off;
+				else if (std::strcmp(mode_text,"shadow")==0) requested=DescriptorEvaluationMode::Shadow;
+				else if (std::strcmp(mode_text,"on")==0) requested=DescriptorEvaluationMode::Fast;
+				else valid=false;
+				bool all=control.all; auto target=control.target;
+				if (count==2) {
+					all=std::strcmp(scope_text,"all")==0;
+					if (!all) {
+						valid &= std::strlen(scope_text)==16 && std::all_of(scope_text,scope_text+std::strlen(scope_text),[](unsigned char c){return std::isxdigit(c)!=0;});
+						if (valid) target=std::strtoull(scope_text,nullptr,16);
+					}
+				}
+				if (rejected.load(std::memory_order_relaxed)) requested=DescriptorEvaluationMode::Off;
+				if (valid && (requested!=control.mode || all!=control.all || (!all && target!=control.target))) {
+					control.Report(now); control.mode=requested; control.all=all; control.target=target;
+					std::fprintf(stderr,"[flat-srt] mode=%s scope=%s thread=%llu\n",control.Name(),all ? "all" : fmt::format("{:016x}",target).c_str(),static_cast<unsigned long long>(ProfileThreadId()));
+					std::fflush(stderr);
+				}
+			}
+			std::fclose(file);
+		}
+	}
+	if (now>=control.next_report) control.Report(now);
+	if (!control.all && plan.shader_hash!=control.target)
+		return MaterializeEvaluationExperiment<false>(plan,runtime,resources,specialization);
+	auto& a=control.shaders[plan.shader_hash]; ++a.calls;
+	const bool has_recipes=!plan.flat_srt_recipes.empty();
+	if (!has_recipes) ++a.no_recipe;
+	uint64_t sequence=0;
+	if (control.mode!=DescriptorEvaluationMode::Off) sequence=++control.sequences[&plan];
+	const auto action=ChooseFlatSrtAction(control.mode,has_recipes,plan.flat_srt_verified,plan.flat_srt_full_checks,sequence,
+	    rejected.load(std::memory_order_relaxed) || plan.flat_srt_rejected);
+	const auto recipes_before=a.stats.recipe_evaluations;
+	const auto begin=ProfileClockNs();
+	bool result;
+	if (action==FlatSrtAction::Compare) {
+		++a.compared;
+		result=ShadowFlatSrtMaterializeResources(plan,runtime,resources,specialization,a.stats);
+	} else {
+		auto selected=runtime;
+		selected.compiled_flat_srt=action==FlatSrtAction::Candidate;
+		selected.flat_srt_stats=&a.stats;
+		if (selected.compiled_flat_srt) ++a.fast;
+		else { ++a.reference; if (control.mode==DescriptorEvaluationMode::Fast) ++a.blocked; }
+		result=MaterializeResources(plan,selected,resources,specialization);
+	}
+	const auto elapsed=ProfileClockNs()-begin; a.cpu+=elapsed;
+	if (action==FlatSrtAction::Compare) a.shadow_cpu+=elapsed;
+	else if (action==FlatSrtAction::Candidate) { a.fast_cpu+=elapsed; a.fast_recipes+=a.stats.recipe_evaluations-recipes_before; }
+	else a.reference_cpu+=elapsed;
+	if (plan.flat_srt_rejected && !rejected.exchange(true,std::memory_order_relaxed)) {
+		std::fprintf(stderr,"[flat-srt] MISMATCH shader=0x%016llx; disabling all scopes\n",static_cast<unsigned long long>(plan.shader_hash));
+		std::fflush(stderr); control.Report(ProfileClockNs()); control.mode=DescriptorEvaluationMode::Off;
+	}
+	return result;
+}
+
+bool MaterializeDiagnosticWindow(const ShaderRecompiler::IR::ResourcePlan& plan,
+                                 const ShaderRecompiler::IR::SrtRuntime& runtime,
+                                 ShaderRecompiler::IR::ResourceSnapshot& resources,
+                                 ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	using namespace ShaderRecompiler::IR;
+	static const auto* control_path = std::getenv("KYTY_MATERIALIZER_PROFILE_CONTROL_FILE");
+	if (!control_path) return MaterializeDescriptorExperiment(plan, runtime, resources, specialization);
+	struct Window {
+		struct Aggregate { uint64_t calls = 0, samples = 0, cpu = 0, sampled_cpu = 0; SrtEvaluationProfile detail; };
+		std::unordered_map<uint64_t, Aggregate> shaders;
+		std::unordered_set<const ResourcePlan*> described;
+		uint64_t sequence = 0, next_poll = 0, until = 0, next_report = 0, start = 0;
+		FILE* csv = [] {
+			const auto* path = std::getenv("KYTY_MATERIALIZER_PROFILE_CSV");
+			FILE* f = path ? std::fopen(path, "a+") : nullptr;
+			if (f) {
+				std::fseek(f, 0, SEEK_END);
+				if (std::ftell(f) == 0) std::fprintf(f, "kind,host_ns,thread,shader,plan,calls,samples,cpu_ns,phase,opcode,words,hits,misses,failures,source,dword,metadata\n");
+				std::fflush(f);
+			}
+			return f;
+		}();
+		void Report(uint64_t now, const char* kind = "aggregate") {
+			if (csv) {
+				static constexpr const char* phases[] = {"flat_srt","uniform_fill","buffers","images","samplers","specialization"};
+				for (const auto& [shader, a] : shaders) {
+					std::fprintf(csv, "%s,%llu,%llu,0x%016llx,0,%llu,%llu,%llu,,,0,0,0,0,0,0,window_start=%llu;sample_cpu_ns=%llu;sample_every=32\n",
+					    kind, now, ProfileThreadId(), shader, a.calls, a.samples, a.cpu, start, a.sampled_cpu);
+					for (size_t p = 0; p < a.detail.phases.size(); ++p)
+						std::fprintf(csv, "phase,%llu,%llu,0x%016llx,0,0,%llu,%llu,%s,,0,0,0,0,0,0,\n",
+						    now, ProfileThreadId(), shader, a.samples, a.detail.phases[p], phases[p]);
+					for (size_t op = 0; op < a.detail.opcodes.size(); ++op) {
+						const auto& o = a.detail.opcodes[op];
+						if (!o.visits && !o.words) continue;
+						const auto name = op == static_cast<size_t>(ValueOpcode::Count) ? std::string_view("immediate") : ValueOpcodeName(static_cast<ValueOpcode>(op));
+						std::fprintf(csv, "opcode,%llu,%llu,0x%016llx,0,%llu,%llu,%llu,,%.*s,%llu,%llu,%llu,%llu,0,0,\n",
+						    now, ProfileThreadId(), shader, o.visits, a.samples, o.word_ns, static_cast<int>(name.size()), name.data(),
+						    o.words, o.hits, o.misses, o.failures);
+					}
+				}
+				std::fprintf(csv, "marker,%llu,%llu,0,0,0,0,0,,,0,0,0,0,0,0,%s\n", now, ProfileThreadId(), kind);
+				std::fflush(csv);
+			}
+			shaders.clear(); start = now; next_report = now + 2'000'000'000ull;
+		}
+		void Describe(const ResourcePlan& p, uint64_t now) {
+			if (!csv || !described.insert(&p).second) return;
+			for (size_t source = 0; source < p.descriptor_sources.size(); ++source) {
+				const auto& desc = p.descriptor_sources[source];
+				for (size_t word = 0; word < desc.dword_count; ++word) {
+					const auto root = desc.dwords[word].Resolve();
+					const auto* inst = root.TryInstruction();
+					const auto root_name = inst ? std::string(ValueOpcodeName(inst->GetOpcode())) : "immediate_" + TypeName(root.GetType());
+					std::unordered_map<std::string, size_t> dependencies;
+					std::unordered_set<const Inst*> seen;
+					std::vector<Value> pending {root};
+					bool bounded = true;
+					while (!pending.empty()) {
+						const auto value = pending.back().Resolve(); pending.pop_back();
+						const auto* node = value.TryInstruction();
+						if (!node || !seen.insert(node).second) continue;
+						if (seen.size() > 2048) { bounded = false; break; }
+						++dependencies[std::string(ValueOpcodeName(node->GetOpcode()))];
+						for (size_t i = 0; i < node->NumArgs(); ++i) pending.push_back(node->Arg(i));
+						if (node->GetOpcode() == ValueOpcode::ReadConst && node->NumArgs() == 2) {
+							const auto slot = node->Arg(1).Resolve();
+							if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < p.srt_reads.size())
+								pending.push_back(p.srt_reads[slot.U32()].value);
+						}
+					}
+					std::string metadata = fmt::format("pure_word={};complete_gather={};bounded={};dependencies=",
+					    (root.IsImmediate() && root.GetType() == Type::U32) || (inst && inst->GetOpcode() == ValueOpcode::GetUserData),
+					    source < p.descriptor_gathers.size() && p.descriptor_gathers[source].eligible, bounded);
+					for (const auto& [op, n] : dependencies) metadata += fmt::format("{}:{}|", op, n);
+					std::fprintf(csv, "graph,%llu,%llu,0x%016llx,0x%llx,0,0,0,,%s,0,0,0,0,%zu,%zu,%s\n",
+					    now, ProfileThreadId(), p.shader_hash, reinterpret_cast<uintptr_t>(&p), root_name.c_str(), source, word, metadata.c_str());
+				}
+			}
+		}
+		~Window() { Report(ProfileClockNs(), "shutdown"); if (csv) std::fclose(csv); }
+	};
+	static thread_local Window window;
+	const auto now = ProfileClockNs();
+	std::optional<ProfileCpuScope> diagnostic;
+	const auto diagnostic_scope = [&] { if (auto* s = ProfileThread().scheduler) diagnostic.emplace(*s, "profile_materializer_diagnostic_cpu"); };
+	if (now >= window.next_poll) {
+		diagnostic_scope();
+		window.next_poll = now + 500'000'000ull;
+		if (FILE* f = std::fopen(control_path, "r")) {
+			char text[16] {}; const bool arm = std::fgets(text, sizeof(text), f) && std::strncmp(text, "on", 2) == 0;
+			std::fclose(f);
+			if (arm && window.csv) {
+				window.Report(now, "arm");
+				const auto* seconds = std::getenv("KYTY_MATERIALIZER_PROFILE_SECONDS");
+				const auto duration = seconds ? std::clamp(std::atoi(seconds), 1, 120) : 20;
+				window.until = now + duration * 1'000'000'000ull;
+				if (FILE* consume = std::fopen(control_path, "w")) { std::fputs("off\n", consume); std::fclose(consume); }
+				std::fprintf(stderr, "[materializer-profile] reference window armed for %d seconds\n", duration);
+				std::fflush(stderr);
+			}
+		}
+		diagnostic.reset();
+	}
+	if (!window.until) return MaterializeDescriptorExperiment(plan, runtime, resources, specialization);
+	if (now >= window.until) {
+		diagnostic_scope(); window.Report(now, "complete"); window.until = 0; diagnostic.reset();
+		return MaterializeDescriptorExperiment(plan, runtime, resources, specialization);
+	}
+	diagnostic_scope();
+	if (now >= window.next_report) window.Report(now);
+	uint64_t choice = (++window.sequence) + 0x9e3779b97f4a7c15ull;
+	choice = (choice ^ (choice >> 30)) * 0xbf58476d1ce4e5b9ull;
+	choice = (choice ^ (choice >> 27)) * 0x94d049bb133111ebull;
+	const bool sample = ((choice ^ (choice >> 31)) & 31u) == 0;
+	if (sample) window.Describe(plan, now);
+	auto& aggregate = window.shaders[plan.shader_hash];
+	++aggregate.calls;
+	std::optional<SrtEvaluationProfile> observation;
+	SrtRuntime observed = runtime;
+	if (sample) { observation.emplace(); observed.profile = &*observation; }
+	diagnostic.reset();
+	const auto begin = ProfileClockNs();
+	const bool result = MaterializeResources(plan, observed, resources, specialization);
+	const auto elapsed = ProfileClockNs() - begin;
+	diagnostic_scope();
+	aggregate.cpu += elapsed;
+	if (sample) {
+		++aggregate.samples; aggregate.sampled_cpu += elapsed;
+		for (size_t i = 0; i < observation->phases.size(); ++i) aggregate.detail.phases[i] += observation->phases[i];
+		for (size_t i = 0; i < observation->opcodes.size(); ++i) {
+			auto& a = aggregate.detail.opcodes[i]; const auto& b = observation->opcodes[i];
+			a.visits += b.visits; a.hits += b.hits; a.misses += b.misses; a.failures += b.failures; a.words += b.words; a.word_ns += b.word_ns;
+		}
+	}
+	return result;
+}
+
+struct MemorySnapshot {
+	uint64_t blocks = 0;
+	uint64_t usage = 0;
+};
+
+bool VramEventsEnabled() {
+	static const bool enabled = std::getenv("KYTY_VRAM_EVENTS") != nullptr;
+	return enabled;
+}
+
+MemorySnapshot ReadMemorySnapshot(const GraphicContext& graphics) {
+	MemorySnapshot snapshot;
+	graphics.SampleDeviceLocalUsage(snapshot.usage, snapshot.blocks);
+	return snapshot;
+}
+
+void LogVramEvent(const char* kind, uint64_t id, MemorySnapshot before, MemorySnapshot after,
+                  uint64_t detail = 0) {
+	if (std::FILE* log = std::fopen("D:/PS5/vram-events.txt", "a"); log != nullptr) {
+		const auto gap_before = static_cast<int64_t>(before.usage) - static_cast<int64_t>(before.blocks);
+		const auto gap_after = static_cast<int64_t>(after.usage) - static_cast<int64_t>(after.blocks);
+		std::fprintf(log,
+		             "%s id=0x%016llx detail=0x%016llx vma=%llu->%lluMB driver=%llu->%lluMB "
+		             "gap=%lld->%lldMB gap_delta=%lldMB gap_delta_kb=%lld\n",
+		             kind, static_cast<unsigned long long>(id),
+		             static_cast<unsigned long long>(detail),
+		             static_cast<unsigned long long>(before.blocks / (1024 * 1024)),
+		             static_cast<unsigned long long>(after.blocks / (1024 * 1024)),
+		             static_cast<unsigned long long>(before.usage / (1024 * 1024)),
+		             static_cast<unsigned long long>(after.usage / (1024 * 1024)),
+		             static_cast<long long>(gap_before / (1024 * 1024)),
+		             static_cast<long long>(gap_after / (1024 * 1024)),
+		             static_cast<long long>((gap_after - gap_before) / (1024 * 1024)),
+		             static_cast<long long>((gap_after - gap_before) / 1024));
+		std::fclose(log);
+	}
+}
 
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
@@ -94,8 +533,12 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
-	return !values.empty() &&
+	ProfileDetailScope profile("cpu_specialization_memory_read", address, values.size_bytes());
+	const bool success = !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+	if (success) if (auto* scheduler = ProfileThread().scheduler) scheduler->ProfileBufferUse(
+	    "cpu_consume_specialization", address, values.size_bytes(), 0);
+	return success;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -254,7 +697,13 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
+		const auto before_module = VramEventsEnabled() ? ReadMemorySnapshot(graphics) : MemorySnapshot {};
 		const auto module = CompileSPV(result.spirv, device);
+		const auto id     = ++next_shader_id;
+		if (VramEventsEnabled()) {
+			LogVramEvent("shader_module", id, before_module, ReadMemorySnapshot(graphics),
+			             options.shader_hash);
+		}
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
@@ -263,13 +712,14 @@ struct PipelineCache::ProgramCache {
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .handle         = {.id = id, .module = module},
 		};
 	}
 
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
+		ProfileDetailScope profile("cpu_program_get", params.hash);
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -285,7 +735,15 @@ struct PipelineCache::ProgramCache {
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
-		BuildStageStaticKey(input_info, lookup_key.static_state);
+		{ ProfileDetailScope key_profile("cpu_program_static_key", params.hash);
+		  BuildStageStaticKey(input_info, lookup_key.static_state); }
+		uint64_t profile_key = params.hash;
+		if (profile.Active()) {
+			ProfileCpuScope fingerprint(*ProfileThread().scheduler, "profile_fingerprint_cpu");
+			profile_key = ProfileFingerprint(lookup_key.static_state.data(), lookup_key.static_state.size() * sizeof(uint32_t), params.hash);
+			profile_key ^= static_cast<uint64_t>(stage) << 56;
+			profile.SetIdentity(profile_key, lookup_key.static_state.size());
+		}
 		auto                                         entry = programs.find(lookup_key);
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = user_data,
@@ -293,9 +751,11 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+			ProfileDetailEvent("cache_program_source_hit", profile_key);
+			{ ProfileDetailScope materialize("cpu_materialize_resources", params.hash);
+			EXIT_IF(!MaterializeDiagnosticWindow(
 			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			    entry->second.specialization)); }
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -305,6 +765,7 @@ struct PipelineCache::ProgramCache {
 				               candidate.specialization == entry->second.specialization;
 			        });
 			    permutation != entry->second.permutations.end()) {
+				ProfileDetailEvent("cache_program_permutation_hit", profile_key);
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
@@ -313,6 +774,7 @@ struct PipelineCache::ProgramCache {
 		}
 
 		ShaderStageInputInfo stage_input {};
+		ProfileDetailEvent(entry == programs.end() ? "cache_program_source_miss" : "cache_program_permutation_miss", profile_key);
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage_input.vertex = &input_info;
 		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
@@ -333,6 +795,7 @@ struct PipelineCache::ProgramCache {
 			default: EXIT("invalid pipeline shader stage\n");
 		}
 		ShaderRecompiler::CompileOptions options;
+		options.optimization_type = Config::GetShaderOptimizationType();
 		options.stage       = stage;
 		options.shader_hash = params.hash;
 		options.user_data   = user_data;
@@ -357,7 +820,8 @@ struct PipelineCache::ProgramCache {
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+			ProfileDetailScope materialize("cpu_materialize_resources", params.hash);
+			EXIT_IF(!MaterializeDiagnosticWindow(
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
 		}
@@ -383,7 +847,7 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	explicit ProgramCache(GraphicContext& graphics): graphics(graphics), device(graphics.device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -397,14 +861,111 @@ struct PipelineCache::ProgramCache {
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
+	GraphicContext&                                             graphics;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };
 
-PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+PipelineCache::PipelineCache(GraphicContext& graphics, MasterSemaphore& master_semaphore)
+    : m_graphics(graphics), m_master_semaphore(master_semaphore),
+      m_program_cache(std::make_unique<ProgramCache>(graphics)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+}
+
+void PipelineCache::TrimPipelines() {
+	// Pipelines are driver-managed memory that VMA cannot see and no cache GC can reclaim. Without
+	// a bound they accumulate for the whole session - measured at ~4.2 MB each and ~3.3 GB in-fight
+	// on UFC 5, which pushed the process past the driver budget and spilled to shared system memory.
+	//
+	// A pipeline may only be destroyed once the GPU has passed the tick at which it was last used;
+	// before that a submitted command buffer still references it. Candidates are therefore filtered
+	// through MasterSemaphore::IsFree and evicted oldest-use-first.
+	//
+	// KYTY_PIPELINE_BUDGET is the maximum number of pipelines to retain. 0 disables trimming, which
+	// is the default until a budget has been measured against the live working set.
+	static const size_t budget = [] {
+		const char* env = std::getenv("KYTY_PIPELINE_BUDGET");
+		if (env == nullptr) {
+			return size_t {0};
+		}
+		char*      end    = nullptr;
+		const auto parsed = std::strtoull(env, &end, 10);
+		return end == env ? size_t {0} : static_cast<size_t>(parsed);
+	}();
+	if (budget == 0) {
+		return;
+	}
+	const size_t total = m_graphics_pipelines.size() + m_compute_pipelines.size();
+	if (total <= budget) {
+		return;
+	}
+
+	struct Candidate {
+		uint64_t tick     = 0;
+		bool     compute  = false;
+		uint64_t compute_key = 0;
+		const GraphicsPipelineKey* graphics_key = nullptr;
+	};
+	std::vector<Candidate> candidates;
+	candidates.reserve(total);
+	for (const auto& [key, pipeline]: m_graphics_pipelines) {
+		if (m_master_semaphore.IsFree(pipeline->last_used_tick)) {
+			candidates.push_back({pipeline->last_used_tick, false, 0, &key});
+		}
+	}
+	for (const auto& [key, pipeline]: m_compute_pipelines) {
+		if (m_master_semaphore.IsFree(pipeline->last_used_tick)) {
+			candidates.push_back({pipeline->last_used_tick, true, key, nullptr});
+		}
+	}
+	std::sort(candidates.begin(), candidates.end(),
+	          [](const Candidate& a, const Candidate& b) { return a.tick < b.tick; });
+
+	size_t remaining = total;
+	size_t evicted   = 0;
+	for (const auto& candidate: candidates) {
+		if (remaining <= budget) {
+			break;
+		}
+		const auto destroy = [this](const Pipeline& pipeline, const char* kind, uint64_t id) {
+			const auto before = VramEventsEnabled() ? ReadMemorySnapshot(m_graphics) : MemorySnapshot {};
+			{
+				VramAttributionScope vram(m_graphics, "pipeline_destroy");
+				m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+			}
+			if (VramEventsEnabled()) {
+				LogVramEvent(kind, id, before, ReadMemorySnapshot(m_graphics));
+			}
+			m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+			m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+		};
+		if (candidate.compute) {
+			const auto found = m_compute_pipelines.find(candidate.compute_key);
+			if (found == m_compute_pipelines.end()) {
+				continue;
+			}
+			destroy(*found->second, "compute_pipeline_destroy", candidate.compute_key);
+			m_compute_pipelines.erase(found);
+		} else {
+			const auto found = m_graphics_pipelines.find(*candidate.graphics_key);
+			if (found == m_graphics_pipelines.end()) {
+				continue;
+			}
+			destroy(*found->second, "graphics_pipeline_destroy",
+			        (found->first.vertex_shader_ids[0] << 32u) | found->first.ps_shader_id);
+			m_graphics_pipelines.erase(found);
+		}
+		--remaining;
+		++evicted;
+	}
+	if (evicted != 0) {
+		if (std::FILE* f = std::fopen("D:/PS5/pipeline-census.txt", "a"); f != nullptr) {
+			std::fprintf(f, "PipeTrim: evicted=%zu remaining=%zu budget=%zu candidates=%zu\n",
+			             evicted, remaining, budget, candidates.size());
+			std::fclose(f);
+		}
+	}
 }
 
 PipelineCache::~PipelineCache() {
@@ -573,11 +1134,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	ProfileDetailScope profile("cpu_graphics_programs");
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
 	} else {
+		ProfileDetailScope prepare("cpu_prepare_vertex_program", vertex_regs.es_regs.data_addr);
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
@@ -601,7 +1164,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
-		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		{ ProfileDetailScope prepare("cpu_prepare_pixel_program", pixel_regs.ps_regs.data_addr);
+		  pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info); }
 		const auto& blend = context.GetBlendControl(0);
 		pixel_info.dual_source_blending =
 		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
@@ -836,6 +1400,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		iter->second->last_used_tick = m_master_semaphore.CurrentTick();
 		return *iter->second;
 	}
 
@@ -851,15 +1416,65 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	const auto before_pipeline = VramEventsEnabled() ? ReadMemorySnapshot(m_graphics) : MemorySnapshot {};
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 	                       ps_input_info, programs, static_params, m_driver_cache);
+	if (VramEventsEnabled()) {
+		LogVramEvent("graphics_pipeline", (vs_id << 32u) | ps_id, before_pipeline,
+		             ReadMemorySnapshot(m_graphics));
+	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+	// TEMPORARY DIAGNOSTIC (session 17): pipelines are only destroyed in ~PipelineCache, so they
+	// accumulate for the whole session. Driver-managed memory (outside VMA) grew 12 MB -> 3.3 GB
+	// during one fight; this reports the count so bytes-per-pipeline can be estimated.
+	{
+		static std::chrono::steady_clock::time_point next_report {};
+		static uint64_t                             s_census_mark = 0;
+		const auto                                  now = std::chrono::steady_clock::now();
+		if (now >= next_report) {
+			next_report = now + std::chrono::seconds(2);
+			if (std::FILE* f = std::fopen("D:/PS5/pipeline-census.txt", "a"); f != nullptr) {
+				size_t driver_cache_bytes = 0;
+				if (m_driver_cache != nullptr) {
+					(void)m_graphics.device.getPipelineCacheData(m_driver_cache,
+					                                            &driver_cache_bytes, nullptr);
+				}
+				size_t live = 0;
+				size_t in_flight = 0;
+				const auto tally = [&](const auto& pipelines) {
+					for (const auto& [key, pipeline]: pipelines) {
+						(void)key;
+						if (pipeline->last_used_tick >= s_census_mark) {
+							++live;
+						}
+						if (!m_master_semaphore.IsFree(pipeline->last_used_tick)) {
+							++in_flight;
+						}
+					}
+				};
+				tally(m_graphics_pipelines);
+				tally(m_compute_pipelines);
+				std::fprintf(f,
+				             "PipeCensus: graphics=%zu compute=%zu total=%zu | live_since_last=%zu "
+				             "in_flight=%zu | shader_modules=%llu driver_cache=%u cache_data=%zuMB\n",
+				             m_graphics_pipelines.size(), m_compute_pipelines.size(),
+				             m_graphics_pipelines.size() + m_compute_pipelines.size(), live, in_flight,
+				             static_cast<unsigned long long>(m_program_cache->next_shader_id),
+				             m_driver_cache != nullptr ? 1u : 0u,
+				             driver_cache_bytes / (1024 * 1024));
+				s_census_mark = m_master_semaphore.CurrentTick();
+				std::fclose(f);
+			}
+		}
+	}
 	EXIT_IF(!inserted);
+	iter->second->last_used_tick = m_master_semaphore.CurrentTick();
+	TrimPipelines();
 
 	return *iter->second;
 }
@@ -873,6 +1488,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
+		iter->second->last_used_tick = m_master_semaphore.CurrentTick();
 		return *iter->second;
 	}
 
@@ -881,13 +1497,20 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
+	const auto before_pipeline = VramEventsEnabled() ? ReadMemorySnapshot(m_graphics) : MemorySnapshot {};
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	if (VramEventsEnabled()) {
+		LogVramEvent("compute_pipeline", compute_program.id, before_pipeline,
+		             ReadMemorySnapshot(m_graphics));
+	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	iter->second->last_used_tick = m_master_semaphore.CurrentTick();
+	TrimPipelines();
 
 	return *iter->second;
 }

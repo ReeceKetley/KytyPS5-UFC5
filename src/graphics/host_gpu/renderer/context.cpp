@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -17,19 +18,40 @@
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
-    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
+    : m_scheduler(scheduler), m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
 
 bool CommandBuffer::IsInvalid() const {
 	return m_buffer == nullptr;
 }
 
 vk::CommandBuffer CommandBuffer::Handle() const {
+	if (DrawCommitEnabled() && !DrawCommitOnWorker()) {
+		m_context.GetRenderExecutor().FinishDrawCommit();
+	}
 	EXIT_IF(IsInvalid());
+	// Any recording into this buffer must come through here, so treat handing out the handle as
+	// "something may have been recorded" for global-barrier coalescing.
+	m_recorded_since_barrier.store(true, std::memory_order_relaxed);
 	return m_buffer;
 }
 
 void CommandBuffer::Begin() {
-	EXIT_IF(m_rendering || IsInvalid());
+	if (DrawCommitEnabled() && !DrawCommitOnWorker()) {
+		m_context.GetRenderExecutor().FinishDrawCommit();
+	}
+	// Begin() starts a newly allocated Vulkan buffer. A commit thread can leave the
+	// wrapper's render-pass flag set after the previous buffer was already retired.
+	if (m_rendering) {
+		if (m_render_gpu_timer != UINT32_MAX) {
+			m_scheduler.EndGpuTimer(m_render_gpu_timer);
+			m_render_gpu_timer = UINT32_MAX;
+		}
+		m_rendering    = false;
+		m_render_state = {};
+	}
+	EXIT_IF(IsInvalid());
+	EXIT_IF(m_render_gpu_timer != UINT32_MAX || m_gap_gpu_timer != UINT32_MAX);
+	m_gap_ordinal = 0;
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
@@ -42,11 +64,24 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
+	EndGpuGap();
 	auto buffer = Handle();
 
 	auto result = buffer.end();
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+}
+
+void CommandBuffer::BeginGpuGap() const {
+	if (m_gap_gpu_timer != UINT32_MAX || m_rendering) return;
+	auto& scheduler = m_scheduler;
+	m_gap_gpu_timer = scheduler.StartGpuTimer("gap", scheduler.GpuFrameHint(), m_gap_ordinal++);
+}
+
+void CommandBuffer::EndGpuGap() const {
+	if (m_gap_gpu_timer == UINT32_MAX) return;
+	m_scheduler.EndGpuTimer(m_gap_gpu_timer);
+	m_gap_gpu_timer = UINT32_MAX;
 }
 
 void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
@@ -67,6 +102,13 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
+	EndGpuGap();
+	auto& scheduler = m_scheduler;
+	// The current draw was counted when its guest command began.
+	m_render_draw_start = scheduler.CurrentSubmitDrawCount() > 0
+	                          ? scheduler.CurrentSubmitDrawCount() - 1 : 0;
+	const auto dimensions = (static_cast<uint64_t>(state.width) << 32u) | state.height;
+	m_render_gpu_timer = scheduler.StartGpuTimer("render", scheduler.GpuFrameHint(), dimensions);
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
@@ -115,6 +157,12 @@ void CommandBuffer::EndRendering() const {
 	Handle().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
+	auto& scheduler = m_scheduler;
+	scheduler.SetGpuTimerDraws(m_render_gpu_timer,
+	                           scheduler.CurrentSubmitDrawCount() - m_render_draw_start);
+	scheduler.EndGpuTimer(m_render_gpu_timer);
+	m_render_gpu_timer = UINT32_MAX;
+	BeginGpuGap();
 }
 
 } // namespace Libs::Graphics

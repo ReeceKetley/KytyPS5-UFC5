@@ -2,6 +2,8 @@
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include <bit>
 
 namespace Libs::Graphics {
 
@@ -35,7 +37,7 @@ void MasterSemaphore::Refresh() {
 	}
 }
 
-void MasterSemaphore::Wait(uint64_t tick) {
+void MasterSemaphore::Wait(uint64_t tick, std::source_location site) {
 	if (IsFree(tick)) {
 		return;
 	}
@@ -49,7 +51,11 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
+	const auto start = m_profiler && m_profiler->ProfileActive() ? ProfileClockNs() : 0;
+	const auto frame = start ? m_profiler->ProfileFrame() : 0;
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	if (start) m_profiler->ProfileEvent("timeline_wait", start, ProfileClockNs(),
+	    std::bit_cast<uint64_t>(m_semaphore), tick, site, frame);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
 }

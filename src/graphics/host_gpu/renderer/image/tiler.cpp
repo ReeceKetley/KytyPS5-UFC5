@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/productionProfile.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include "common/alignment.h"
@@ -18,6 +19,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/image/detileReplay.h"
 
 #include <algorithm>
 #include <array>
@@ -256,7 +258,8 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 void TileManager::Record(vk::Buffer source, uint64_t source_offset,
                          uint64_t source_capacity, vk::Buffer target, uint64_t target_offset,
                          uint64_t target_capacity, std::span<Dispatch> dispatches,
-                         bool clear_target) {
+                         bool clear_target, uint64_t guest_address) {
+	ProfileCpuScope cpu_record(m_scheduler, clear_target ? "detile_record_cpu" : "tile_record_cpu", guest_address, target_capacity);
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -271,6 +274,14 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 	                     target_capacity % 4 != 0);
 
 	m_scheduler.EndRendering();
+	const auto gpu_timer = m_scheduler.StartGpuTimer(
+	    clear_target ? "detile" : "tile", m_scheduler.GpuFrameHint(), target_capacity);
+	m_scheduler.SetGpuTimerDraws(gpu_timer, static_cast<uint32_t>(dispatches.size()));
+	if (guest_address != 0) {
+		m_scheduler.SetGpuTimerArg4(gpu_timer, guest_address);
+	}
+	const auto pre_timer = m_scheduler.StartGpuTimer(
+	    clear_target ? "detile_pre" : "tile_pre", m_scheduler.GpuFrameHint(), target_capacity);
 	auto                    command = m_scheduler.Current().Handle();
 	vk::BufferMemoryBarrier barriers[3] {};
 	barriers[0].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostWrite;
@@ -294,20 +305,26 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 	barriers[2].offset        = dispatches.front().params_offset;
 	barriers[2].size =
 	    dispatches.back().params_offset - dispatches.front().params_offset + sizeof(Push);
-	command.pipelineBarrier(
+	ProfilePipelineBarrier(command,
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer, {}, 0,
 	    nullptr, 3, barriers, 0, nullptr);
 	if (clear_target) {
+		const auto clear_timer = m_scheduler.StartGpuTimer("detile_clear", m_scheduler.GpuFrameHint(), target_capacity);
 		command.fillBuffer(target, target_offset, target_capacity, 0);
+		m_scheduler.EndGpuTimer(clear_timer);
 		barriers[1].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		barriers[1].dstAccessMask =
 		    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
-		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		ProfilePipelineBarrier(command, vk::PipelineStageFlagBits::eTransfer,
 		                        vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 1,
 		                        &barriers[1], 0, nullptr);
 	}
+	m_scheduler.EndGpuTimer(pre_timer);
 
+	const auto dispatch_timer = m_scheduler.StartGpuTimer(
+	    clear_target ? "detile_dispatch" : "tile_dispatch", m_scheduler.GpuFrameHint(),
+	    target_capacity);
 	const vk::DescriptorBufferInfo source_info {source, source_descriptor_offset, source_range};
 	const vk::DescriptorBufferInfo target_info {target, target_descriptor_offset, target_range};
 	for (auto& dispatch: dispatches) {
@@ -328,17 +345,24 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 		command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
 		                 dispatch.push.depth);
 	}
+	m_scheduler.EndGpuTimer(dispatch_timer);
 
+	const auto post_timer = m_scheduler.StartGpuTimer(
+	    clear_target ? "detile_post" : "tile_post", m_scheduler.GpuFrameHint(), target_capacity);
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	ProfilePipelineBarrier(command, vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
 	                        &barriers[1], 0, nullptr);
+	m_scheduler.EndGpuTimer(post_timer);
+	m_scheduler.EndGpuTimer(gpu_timer);
 }
 
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
                                         uint64_t tiled_capacity, uint64_t linear_capacity,
-                                        std::span<const GpuTileInfo> infos) {
+                                        std::span<const GpuTileInfo> infos,
+                                        uint64_t guest_address) {
+	ProfileCpuScope cpu_transaction(m_scheduler, "detile_transaction", guest_address, linear_capacity, true);
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -347,7 +371,9 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, 0, dispatches);
 	auto scratch = GetScratchBuffer(linear_capacity, tiled);
 	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches,
-	       true);
+	       true, guest_address);
+	MaybeCaptureDetile(m_graphics, m_scheduler, {tiled, tiled_offset, tiled_capacity},
+	                   scratch, infos, guest_address);
 	return {scratch.buffer, 0, linear_capacity};
 }
 
@@ -398,6 +424,7 @@ TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer inpu
 		buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
 		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
 		        vk::BufferUsageFlagBits::eTransferDst, size);
+		buffer->ProfileAllocation("detile_scratch_allocation");
 	}
 	return {buffer->Handle(), 0, size};
 }
@@ -491,6 +518,8 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	EXIT_IF(source.size < source_barrier_size || target.size < target_barrier_size);
 
 	m_scheduler.EndRendering();
+	const auto gpu_timer = m_scheduler.StartGpuTimer("d16_convert", m_scheduler.GpuFrameHint(),
+	                                                  target_barrier_size);
 	auto                    command = m_scheduler.Current().Handle();
 	vk::BufferMemoryBarrier barriers[2] {};
 	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -512,7 +541,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	                            vk::AccessFlagBits::eTransferWrite |
 	                            vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
-	command.pipelineBarrier(
+	ProfilePipelineBarrier(command,
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
@@ -577,9 +606,10 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	}
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	ProfilePipelineBarrier(command, vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
 	                        &barriers[1], 0, nullptr);
+	m_scheduler.EndGpuTimer(gpu_timer);
 }
 
 void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
@@ -627,8 +657,9 @@ void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eMemoryRead;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderWrite;
 	m_scheduler.EndRendering();
+	const auto gpu_timer = m_scheduler.StartGpuTimer("swap_bgra16", m_scheduler.GpuFrameHint(), bytes);
 	auto command = m_scheduler.Current().Handle();
-	command.pipelineBarrier(
+	ProfilePipelineBarrier(command,
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_swap_bgra16);
@@ -643,9 +674,10 @@ void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 	command.dispatch((pixels + 63u) / 64u, 1, 1);
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead;
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	ProfilePipelineBarrier(command, vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &barriers[1],
 	                        0, nullptr);
+	m_scheduler.EndGpuTimer(gpu_timer);
 }
 
 TileManager::Result TileManager::SwapBgra16(Result input) {

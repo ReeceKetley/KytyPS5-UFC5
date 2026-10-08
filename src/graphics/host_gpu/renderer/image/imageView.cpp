@@ -379,7 +379,11 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	create.subresourceRange.layerCount     = normalized.layer_count;
 
 	vk::ImageView view   = nullptr;
-	const auto    result = m_graphics.device.createImageView(&create, nullptr, &view);
+	vk::Result    result = vk::Result::eSuccess;
+	{
+		VramAttributionScope vram(m_graphics, "image_view");
+		result = m_graphics.device.createImageView(&create, nullptr, &view);
+	}
 	if (result != vk::Result::eSuccess || view == nullptr) {
 		EXIT("failed to create image view: result=%d image_format=%d view_format=%d type=%d "
 		     "aspect=0x%x mip=%u+%u layer=%u+%u usage=0x%x\n",

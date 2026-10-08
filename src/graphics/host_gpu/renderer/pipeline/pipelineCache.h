@@ -17,6 +17,8 @@
 
 namespace Libs::Graphics {
 
+class MasterSemaphore;
+
 struct GraphicContext;
 struct RenderColorInfo;
 struct RenderDepthInfo;
@@ -106,7 +108,7 @@ struct ShaderProgram {
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
-	explicit PipelineCache(GraphicContext& graphics);
+	PipelineCache(GraphicContext& graphics, MasterSemaphore& master_semaphore);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
@@ -116,6 +118,9 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// Master-semaphore tick at the last use. A pipeline may only be destroyed once the GPU
+		// has passed this tick, otherwise a submitted command buffer still references it.
+		uint64_t                last_used_tick        = 0;
 	};
 
 	struct GraphicsPrograms {
@@ -174,6 +179,7 @@ private:
 	};
 
 	GraphicContext&               m_graphics;
+	MasterSemaphore&              m_master_semaphore;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
@@ -182,6 +188,10 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
 	void InitializeDriverCache();
+	// Destroy pipelines the GPU has finished with, oldest use first, when the cache exceeds its
+	// budget. Pipelines are driver-managed memory invisible to VMA; without this they accumulate
+	// for the whole session (measured ~4.2 MB each, ~3.3 GB in-fight).
+	void TrimPipelines();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

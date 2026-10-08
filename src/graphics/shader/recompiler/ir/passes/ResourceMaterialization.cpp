@@ -224,10 +224,11 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t dynamic_offset,
 	       runtime.read_specialization_memory(runtime.userdata, address, prefix);
 }
 
+template <typename Walker>
 bool MaterializeIndirectImage(const ResourcePlan& program,
                               const DescriptorSource::IndirectImage& indirect,
                               uint32_t image_index,
-                              const SrtRuntime& runtime, SrtWalker& clean,
+                              const SrtRuntime& runtime, Walker& clean,
                               ResourceSnapshot& snapshot,
                               ResourceSpecialization& specialization) {
 	const auto& sources = indirect.sources;
@@ -938,11 +939,36 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		if (image.written) MarkCleanFlatSlots(plan, Source(plan, image.source), plan.clean_flat_slots);
 	}
 	if (capture_image_reads) plan.resource_tracking_complete &= !program.has_address_writes;
+	plan.descriptor_gathers.resize(plan.descriptor_sources.size());
+	for (size_t source = 0; source < plan.descriptor_sources.size(); ++source) {
+		const auto& descriptor = plan.descriptor_sources[source];
+		auto& gather = plan.descriptor_gathers[source];
+		gather.dword_count = descriptor.dword_count;
+		gather.eligible = descriptor.dword_count <= gather.words.size() && !descriptor.indirect_image;
+		for (uint32_t index = 0; gather.eligible && index < descriptor.dword_count; ++index) {
+			const auto value = descriptor.dwords[index].Resolve();
+			auto& word = gather.words[index];
+			if (value.IsImmediate() && value.GetType() == Type::U32) {
+				word.value = value.U32();
+			} else if (const auto* inst = value.TryInstruction(); inst &&
+			           inst->GetOpcode() == ValueOpcode::GetUserData && inst->NumArgs() == 1 &&
+			           inst->Arg(0).GetType() == Type::ScalarReg) {
+				word.user_data = true;
+				word.value = RegIndex(inst->Arg(0).ScalarRegister());
+				word.memo_index = inst->EvaluationIndex(plan.evaluation_value_count);
+			} else {
+				gather.eligible = false;
+			}
+		}
+	}
+	BuildFlatSrtRecipes(plan);
 	return plan;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+template <typename Walker>
+static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          DescriptorEvaluationMode mode, DescriptorEvaluationStats* stats) {
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
 		return false;
@@ -958,12 +984,18 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		                                         ? CaptureStrictRead : nullptr;
 		observed.read_memory = CaptureOrdinaryRead;
 	}
-	SrtWalker clean(program, CleanRuntime(observed));
-	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);
+	const auto inactive_mask = [] {
+		if constexpr (std::is_same_v<Walker, SrtWalker>) return Value {};
+		else return CompiledSrtWalker::NoNode;
+	}();
+	Walker clean(program, CleanRuntime(observed), {}, nullptr, inactive_mask, mode, stats);
+	Walker walker(program, observed, program.clean_flat_slots, &clean, inactive_mask, mode, stats);
+	{ SrtPhaseProfile phase(runtime.profile, SrtEvaluationProfile::Flat);
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return false;
-	}
+	} }
 	const auto active = std::span<const uint8_t>(program.active_sources);
+	{ SrtPhaseProfile phase(runtime.profile, SrtEvaluationProfile::Uniform);
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;
 	const auto words = fill.fill.words;
@@ -976,6 +1008,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		snapshot.uniform_fill = fill.fill;
 		snapshot.uniform_fill.value = stored[0];
 	}
+	}
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
 		if (source >= program.descriptor_sources.size()) {
 			return false;
@@ -987,6 +1020,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		value.dword_count = program.descriptor_sources[source].dword_count;
 		return true;
 	};
+	{ SrtPhaseProfile phase(runtime.profile, SrtEvaluationProfile::Buffers);
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.clear();
 	specialization.buffers.reserve(program.info.buffers.size());
@@ -1022,6 +1056,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		    .zero_stride_oob = descriptor.OutOfBounds() == 0u && stride == 0u,
 		});
 	}
+	}
+	{ SrtPhaseProfile phase(runtime.profile, SrtEvaluationProfile::Images);
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
@@ -1059,6 +1095,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		}
 	}
+	}
+	{ SrtPhaseProfile phase(runtime.profile, SrtEvaluationProfile::Samplers);
 	snapshot.samplers.resize(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
 		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
@@ -1075,8 +1113,144 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		}
 	}
+	}
+	SrtPhaseProfile phase(runtime.profile, SrtEvaluationProfile::Specialization);
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
+}
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          DescriptorEvaluationMode mode, DescriptorEvaluationStats* stats) {
+	return MaterializeWith<SrtWalker>(program, runtime, snapshot, specialization, mode, stats);
+}
+
+bool MaterializeCompiledSrtResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                                     ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	// Existing opcode/recipe observers retain their reference semantics.
+	if (runtime.profile || runtime.compiled_flat_srt || !CompileSrtPlan(program))
+		return MaterializeResources(program, runtime, snapshot, specialization);
+	return MaterializeWith<CompiledSrtWalker>(program, runtime, snapshot, specialization,
+	                                        DescriptorEvaluationMode::Off, nullptr);
+}
+
+static bool ShadowMaterializeImpl(const ResourcePlan& program, const SrtRuntime& runtime,
+                                ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                                DescriptorEvaluationStats* descriptor_stats, FlatSrtEvaluationStats* flat_stats,
+                                CompiledSrtEvaluationStats* compiled_stats = nullptr) {
+	struct Observation {
+		uint64_t address;
+		size_t count;
+		bool strict, success;
+		std::vector<uint32_t> words;
+	};
+	struct Replay {
+		SrtRuntime runtime;
+		std::vector<Observation> reads;
+		size_t cursor = 0;
+		bool replay = false, matched = true;
+		bool Read(bool strict, uint64_t address, std::span<uint32_t> values) {
+			if (replay) {
+				if (cursor >= reads.size()) { matched = false; return false; }
+				const auto& read = reads[cursor++];
+				if (read.address != address || read.count != values.size() || read.strict != strict) {
+					matched = false;
+					return false;
+				}
+				if (read.success) std::copy(read.words.begin(), read.words.end(), values.begin());
+				return read.success;
+			}
+			const auto reader = strict ? runtime.read_specialization_memory : runtime.read_memory;
+			bool success = false;
+			if (reader) success = reader(runtime.userdata, address, values);
+			else if (!strict) {
+				std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+				success = true;
+			}
+			Observation read {address, values.size(), strict, success, {}};
+			if (success) read.words.assign(values.begin(), values.end());
+			reads.push_back(std::move(read));
+			return success;
+		}
+	} replay {runtime};
+	auto candidate_snapshot = snapshot;
+	auto candidate_specialization = specialization;
+	SrtRuntime recorded = runtime;
+	recorded.userdata = &replay;
+	recorded.read_memory = +[](void* p, uint64_t a, std::span<uint32_t> v) {
+		return static_cast<Replay*>(p)->Read(false, a, v);
+	};
+	if (runtime.read_specialization_memory) {
+		recorded.read_specialization_memory = +[](void* p, uint64_t a, std::span<uint32_t> v) {
+			return static_cast<Replay*>(p)->Read(true, a, v);
+		};
+	}
+	if (flat_stats) {
+		recorded.compiled_flat_srt = false;
+		recorded.flat_srt_stats = flat_stats;
+	}
+	const auto eligible_before = descriptor_stats ? descriptor_stats->eligible : flat_stats ? flat_stats->recipe_evaluations : 0;
+	const auto reference_begin = (flat_stats || compiled_stats) ? SrtEvaluationProfile::Clock() : 0;
+	const bool reference_ok = MaterializeResources(program, recorded, snapshot, specialization,
+	    descriptor_stats ? DescriptorEvaluationMode::Shadow : DescriptorEvaluationMode::Off, descriptor_stats);
+	if (flat_stats) flat_stats->reference_ns += SrtEvaluationProfile::Clock() - reference_begin;
+	if (compiled_stats) compiled_stats->reference_ns += SrtEvaluationProfile::Clock() - reference_begin;
+	const auto reference_active = compiled_stats ? program.active_sources : std::vector<uint8_t> {};
+	replay.replay = true;
+	if (flat_stats) recorded.compiled_flat_srt = true;
+	const auto candidate_begin = (flat_stats || compiled_stats) ? SrtEvaluationProfile::Clock() : 0;
+	const bool candidate_ok = compiled_stats
+	    ? MaterializeCompiledSrtResources(program, recorded, candidate_snapshot, candidate_specialization)
+	    : MaterializeResources(program, recorded, candidate_snapshot, candidate_specialization,
+	                           descriptor_stats ? DescriptorEvaluationMode::Fast : DescriptorEvaluationMode::Off);
+	const bool mismatch = reference_ok != candidate_ok || snapshot != candidate_snapshot ||
+	    specialization != candidate_specialization || !replay.matched || replay.cursor != replay.reads.size() ||
+	    (compiled_stats && reference_active != program.active_sources);
+	// Shadow returns the reference decision, including its persistent activation state.
+	if (compiled_stats) program.active_sources = reference_active;
+	if (compiled_stats) {
+		compiled_stats->candidate_ns += SrtEvaluationProfile::Clock() - candidate_begin;
+		++compiled_stats->full_checks;
+		++program.compiled_srt_full_checks;
+		if (mismatch) { ++compiled_stats->full_mismatches; program.compiled_srt_rejected = true; }
+		else if (reference_ok && program.compiled_srt && !program.compiled_srt_rejected &&
+		         !runtime.profile && !runtime.compiled_flat_srt) program.compiled_srt_verified = true;
+	} else if (flat_stats) {
+		flat_stats->candidate_ns += SrtEvaluationProfile::Clock() - candidate_begin;
+		++flat_stats->full_checks;
+		++program.flat_srt_full_checks;
+		if (mismatch) { ++flat_stats->full_mismatches; program.flat_srt_rejected = true; }
+		else if (reference_ok && flat_stats->recipe_evaluations > eligible_before && !program.flat_srt_rejected)
+			program.flat_srt_verified = true;
+	} else {
+		++descriptor_stats->full_checks;
+		++program.descriptor_gather_full_checks;
+		if (mismatch) {
+			++descriptor_stats->full_mismatches;
+			program.descriptor_gather_rejected = true;
+		} else if (reference_ok && descriptor_stats->eligible > eligible_before && !program.descriptor_gather_rejected) {
+			program.descriptor_gather_verified = true;
+		}
+	}
+	return reference_ok;
+}
+
+bool ShadowMaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                                ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                                DescriptorEvaluationStats& stats) {
+	return ShadowMaterializeImpl(program, runtime, snapshot, specialization, &stats, nullptr);
+}
+
+bool ShadowFlatSrtMaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                                      ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                                      FlatSrtEvaluationStats& stats) {
+	return ShadowMaterializeImpl(program, runtime, snapshot, specialization, nullptr, &stats);
+}
+
+bool ShadowCompiledSrtMaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                                            ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                                            CompiledSrtEvaluationStats& stats) {
+	return ShadowMaterializeImpl(program, runtime, snapshot, specialization, nullptr, nullptr, &stats);
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

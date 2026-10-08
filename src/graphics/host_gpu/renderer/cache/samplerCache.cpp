@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
+#include "graphics/host_gpu/renderer/productionProfile.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -15,12 +16,18 @@ SamplerCache::~SamplerCache() {
 }
 
 vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool integer_border) {
+	ProfileDetailScope profile("cpu_sampler_lookup");
+	if (profile.Active()) profile.SetIdentity(ProfileFingerprint(r.fields, sizeof(r.fields), integer_border));
+	ProfileDetailScope lock_profile("cpu_sampler_lock_acquire");
 	Common::LockGuard lock(m_mutex);
+	lock_profile.Finish();
 
 	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3], integer_border};
 	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
+		ProfileDetailEvent("cache_sampler_hit");
 		return iter->second;
 	}
+	ProfileDetailEvent("cache_sampler_miss");
 
 	float      aniso_ratio = 1.0f;
 	const auto mag_filter  = r.XyMagFilter();
@@ -151,7 +158,11 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 	}
 
 	vk::Sampler vk_sampler = nullptr;
-	const auto  result     = m_graphics.device.createSampler(&sampler_info, nullptr, &vk_sampler);
+	vk::Result  result     = vk::Result::eSuccess;
+	{
+		VramAttributionScope vram(m_graphics, "sampler");
+		result = m_graphics.device.createSampler(&sampler_info, nullptr, &vk_sampler);
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || vk_sampler == nullptr);
 
 	m_samplers.emplace(key, vk_sampler);

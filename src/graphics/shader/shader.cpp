@@ -21,6 +21,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -833,6 +834,21 @@ ShaderParams PrepareProgram(
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     ShaderPixelInputInfo&                               ps_info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
+	if (static const char* path = std::getenv("KYTY_SHADER_STORAGE_LOG");
+	    path != nullptr && path[0] != '\0' && regs.ps_regs.rsrc2.extra_lds_size != 0) {
+		static std::mutex                                     lock;
+		static std::vector<std::pair<uint64_t, uint32_t>>     seen;
+		const std::pair<uint64_t, uint32_t> key {hash, regs.ps_regs.rsrc2.extra_lds_size};
+		const std::lock_guard                                 guard(lock);
+		if (std::ranges::find(seen, key) == seen.end()) {
+			seen.push_back(key);
+			if (auto* file = std::fopen(path, "a"); file != nullptr) {
+				std::fprintf(file, "ps_regs hash=%016" PRIx64 " extra_lds_size=%u\n", hash,
+				             static_cast<unsigned>(regs.ps_regs.rsrc2.extra_lds_size));
+				std::fclose(file);
+			}
+		}
+	}
 	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
 	return GetShaderParams(
 	    regs.ps_regs.data_addr, hash,

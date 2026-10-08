@@ -23,7 +23,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -37,6 +40,206 @@ static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
+
+enum class Pm4SuspendReason : uint8_t { None, WaitRegMem, Other };
+
+static thread_local Pm4SuspendReason g_pm4_suspend_reason = Pm4SuspendReason::None;
+
+// One row per presented frame while KYTY_QUEUE_OVERLAP_TRACE is set. Counts are
+// taken on the guest GPU thread and do not change which queue runs next.
+struct QueueOverlapTrace {
+	FILE*    file                   = nullptr;
+	int      frame                  = -1;
+	uint32_t gfx_slices             = 0;
+	uint32_t gfx_with_compute       = 0;
+	uint64_t compute_queued_sum     = 0;
+	uint32_t compute_queued_peak    = 0;
+	uint32_t compute_runnable_peak  = 0;
+	uint32_t compute_slices         = 0;
+	uint32_t compute_with_gfx       = 0;
+	uint32_t gfx_wait_episodes      = 0;
+	uint32_t gfx_wait_retries       = 0;
+	uint32_t gfx_wait_with_compute  = 0;
+	uint32_t compute_wait_blocks    = 0;
+	uint32_t gfx_other_blocks       = 0;
+	uint64_t gfx_wait_span_us       = 0;
+	uint64_t idle_wait_us           = 0;
+	uint64_t idle_gfx_wait_us       = 0;
+	uint32_t idle_polls             = 0;
+	bool     gfx_wait_open          = false;
+	std::chrono::steady_clock::time_point gfx_wait_since {};
+
+	QueueOverlapTrace() {
+		const char* path = std::getenv("KYTY_QUEUE_OVERLAP_TRACE");
+		if (path == nullptr || path[0] == '\0') {
+			return;
+		}
+		file = std::fopen(path, "w");
+		if (file == nullptr) {
+			return;
+		}
+		std::fprintf(file,
+		             "frame,gfx_slices,gfx_with_compute,compute_queued_avg_x100,"
+		             "compute_queued_peak,compute_runnable_peak,compute_slices,compute_with_gfx,"
+		             "gfx_wait_episodes,gfx_wait_retries,gfx_wait_with_compute,compute_wait_blocks,"
+		             "gfx_other_blocks,gfx_wait_span_us,idle_wait_us,idle_gfx_wait_us,idle_polls\n");
+		std::fflush(file);
+	}
+
+	~QueueOverlapTrace() {
+		Flush();
+		if (file != nullptr) {
+			std::fclose(file);
+			file = nullptr;
+		}
+	}
+
+	[[nodiscard]] bool Enabled() const noexcept { return file != nullptr; }
+
+	void Publish(int next_frame) {
+		if (file == nullptr) {
+			return;
+		}
+		if (frame < 0) {
+			frame = next_frame;
+			return;
+		}
+		if (next_frame == frame) {
+			return;
+		}
+		WriteFrame();
+		Reset(next_frame);
+	}
+
+	void Flush() {
+		if (file == nullptr || frame < 0) {
+			return;
+		}
+		WriteFrame();
+		frame = -1;
+	}
+
+	void NoteSlice(bool graphics, uint32_t compute_queued, uint32_t compute_runnable,
+	               uint32_t graphics_queued) {
+		if (file == nullptr) {
+			return;
+		}
+		if (graphics) {
+			gfx_slices++;
+			if (compute_runnable > 0) {
+				gfx_with_compute++;
+			}
+			compute_queued_sum += compute_queued;
+			compute_queued_peak   = std::max(compute_queued_peak, compute_queued);
+			compute_runnable_peak = std::max(compute_runnable_peak, compute_runnable);
+		} else {
+			compute_slices++;
+			if (graphics_queued > 0) {
+				compute_with_gfx++;
+			}
+		}
+	}
+
+	void NoteGfxWait(bool episode, bool compute_pending) {
+		if (file == nullptr) {
+			return;
+		}
+		gfx_wait_retries++;
+		if (!episode) {
+			return;
+		}
+		gfx_wait_episodes++;
+		if (compute_pending) {
+			gfx_wait_with_compute++;
+		}
+	}
+
+	void NoteComputeWait() {
+		if (file != nullptr) {
+			compute_wait_blocks++;
+		}
+	}
+
+	void NoteGfxOther() {
+		if (file != nullptr) {
+			gfx_other_blocks++;
+		}
+	}
+
+	void OpenGfxWait() {
+		if (file == nullptr || gfx_wait_open) {
+			return;
+		}
+		gfx_wait_open  = true;
+		gfx_wait_since = std::chrono::steady_clock::now();
+	}
+
+	void CloseGfxWait() {
+		if (file == nullptr || !gfx_wait_open) {
+			return;
+		}
+		gfx_wait_span_us += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(
+		        std::chrono::steady_clock::now() - gfx_wait_since)
+		        .count());
+		gfx_wait_open = false;
+	}
+
+	void NoteIdle(uint64_t wait_us, bool graphics_wait) {
+		if (file == nullptr) {
+			return;
+		}
+		idle_wait_us += wait_us;
+		idle_polls++;
+		if (graphics_wait) {
+			idle_gfx_wait_us += wait_us;
+		}
+	}
+
+private:
+	void Reset(int next_frame) {
+		frame                 = next_frame;
+		gfx_slices            = 0;
+		gfx_with_compute      = 0;
+		compute_queued_sum    = 0;
+		compute_queued_peak   = 0;
+		compute_runnable_peak = 0;
+		compute_slices        = 0;
+		compute_with_gfx      = 0;
+		gfx_wait_episodes     = 0;
+		gfx_wait_retries      = 0;
+		gfx_wait_with_compute = 0;
+		compute_wait_blocks   = 0;
+		gfx_other_blocks      = 0;
+		gfx_wait_span_us      = 0;
+		idle_wait_us          = 0;
+		idle_gfx_wait_us      = 0;
+		idle_polls            = 0;
+	}
+
+	void WriteFrame() {
+		if (file == nullptr || frame < 0) {
+			return;
+		}
+		const uint32_t queued_avg = gfx_slices == 0
+		                                ? 0
+		                                : static_cast<uint32_t>(compute_queued_sum * 100ull / gfx_slices);
+		std::fprintf(file,
+		             "%d,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%llu,%llu,%llu,%u\n", frame, gfx_slices,
+		             gfx_with_compute, queued_avg, compute_queued_peak, compute_runnable_peak,
+		             compute_slices, compute_with_gfx, gfx_wait_episodes, gfx_wait_retries,
+		             gfx_wait_with_compute, compute_wait_blocks, gfx_other_blocks,
+		             static_cast<unsigned long long>(gfx_wait_span_us),
+		             static_cast<unsigned long long>(idle_wait_us),
+		             static_cast<unsigned long long>(idle_gfx_wait_us), idle_polls);
+		std::fflush(file);
+	}
+};
+
+QueueOverlapTrace& GetQueueOverlapTrace() {
+	static QueueOverlapTrace trace;
+	return trace;
+}
 
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
@@ -172,7 +375,8 @@ void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
 	// finish the preceding graphics frame. The first point returns immediately.
-	m_suspend_point_ready->acquire();
+	{ Libs::Graphics::ProfileCpuScope profile(m_renderer.GetCommandScheduler(), "guest_suspend_point_wait");
+	  m_suspend_point_ready->acquire(); }
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
@@ -316,6 +520,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	(void)poll;
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+		g_pm4_suspend_reason = Pm4SuspendReason::WaitRegMem;
 		SuspendPm4();
 	}
 }
@@ -432,6 +637,7 @@ void GuestGpu::Enqueue(Submission submission) {
 }
 
 void GuestGpu::WaitForIdle() {
+	Libs::Graphics::ProfileCpuScope profile(m_renderer.GetCommandScheduler(), "guest_idle_completion_wait");
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	Common::LockGuard lock(m_queue_mutex);
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
@@ -446,16 +652,24 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
+	auto& overlap = GetQueueOverlapTrace();
 	for (;;) {
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
-		bool                         has_submission = false;
-		bool                         should_stop    = false;
+		bool                         has_submission   = false;
+		bool                         should_stop      = false;
+		uint32_t                     compute_queued   = 0;
+		uint32_t                     compute_runnable = 0;
+		uint32_t                     graphics_queued = 0;
+		auto& profile_scheduler = gpu->m_renderer.GetCommandScheduler();
+		profile_scheduler.SetProfileFrame(gpu->GetFrameNum());
+		overlap.Publish(gpu->GetFrameNum());
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				Libs::Graphics::ProfileCpuScope profile(profile_scheduler, "guest_no_work_wait");
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -477,14 +691,35 @@ void GuestGpu::ThreadRun(void* data) {
 					}
 				}
 				if (selected_queue < 0) {
-					gpu->m_processing = false;
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					const bool graphics_wait =
+					    !gpu->m_queues[0].empty() && gpu->m_queues[0].front().wait_blocked;
+					const auto idle_start = std::chrono::steady_clock::now();
+					gpu->m_processing     = false;
+					{
+						Libs::Graphics::ProfileCpuScope profile(profile_scheduler,
+						    graphics_wait ? "guest_pm4_blocked_wait" : "guest_blocked_wait");
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					}
+					const auto idle_us = static_cast<uint64_t>(
+					    std::chrono::duration_cast<std::chrono::microseconds>(
+					        std::chrono::steady_clock::now() - idle_start)
+					        .count());
+					overlap.NoteIdle(idle_us, graphics_wait);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
 						}
 					}
 					continue;
+				}
+				if (overlap.Enabled()) {
+					graphics_queued = static_cast<uint32_t>(gpu->m_queues[0].size());
+					for (uint32_t id = 1; id < QueueCount; id++) {
+						compute_queued += static_cast<uint32_t>(gpu->m_queues[id].size());
+						if (!gpu->m_queues[id].empty() && !gpu->m_queues[id].front().blocked) {
+							compute_runnable++;
+						}
+					}
 				}
 				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
 				submission  = std::move(queue.front());
@@ -493,9 +728,13 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
 				gpu->m_processing = true;
 				has_submission    = true;
+				if (submission.queue_id == 0) {
+					graphics_queued = graphics_queued > 0 ? graphics_queued - 1 : 0;
+				}
 			}
 		}
 		if (should_stop) {
+			overlap.Flush();
 			gpu->m_gfx_cp->BufferWait();
 			g_gpu_state  = nullptr;
 			g_gpu_thread = false;
@@ -504,7 +743,7 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
-			command();
+			{ Libs::Graphics::ProfileCpuScope profile(profile_scheduler, "guest_callback_cpu"); command(); }
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -515,11 +754,42 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		const bool graphics_slice = submission.type == SubmissionType::Graphics;
+		const bool compute_slice  = submission.type == SubmissionType::Compute;
+		const bool retrying_wait  = submission.wait_blocked;
+		submission.wait_blocked   = false;
+		if (retrying_wait && graphics_slice) {
+			overlap.CloseGfxWait();
+		}
+		if (!retrying_wait && (graphics_slice || compute_slice)) {
+			overlap.NoteSlice(graphics_slice, compute_queued, compute_runnable, graphics_queued);
+		}
+		const bool complete = [&] {
+			Libs::Graphics::ProfileCpuScope profile(profile_scheduler, "guest_process_slice");
+			profile.SetGuestQueue(submission.queue_id);
+			return gpu->Process(submission);
+		}();
+		const bool wait_reg_mem = g_pm4_suspend_reason == Pm4SuspendReason::WaitRegMem;
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
 			submission.blocked = true;
+			if (graphics_slice && wait_reg_mem) {
+				bool compute_pending = false;
+				for (uint32_t id = 1; id < QueueCount; id++) {
+					if (!gpu->m_queues[id].empty()) {
+						compute_pending = true;
+						break;
+					}
+				}
+				overlap.NoteGfxWait(!retrying_wait, compute_pending);
+				submission.wait_blocked = true;
+				overlap.OpenGfxWait();
+			} else if (graphics_slice) {
+				overlap.NoteGfxOther();
+			} else if (compute_slice && wait_reg_mem) {
+				overlap.NoteComputeWait();
+			}
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
@@ -537,6 +807,7 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
+	g_pm4_suspend_reason   = Pm4SuspendReason::None;
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
 
@@ -667,6 +938,9 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 
 void CommandProcessor::SuspendPm4() {
 	EXIT_IF(g_current_execution == nullptr);
+	if (g_pm4_suspend_reason == Pm4SuspendReason::None) {
+		g_pm4_suspend_reason = Pm4SuspendReason::Other;
+	}
 	g_current_execution->m_suspended = true;
 }
 
@@ -876,6 +1150,7 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 }
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
+	Libs::Graphics::ProfileOperationScope origin("guest_draw_indirect");
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
@@ -933,6 +1208,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, uint32_t draw_initiator,
                                          bool indexed) {
+	Libs::Graphics::ProfileOperationScope origin("guest_draw_indirect_multi");
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
@@ -1036,6 +1312,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
+	Libs::Graphics::ProfileOperationScope origin("guest_dispatch_indirect");
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
@@ -1055,6 +1332,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	BufferFlush();
+	Libs::Graphics::ProfileCpuScope profile(GetScheduler(), "video_flip_done_wait", display_buffer_index);
 
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 	                                      static_cast<int>(display_buffer_index));
@@ -1280,8 +1558,28 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	                 interrupt_context_id);
 }
 
+// Coalesce adjacent global barriers. Two identical all-commands full memory barriers with nothing
+// recorded between them are equivalent to one, so a barrier is skipped when no command has been
+// recorded since the last one. CommandBuffer::Handle() is the only route to the raw buffer, so it
+// marks the flag and the test over-approximates in the safe direction: a Handle() call that records
+// nothing costs a redundant barrier, never a missing one. FACT-0017 measured 89.8% of global
+// barriers as adjacent duplicates (521222 barriers forming only 53006 runs, runs up to 124 long),
+// each one also tearing down the render pass via EndRendering and taking the renderer mutex.
+// KYTY_BARRIER_COALESCE=0 restores one barrier per guest flush packet.
+static bool BarrierCoalesceEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BARRIER_COALESCE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
+
+	if (BarrierCoalesceEnabled() && !CurrentBuffer().RecordedSinceGlobalBarrier()) {
+		return;
+	}
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -1293,7 +1591,9 @@ void CommandProcessor::EmitGlobalBarrier() {
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
-	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	Libs::Graphics::ProfilePipelineBarrier2(CurrentBuffer().Handle(), dependency);
+	// Cleared last: EndRendering() and Handle() above both mark the buffer as recorded.
+	CurrentBuffer().ClearRecordedSinceGlobalBarrier();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
@@ -1389,6 +1689,7 @@ void CommandProcessor::Flip() {
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, m_flip.handle, m_flip.index,
 	                               m_flip.flip_mode, m_flip.flip_arg, request);
+	m_renderer.TickFrame();
 	GetScheduler().Flush();
 }
 
@@ -1408,6 +1709,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
 	                                 value, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                 m_flip.flip_arg, request);
+	m_renderer.TickFrame();
 	GetScheduler().Flush();
 }
 
@@ -1433,6 +1735,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(
 	    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, m_flip.handle,
 	    m_flip.index, m_flip.flip_mode, m_flip.flip_arg, request, m_interrupt_event_id);
+	m_renderer.TickFrame();
 	GetScheduler().Flush();
 }
 
@@ -1450,6 +1753,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+	m_renderer.TickFrame();
 	GetScheduler().Flush();
 }
 

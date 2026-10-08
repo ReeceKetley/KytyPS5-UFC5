@@ -64,8 +64,10 @@ public:
 	KYTY_CLASS_NO_COPY(TileManager);
 
 	// Consume scratch results before the next acquisition, or pass their buffer as input.
+	// guest_address is recorded on the outer detile GPU timer when timing is enabled.
 	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
-	                            uint64_t linear_capacity, std::span<const GpuTileInfo> infos);
+	                            uint64_t linear_capacity, std::span<const GpuTileInfo> infos,
+	                            uint64_t guest_address = 0);
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
 	          uint64_t tiled_offset, uint64_t tiled_capacity, std::span<const GpuTileInfo> infos);
 	void TileImage(Image& image, std::span<const vk::BufferImageCopy> regions, vk::Buffer tiled,
@@ -121,7 +123,7 @@ private:
 	             std::vector<Dispatch>& dispatches);
 	void Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
-	            std::span<Dispatch> dispatches, bool clear_target);
+	            std::span<Dispatch> dispatches, bool clear_target, uint64_t guest_address = 0);
 	[[nodiscard]] vk::Pipeline GetPipeline(uint32_t slot);
 	void                       SwapBgra16(Result input, Result output, uint32_t pixels);
 

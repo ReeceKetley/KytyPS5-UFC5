@@ -6,15 +6,21 @@
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
+#include "graphics/host_gpu/bdaSyncPlan.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <atomic>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
+#include <source_location>
 
 namespace Libs::Graphics {
 
@@ -31,12 +37,18 @@ public:
 	// entirely eaten by per-buffer padding (buffer ranges align to CACHING_PAGESIZE): VMA blocks
 	// unchanged at ~4.4 GB, alloc/block fragmentation 13 MB -> 244 MB, shared spill 1.2 -> 1.9 GB,
 	// and it introduced multi-second stutters outside the fight. Do not retry without also fixing
-	// buffer granularity. The real target is pipeline memory - see the ledger, session 17.
+	// buffer granularity. The sparse BDA-table experiment below keeps the 16 KB page size.
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	static constexpr uint32_t BDA_LEAF_BITS = 12;
+	static constexpr uint64_t BDA_LEAF_ENTRIES = uint64_t {1} << BDA_LEAF_BITS;
+	static constexpr uint64_t BDA_LEAF_SIZE = BDA_LEAF_ENTRIES * sizeof(vk::DeviceAddress);
+	static constexpr uint64_t BDA_ROOT_SIZE =
+	    ((CACHING_NUMPAGES + BDA_LEAF_ENTRIES - 1) / BDA_LEAF_ENTRIES) * sizeof(vk::DeviceAddress);
+	[[nodiscard]] static bool SparseBdaEnabled();
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -56,7 +68,8 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
+	                                  std::source_location site = std::source_location::current());
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -75,8 +88,15 @@ public:
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
+	[[nodiscard]] size_t RegisteredBufferCount() const noexcept { return m_buffers.size(); }
+	[[nodiscard]] uint64_t RegisteredBufferBytes() const noexcept { return m_total_used_memory; }
+	[[nodiscard]] uint64_t BdaTableAllocatedBytes() const noexcept {
+		return m_bda_pagetable_buffer.Size() + m_bda_leaf_chunks.size() * (64ull * 1024 * 1024);
+	}
+	[[nodiscard]] uint64_t BdaLeafCount() const noexcept { return m_bda_leaf_count; }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	void FillBufferFromProvenComputeFill(uint64_t vaddr, uint64_t size, uint32_t value);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
@@ -86,7 +106,19 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	BdaSyncCounters SynchronizeBdaRanges(const RangeSet& ranges, uint64_t mapping_version,
+	                                    BdaSyncAction action);
+	[[nodiscard]] uint64_t RegisterEpoch() const { return m_register_epoch; }
+	void               TickFrame();
 	void               RunGarbageCollector();
+	[[nodiscard]] bool BufferCovers(BufferId id, uint64_t address, uint64_t size) const;
+	[[nodiscard]] bool RetainBuffer(BufferId id, uint64_t address, uint64_t size);
+	void               NoteShaderWrite(uint64_t address, uint64_t size);
+	// Ranges whose metadata readback was skipped stay GPU-modified; guest CPU reads of them
+	// must still fault and download, which these counters prove.
+	void                   WatchSkippedReadback(uint64_t vaddr, uint64_t size);
+	void                   NoteCpuReadFault(uint64_t vaddr);
+	[[nodiscard]] uint64_t TakeSkippedReadbackFaults();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -108,6 +140,7 @@ private:
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
+	[[nodiscard]] std::pair<Buffer&, uint64_t> GetBdaLeaf(uint64_t leaf_index);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
@@ -131,6 +164,9 @@ private:
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
+	std::vector<std::unique_ptr<Buffer>>              m_bda_leaf_chunks;
+	std::unordered_map<uint64_t, uint64_t>            m_bda_leaf_slots;
+	uint64_t                                          m_bda_leaf_count = 0;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
@@ -146,6 +182,14 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	uint64_t m_register_epoch = 0;
+	BdaSyncHistory m_bda_history;
+	BdaSyncCounters* m_bda_counters = nullptr;
+	const RangeSet* m_bda_expected_uploads = nullptr;
+	std::mutex                                  m_skipped_readback_lock;
+	std::vector<std::pair<uint64_t, uint64_t>>  m_skipped_readbacks;
+	std::atomic<bool>                           m_watch_skipped_readbacks {false};
+	std::atomic<uint64_t>                       m_skipped_readback_faults {0};
 };
 
 } // namespace Libs::Graphics

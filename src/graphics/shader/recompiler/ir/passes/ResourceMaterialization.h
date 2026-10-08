@@ -42,7 +42,30 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          DescriptorEvaluationMode mode = DescriptorEvaluationMode::Off,
+                          DescriptorEvaluationStats* stats = nullptr);
+
+// Returns reference output. Candidate materialization replays observed reads instead of
+// calling guest memory readers again, comparing failures, complete outputs and read order.
+bool ShadowMaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                                ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                                DescriptorEvaluationStats& stats);
+
+// FlatSRT candidate uses the same captured-read replay and complete-output checks.
+bool ShadowFlatSrtMaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                                      ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                                      FlatSrtEvaluationStats& stats);
+
+struct CompiledSrtEvaluationStats {
+	uint64_t full_checks = 0, full_mismatches = 0, reference_ns = 0, candidate_ns = 0;
+};
+// Explicit opt-in entry point. Unsupported plans use the reference evaluator.
+bool MaterializeCompiledSrtResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                                     ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+bool ShadowCompiledSrtMaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                                            ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                                            CompiledSrtEvaluationStats& stats);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

@@ -87,6 +87,7 @@ void DescriptorHeap::CreateDescriptorPool() {
 	create.maxSets       = DescriptorHeapCount;
 	create.poolSizeCount = static_cast<uint32_t>(DescriptorPoolSizes.size());
 	create.pPoolSizes    = DescriptorPoolSizes.data();
+	VramAttributionScope vram(m_graphics, "descriptor_pool");
 	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &m_current_pool) !=
 	        vk::Result::eSuccess);
 }

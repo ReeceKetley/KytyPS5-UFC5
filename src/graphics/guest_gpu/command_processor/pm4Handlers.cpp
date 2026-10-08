@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/productionProfile.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -1425,6 +1426,7 @@ KYTY_CP_OP_PARSER(CpOpSetPredication) {
 }
 
 KYTY_CP_OP_PARSER(CpOpCondExec) {
+	ProfileOperationScope origin("guest_cond_exec");
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_COND_EXEC);
@@ -1442,7 +1444,10 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
+	const auto value = *reinterpret_cast<const volatile uint32_t*>(addr);
+	if (auto* scheduler = ProfileThread().scheduler)
+		scheduler->ProfileBufferUse("cpu_consume_cond_exec", addr, sizeof(value), value);
+	if (value == 0) {
 		return payload_dw + exec_count;
 	}
 
@@ -1450,6 +1455,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 }
 
 KYTY_CP_OP_PARSER(CpOpBranch) {
+	ProfileOperationScope origin("guest_conditional_branch");
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_INDIRECT_BUFFER);
@@ -1522,6 +1528,7 @@ static uint8_t CopyDataSrcToDma(uint32_t src) {
 }
 
 KYTY_CP_OP_PARSER(CpOpCopyData) {
+	ProfileOperationScope origin("guest_copy_data");
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != KYTY_PM4(6, Pm4::IT_COPY_DATA, 0u));
@@ -2567,12 +2574,14 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 }
 
 KYTY_CP_OP_PARSER(CpOpWaitRegMem32) {
+	ProfileOperationScope origin("guest_wait_reg_mem32");
 	KYTY_PROFILER_FUNCTION();
 
 	return CpOpWaitRegMemSized<uint32_t>(cp, cmd_id, buffer);
 }
 
 KYTY_CP_OP_PARSER(CpOpWaitRegMem64) {
+	ProfileOperationScope origin("guest_wait_reg_mem64");
 	KYTY_PROFILER_FUNCTION();
 
 	return CpOpWaitRegMemSized<uint64_t>(cp, cmd_id, buffer);

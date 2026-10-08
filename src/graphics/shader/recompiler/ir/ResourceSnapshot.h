@@ -37,6 +37,7 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
+	bool operator==(const ResourceSnapshot&) const = default;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

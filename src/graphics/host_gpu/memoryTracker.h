@@ -104,6 +104,39 @@ public:
 		s_upload_owner = previous_upload_owner;
 	}
 
+	[[nodiscard]] uint64_t RegionCpuDirtyEpoch(uint64_t index) const {
+		if (index >= REGION_COUNT) EXIT("invalid memory tracker region\n");
+		const auto* manager = m_regions[index].load(std::memory_order_acquire);
+		return manager ? manager->RegionCpuDirtyEpoch() : 0;
+	}
+
+	// Snapshot only, with callbacks outside region locks. Untracked memory is dirty.
+	// This does not clear ownership or consume the normal upload callback's pages.
+	template <typename Func>
+	void ForEachCpuDirtySpan(uint64_t vaddr, uint64_t size, Func&& func) {
+		ValidateRange(vaddr, size);
+		CheckNotInUploadCallback();
+		std::vector<std::pair<uint64_t, uint64_t>> spans;
+		const auto end = vaddr + size;
+		const auto add = [&](uint64_t begin, uint64_t finish) {
+			begin = std::max(begin, vaddr); finish = std::min(finish, end);
+			if (begin >= finish) return;
+			if (!spans.empty() && spans.back().second == begin) spans.back().second = finish;
+			else spans.emplace_back(begin, finish);
+		};
+		for (auto index = vaddr / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < end; ++index) {
+			auto* manager = m_regions[index].load(std::memory_order_acquire);
+			const auto begin = std::max(index * TRACKER_REGION_SIZE, vaddr);
+			const auto finish = std::min((index + 1) * TRACKER_REGION_SIZE, end);
+			if (!manager) { add(begin, finish); continue; }
+			if (!manager->HasCpuDirty()) continue;
+			std::scoped_lock lock(manager->lock);
+			manager->ForEachModifiedRange<DirtySource::Cpu, false>(begin, finish - begin,
+			    [&](uint64_t address, uint64_t bytes) { add(address, address + bytes); });
+		}
+		for (const auto& [begin, finish]: spans) func(begin, finish - begin);
+	}
+
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;

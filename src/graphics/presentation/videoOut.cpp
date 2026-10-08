@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -1800,6 +1802,22 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
 	status->resolution =
 	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	// Diagnostic: ask the guest to choose its own lower-resolution resource layouts.
+	// Resizing the host window does not change guest render targets. Do not rewrite
+	// image extents here: shader coordinates, tiled strides and copies depend on them.
+	static const bool force_1080p = [] {
+		const auto* value = std::getenv("KYTY_VIDEO_OUT_1080P");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (force_1080p && ctx->bus == VIDEO_OUT_BUS_TYPE_MAIN) {
+		status->resolution = 1u;
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(
+			    "[resolution test] Primary output reports 1080p (code 1). "
+			    "Internal render resolution still depends on the game.\n");
+		}
+	}
 	status->dynamicRange = 1;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119

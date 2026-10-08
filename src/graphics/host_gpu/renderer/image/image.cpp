@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/productionProfile.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
 #include "common/assert.h"
@@ -13,12 +14,73 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <utility>
 #include <fmt/format.h>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
 
 namespace {
+
+vk::ImageUsageFlags& PendingTightUsageSlot() noexcept {
+	thread_local vk::ImageUsageFlags usage {};
+	return usage;
+}
+
+std::atomic<uint64_t> g_image_usage_upgrades {0};
+
+[[nodiscard]] bool ImageHasContents(const VulkanImage& image) noexcept {
+	if (image.state.layout != vk::ImageLayout::eUndefined) {
+		return true;
+	}
+	for (const auto& subresource: image.subresource_states) {
+		if (subresource.layout != vk::ImageLayout::eUndefined) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void ExchangeVulkanImage(VulkanImage& left, VulkanImage& right) noexcept {
+	std::swap(left.format, right.format);
+	std::swap(left.image_type, right.image_type);
+	std::swap(left.extent, right.extent);
+	std::swap(left.layers, right.layers);
+	std::swap(left.mip_levels, right.mip_levels);
+	std::swap(left.samples, right.samples);
+	std::swap(left.usage, right.usage);
+	std::swap(left.flags, right.flags);
+	std::swap(left.image, right.image);
+	std::swap(left.state, right.state);
+	left.subresource_states.swap(right.subresource_states);
+	std::swap(left.allocation, right.allocation);
+}
+
+} // namespace
+
+bool TightImageUsageEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* flag = std::getenv("KYTY_TIGHT_IMAGE_USAGE");
+		return flag != nullptr && std::strcmp(flag, "1") == 0;
+	}();
+	return enabled;
+}
+
+void SetPendingTightUsage(vk::ImageUsageFlags usage) noexcept {
+	PendingTightUsageSlot() = usage;
+}
+
+uint64_t ImageUsageUpgradeCount() noexcept {
+	return g_image_usage_upgrades.load(std::memory_order_relaxed);
+}
+
+namespace {
+
+[[nodiscard]] vk::ImageUsageFlags PendingTightUsage() noexcept {
+	return PendingTightUsageSlot();
+}
 
 [[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
 	switch (type) {
@@ -90,6 +152,11 @@ namespace {
 	if (info.samples == 1) {
 		usage |= vk::ImageUsageFlagBits::eStorage;
 	}
+	// Storage plus color-attachment on every sampled image is the suspect behind the
+	// driver-side copy that VMA does not own. Ask for those flags only when a binding needs them.
+	if (TightImageUsageEnabled()) {
+		usage &= ~(vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eColorAttachment);
+	}
 	return usage;
 }
 
@@ -121,6 +188,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
+	m_scheduler.ProfileImageInfo(backing.image, info.data.size);
 	auto& state              = backing.state;
 	auto& subresource_states = backing.subresource_states;
 	if (range && info.IsVolume()) {
@@ -234,7 +302,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
 	dependency.pImageMemoryBarriers    = barriers.data();
-	command_buffer.pipelineBarrier2(dependency);
+	ProfilePipelineBarrier2(command_buffer, dependency);
 }
 
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
@@ -261,9 +329,14 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size());
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
-	command.pipelineBarrier2(dependency);
+	const auto pre_timer = m_scheduler.StartGpuTimer("upload_pre", m_scheduler.GpuFrameHint(), size);
+	ProfilePipelineBarrier2(command, dependency);
+	m_scheduler.EndGpuTimer(pre_timer);
+	const auto copy_timer = m_scheduler.StartGpuTimer("copy_buffer_to_image", m_scheduler.GpuFrameHint(), size);
 	command.copyBufferToImage(buffer, backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
+	m_scheduler.EndGpuTimer(copy_timer);
+	const auto post_timer = m_scheduler.StartGpuTimer("upload_post", m_scheduler.GpuFrameHint(), size);
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
 	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
 	buffer_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -271,9 +344,11 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 	dependency.imageMemoryBarrierCount = 0;
 	dependency.pImageMemoryBarriers    = nullptr;
-	command.pipelineBarrier2(dependency);
+	ProfilePipelineBarrier2(command, dependency);
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+	m_scheduler.EndGpuTimer(post_timer);
+	m_scheduler.ProfileImageReady(backing.image, info.data.address);
 }
 
 void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
@@ -301,9 +376,11 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size());
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
-	command.pipelineBarrier2(dependency);
+	ProfilePipelineBarrier2(command, dependency);
+	const auto profile_copy_1 = m_scheduler.StartGpuTimer("copy_copyImageToBuffer", m_scheduler.GpuFrameHint());
 	command.copyImageToBuffer(backing.image, vk::ImageLayout::eTransferSrcOptimal, buffer,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
+	m_scheduler.EndGpuTimer(profile_copy_1);
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
 	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
 	buffer_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -311,7 +388,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 	dependency.imageMemoryBarrierCount = 0;
 	dependency.pImageMemoryBarriers    = nullptr;
-	command.pipelineBarrier2(dependency);
+	ProfilePipelineBarrier2(command, dependency);
 }
 
 std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
@@ -383,9 +460,11 @@ void Image::CopyImage(Image& source) {
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	const auto profile_copy_2 = m_scheduler.StartGpuTimer("copy_copyImage", m_scheduler.GpuFrameHint());
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, static_cast<uint32_t>(copies.size()),
 	                  copies.data());
+	m_scheduler.EndGpuTimer(profile_copy_2);
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
@@ -434,8 +513,10 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
+		const auto profile_copy_3 = m_scheduler.StartGpuTimer("copy_copyImage", m_scheduler.GpuFrameHint());
 		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 		                  vk::ImageLayout::eTransferDstOptimal, region);
+		m_scheduler.EndGpuTimer(profile_copy_3);
 	} else {
 		vk::ImageResolve region {};
 		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, resolved_source_range.base_level,
@@ -444,8 +525,10 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
+		const auto profile_copy_4 = m_scheduler.StartGpuTimer("copy_resolveImage", m_scheduler.GpuFrameHint());
 		command.resolveImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     backing.image, vk::ImageLayout::eTransferDstOptimal, region);
+		m_scheduler.EndGpuTimer(profile_copy_4);
 	}
 }
 
@@ -531,15 +614,19 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 				barrier.size          = copy_size;
 				barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
 				barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
-				command.pipelineBarrier2(dependency);
+				ProfilePipelineBarrier2(command, dependency);
+				const auto profile_copy_5 = m_scheduler.StartGpuTimer("copy_copyImageToBuffer", m_scheduler.GpuFrameHint());
 				command.copyImageToBuffer(source.backing.image,
 				                          vk::ImageLayout::eTransferSrcOptimal, buffer.Handle(),
 				                          source_copy);
+				m_scheduler.EndGpuTimer(profile_copy_5);
 				barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
 				barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
-				command.pipelineBarrier2(dependency);
+				ProfilePipelineBarrier2(command, dependency);
+				const auto profile_copy_6 = m_scheduler.StartGpuTimer("copy_copyBufferToImage", m_scheduler.GpuFrameHint());
 				command.copyBufferToImage(buffer.Handle(), backing.image,
 				                          vk::ImageLayout::eTransferDstOptimal, destination_copy);
+				m_scheduler.EndGpuTimer(profile_copy_6);
 			}
 		}
 	}
@@ -574,8 +661,10 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
+	const auto profile_copy_7 = m_scheduler.StartGpuTimer("copy_copyImage", m_scheduler.GpuFrameHint());
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
+	m_scheduler.EndGpuTimer(profile_copy_7);
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
@@ -691,7 +780,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.format        = info.pixel_format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
-	create.usage         = ImageUsageFlags(graphics, info);
+	create.usage         = ImageUsageFlags(graphics, info) | PendingTightUsage();
 	create.samples       = vulkan_sample_count(info.samples);
 
 	vk::ImageFormatProperties properties {};
@@ -719,6 +808,152 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	    info.samples);
 }
 
+void Image::EnsureUsage(vk::ImageUsageFlags required) {
+	if (backing.image == nullptr || (backing.usage & required) == required) {
+		return;
+	}
+	const auto usage = backing.usage | required;
+
+	vk::ImageCreateInfo create {};
+	create.flags         = backing.flags;
+	create.imageType     = backing.image_type;
+	create.extent        = backing.extent;
+	create.mipLevels     = backing.mip_levels;
+	create.arrayLayers   = backing.layers;
+	create.format        = backing.format;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = usage;
+	create.samples       = vulkan_sample_count(backing.samples);
+
+	vk::ImageFormatProperties properties {};
+	if (m_graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
+	                                       create.usage, create.flags,
+	                                       &properties) != vk::Result::eSuccess ||
+	    !static_cast<bool>(properties.sampleCounts & create.samples)) {
+		EXIT("image usage upgrade is unsupported: format=%d type=%d usage=0x%x flags=0x%x "
+		     "samples=%u\n",
+		     static_cast<int>(create.format), static_cast<int>(create.imageType),
+		     static_cast<vk::ImageUsageFlags::MaskType>(create.usage),
+		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), backing.samples);
+	}
+
+	VulkanImage created;
+	if (!m_graphics.CreateImage(create, created)) {
+		EXIT("failed to upgrade image usage: extent=%ux%ux%u format=%d usage=0x%x\n",
+		     create.extent.width, create.extent.height, create.extent.depth,
+		     static_cast<int>(create.format),
+		     static_cast<vk::ImageUsageFlags::MaskType>(create.usage));
+	}
+
+	const bool has_contents = ImageHasContents(backing);
+	if (has_contents) {
+		m_scheduler.EndRendering();
+		auto command = m_scheduler.Current().Handle();
+		Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+		        command);
+
+		auto aspect = FullAspectMask(created.format) & ~vk::ImageAspectFlagBits::eStencil;
+		if (!aspect) {
+			aspect = FullAspectMask(created.format);
+		}
+		vk::ImageMemoryBarrier2 barrier {};
+		barrier.srcStageMask               = vk::PipelineStageFlagBits2::eTopOfPipe;
+		barrier.srcAccessMask              = vk::AccessFlagBits2::eNone;
+		barrier.dstStageMask               = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.dstAccessMask              = vk::AccessFlagBits2::eTransferWrite;
+		barrier.oldLayout                  = vk::ImageLayout::eUndefined;
+		barrier.newLayout                  = vk::ImageLayout::eTransferDstOptimal;
+		barrier.srcQueueFamilyIndex        = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex        = VK_QUEUE_FAMILY_IGNORED;
+		barrier.image                      = created.image;
+		barrier.subresourceRange.aspectMask = aspect;
+		barrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+		barrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &barrier;
+		ProfilePipelineBarrier2(command, dependency);
+
+		std::vector<vk::ImageCopy> copies;
+		copies.reserve(created.mip_levels);
+		for (uint32_t level = 0; level < created.mip_levels; level++) {
+			vk::ImageCopy copy {};
+			copy.srcSubresource.aspectMask = aspect;
+			copy.srcSubresource.mipLevel   = level;
+			copy.srcSubresource.layerCount = 1;
+			copy.dstSubresource            = copy.srcSubresource;
+			const auto width               = std::max(created.extent.width >> level, 1u);
+			const auto height              = std::max(created.extent.height >> level, 1u);
+			const auto depth               = std::max(created.extent.depth >> level, 1u);
+			if (created.image_type == vk::ImageType::e3D) {
+				copy.extent = {width, height, depth};
+			} else {
+				copy.srcSubresource.layerCount = created.layers;
+				copy.dstSubresource.layerCount = created.layers;
+				copy.extent                    = {width, height, 1};
+			}
+			copies.push_back(copy);
+		}
+		const auto profile_copy_8 = m_scheduler.StartGpuTimer("copy_copyImage", m_scheduler.GpuFrameHint());
+		command.copyImage(backing.image, vk::ImageLayout::eTransferSrcOptimal, created.image,
+		                  vk::ImageLayout::eTransferDstOptimal,
+		                  static_cast<uint32_t>(copies.size()), copies.data());
+		m_scheduler.EndGpuTimer(profile_copy_8);
+		created.state = {vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+		                 vk::ImageLayout::eTransferDstOptimal};
+		created.subresource_states.clear();
+	}
+
+	ExchangeVulkanImage(backing, created);
+	m_scheduler.ProfileImageForget(created.image);
+	if (has_contents) {
+		auto command = m_scheduler.Current().Handle();
+		Transit(vk::ImageLayout::eGeneral,
+		        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {},
+		        command);
+	}
+	SetVulkanObjectNameF(
+	    m_graphics.device, backing.image,
+	    "Kyty.Image[guest=0x{:016x} size=0x{:x} extent={}x{}x{} format={} mips={} layers={} samples={}]",
+	    info.data.address, info.data.size, info.extent.width, info.extent.height, info.extent.depth,
+	    static_cast<uint32_t>(info.pixel_format), info.resources.levels, info.resources.layers,
+	    info.samples);
+
+	std::vector<vk::ImageView> retired_views;
+	retired_views.reserve(views.size());
+	for (const auto& cached: views) {
+		if (cached.view != nullptr) {
+			retired_views.push_back(cached.view);
+		}
+	}
+	views.clear();
+	const auto retired_image      = created.image;
+	const auto retired_allocation = created.allocation;
+	created.image                 = nullptr;
+	created.allocation            = nullptr;
+
+	auto& graphics = m_graphics;
+	auto  destroy  = [&graphics, retired_image, retired_allocation,
+	                 retired_views = std::move(retired_views)]() mutable {
+		for (const auto view: retired_views) {
+			graphics.device.destroyImageView(view, nullptr);
+		}
+		if (retired_image != nullptr) {
+			VulkanImage retired;
+			retired.image      = retired_image;
+			retired.allocation = retired_allocation;
+			graphics.DeleteImage(retired);
+		}
+	};
+	if (m_scheduler.Active()) {
+		m_scheduler.DeferOperation(std::move(destroy));
+	} else {
+		destroy();
+	}
+	g_image_usage_upgrades.fetch_add(1, std::memory_order_relaxed);
+}
+
 uint64_t Image::HashGuestEdges() const {
 	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes {};
 	const auto                                 range = info.data;
@@ -740,6 +975,7 @@ uint64_t Image::HashGuestEdges() const {
 
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
+	m_scheduler.ProfileImageForget(backing.image);
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
 			m_graphics.device.destroyImageView(cached.view, nullptr);
