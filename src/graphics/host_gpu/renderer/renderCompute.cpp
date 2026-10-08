@@ -283,7 +283,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(buffer.IsInvalid());
 	FinishDrawCommit();
 	m_context.GetCommandScheduler().PopPendingOperations();
-	m_context.GetCommandScheduler().NoteGpuCommand(m_context.GetGpu().GetFrameNum(), true);
+	m_context.GetCommandScheduler().NoteGpuCommand(m_context.DiagnosticFrameNum(), true);
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -366,7 +366,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 			    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
 		    });
-		const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+		const uint32_t frame_num = static_cast<uint32_t>(m_context.DiagnosticFrameNum());
 		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
 		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
 		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
@@ -484,7 +484,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto gpu_timer = m_context.GetCommandScheduler().ProfileActive() || time_all_compute || shader_hash == 0xea0aceac518ec52dull ||
 	                       shader_hash == 0x723423f5115aedbdull
 	                           ? m_context.GetCommandScheduler().StartGpuTimer(
-	                                 "compute", m_context.GetGpu().GetFrameNum(), shader_hash)
+	                                 "compute", m_context.DiagnosticFrameNum(), shader_hash)
 	                           : UINT32_MAX;
 	m_context.GetCommandScheduler().ProfileConsumers(true);
 	ProfilePreparedBufferUses(std::span {&descriptor_stage, 1u}, "compute", submit_id);
@@ -552,7 +552,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	m_context.GetCommandScheduler().ProfileConsumers(true);
 	ProfilePreparedBufferUses(std::span {&descriptor_stage, 1u}, "compute", submit_id);
-	const auto gpu_timer = m_context.GetCommandScheduler().StartGpuTimer("compute", m_context.GetGpu().GetFrameNum(), program.shader_hash);
+	const auto gpu_timer = m_context.GetCommandScheduler().StartGpuTimer("compute", m_context.DiagnosticFrameNum(), program.shader_hash);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	m_context.GetCommandScheduler().ProfileWriterOperationEnd();
 	m_context.GetCommandScheduler().EndGpuTimer(gpu_timer);

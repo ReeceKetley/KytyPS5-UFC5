@@ -344,7 +344,7 @@ void TraceDetileUpload(CommandScheduler& scheduler, ImageId id, const Image& ima
 	if (trace.file == nullptr || tiles.empty()) {
 		return;
 	}
-	const uint64_t frame = static_cast<uint64_t>(scheduler.Context().GetGpu().GetFrameNum());
+	const uint64_t frame = static_cast<uint64_t>(scheduler.Context().DiagnosticFrameNum());
 	if (frame != trace.frame) {
 		trace.frame = frame;
 		trace.call  = 0;
@@ -1635,7 +1635,7 @@ void TextureCache::TraceColorMetaFill(uint64_t address, uint64_t size, uint32_t 
 	if (trace.file != nullptr) {
 		std::fprintf(trace.file, "F,%" PRIu64 ",0x%016" PRIx64 ",%" PRIu64
 		                         ",0x%08" PRIx32 ",%s\n",
-		             static_cast<uint64_t>(m_scheduler.Context().GetGpu().GetFrameNum()), address,
+		             static_cast<uint64_t>(m_scheduler.Context().DiagnosticFrameNum()), address,
 		             size, value,
 		             gpu_path ? "gpu" : "cpu");
 	}
@@ -1652,7 +1652,7 @@ void TextureCache::TraceColorMetaWrite(uint64_t address, uint64_t size,
 	}
 	std::fprintf(trace.file, "W,%" PRIu64 ",0x%016" PRIx64 ",%" PRIu64
 	                         ",0x%016" PRIx64 ",%s\n",
-	             static_cast<uint64_t>(m_scheduler.Context().GetGpu().GetFrameNum()), address,
+	             static_cast<uint64_t>(m_scheduler.Context().DiagnosticFrameNum()), address,
 	             size, source_address, source);
 }
 
@@ -1664,7 +1664,7 @@ bool TextureCache::TryConsumeColorMetaUniformFill(uint64_t address, uint64_t siz
 		auto& trace = GetColorMetaTrace();
 		if (trace.file != nullptr) {
 			std::fprintf(trace.file, "T,%" PRIu64 ",0x0000000000000000,0,%u,%s\n",
-			             static_cast<uint64_t>(m_scheduler.Context().GetGpu().GetFrameNum()),
+			             static_cast<uint64_t>(m_scheduler.Context().DiagnosticFrameNum()),
 			             static_cast<unsigned>(enabled), enabled ? "on" : "off");
 			std::fflush(trace.file);
 		}
@@ -1691,7 +1691,7 @@ bool TextureCache::TryConsumeColorMetaUniformFill(uint64_t address, uint64_t siz
 	if (trace.file != nullptr) {
 		std::fprintf(trace.file, "P,%" PRIu64 ",0x%016" PRIx64 ",%" PRIu64
 		                         ",0x%08" PRIx32 ",cpu-proven-fill\n",
-		             static_cast<uint64_t>(m_scheduler.Context().GetGpu().GetFrameNum()), address,
+		             static_cast<uint64_t>(m_scheduler.Context().DiagnosticFrameNum()), address,
 		             size, value);
 		std::fflush(trace.file);
 	}
@@ -1767,7 +1767,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	auto& profile = GetColorMetaProfile();
 	if (profile.file != nullptr) {
-		profile.NextFrame(m_scheduler.Context().GetGpu().GetFrameNum());
+		profile.NextFrame(m_scheduler.Context().DiagnosticFrameNum());
 		profile.calls++;
 		profile.ranges.insert(range.address);
 	}
@@ -1800,7 +1800,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (trace.file != nullptr) {
 			std::fprintf(trace.file, "R,%" PRIu64 ",0x%016" PRIx64 ",%" PRIu64
 			                         ",%u,%.3f\n",
-			             static_cast<uint64_t>(m_scheduler.Context().GetGpu().GetFrameNum()),
+			             static_cast<uint64_t>(m_scheduler.Context().DiagnosticFrameNum()),
 			             range.address, range.size,
 			             static_cast<unsigned>(desc.info.metadata.kind), elapsed_ms);
 			std::fflush(trace.file);

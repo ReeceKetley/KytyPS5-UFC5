@@ -990,7 +990,7 @@ void Presenter::ClearLayer(int bus) {
 }
 
 void Presenter::Impl::Present() {
-	present_scheduler.SetProfileFrame(renderer.GetGpu().GetFrameNum());
+	present_scheduler.SetProfileFrame(renderer.DiagnosticFrameNum());
 	ProfileCpuScope present_profile(present_scheduler, "present_cpu");
 	KYTY_PROFILER_FUNCTION();
 

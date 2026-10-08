@@ -1287,7 +1287,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	uint32_t frame_num = 0;
 
 	{
-		frame_num = m_renderer.GetGpu().GetFrameNum();
+		frame_num = m_renderer.DiagnosticFrameNum();
 		if (GraphicsRunDebugDumpEnabled()) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {

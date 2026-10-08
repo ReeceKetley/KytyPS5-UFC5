@@ -346,6 +346,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, std::
 	const auto request_thread = m_scheduler.ProfileLifetime() ? ProfileThreadId() : 0;
 	const auto request_begin = m_scheduler.ProfileLifetime() ? ProfileClockNs() : 0;
 	const auto* request_context = ProfileThread().operation;
+	if (!m_scheduler.Context().HasGpu()) {
+		// GPU test harness: no GuestGpu, so there is no GPU thread to marshal onto and no frame
+		// loop holding a command buffer open. Running the download inline would reach
+		// Finish() -> Submit() with an invalid command. Tests own their buffer contents directly
+		// and never observe guest memory, so there is nothing to download back.
+		return;
+	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, site, request_thread, request_begin, request_context] {
 		ProfileCpuScope request(m_scheduler, "readback_request_cpu", vaddr, size, false, site);
 		if (m_scheduler.ProfileWatched(vaddr, size)) {

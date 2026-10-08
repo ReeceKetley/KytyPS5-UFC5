@@ -49,6 +49,10 @@ GuestGpu& RenderContext::GetGpu() const {
 	return *m_gpu;
 }
 
+int RenderContext::DiagnosticFrameNum() const {
+	return m_gpu != nullptr ? m_gpu->GetFrameNum() : 0;
+}
+
 VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	EXIT_IF(m_video_out == nullptr);
 	return *m_video_out;

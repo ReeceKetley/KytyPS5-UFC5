@@ -36869,6 +36869,14 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
 
 void CheckPm4ContextStateOperations(RenderContext &renderer) {
   GraphicsInitJmpTables();
+  // Unlike the other PM4 cases this one reaches a scheduler Flush, through the
+  // IT_WAIT_REG_MEM suspend/resume path. Flush submits, and Submit asserts on an invalid
+  // command buffer, so the scheduler needs one open. Storage is static because Begin()
+  // binds by reference and the command outlives this function. (Ported from 902feded.)
+  static HW::Context registers{};
+  static HW::UserConfig user_config{};
+  static HW::Shader shaders{};
+  renderer.GetCommandScheduler().Begin(registers, user_config, shaders);
   CommandProcessor processor(renderer, 0);
   constexpr auto primitive_type = static_cast<Prospero::PrimitiveType>(0x35u);
 

@@ -206,7 +206,7 @@ void RenderExecutor::FinishDrawCommit() {
 		return;
 	}
 	ProfileCpuScope profile(m_context.GetCommandScheduler(), "draw_commit_wait");
-	DrawCommitGate::Get().Wait(m_context.GetGpu().GetFrameNum());
+	DrawCommitGate::Get().Wait(m_context.DiagnosticFrameNum());
 	if (m_commit_reset_bindings) {
 		ResetBindings();
 		m_commit_reset_bindings = false;
@@ -412,7 +412,7 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	    " blend=%s src=%u dst=%u comb=%u ps_tex=%d sampled=%d storage=%d ps_kill=%s target_mode0=%u"
 	    " depth_test=%s depth_write=%s depth_func=%u depth_clear=%s viewport=(%.1f,%.1f %.1fx%.1f) "
 	    "scissor=(%d,%d)-(%d,%d)\n",
-	    log_id, buffer.GetContext().GetGpu().GetFrameNum(), draw_name, RenderColorTypeName(color),
+	    log_id, buffer.GetContext().DiagnosticFrameNum(), draw_name, RenderColorTypeName(color),
 	    color.desc.info.data.address, extent.width, extent.height,
 	    static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags, ctx.GetRenderTargetMask(),
 	    cc.mode, cc.op,
@@ -440,7 +440,7 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	LOGF("DrawInputState[%u]: frame=%d target=%s addr=0x%010" PRIx64
 	     " index_type=%u index_count=%u index_addr=0x%016" PRIx64
 	     " vs_resources=%d vs_buffers=%d\n",
-	     log_id, buffer.GetContext().GetGpu().GetFrameNum(), RenderColorTypeName(color),
+	     log_id, buffer.GetContext().DiagnosticFrameNum(), RenderColorTypeName(color),
 	     color.desc.info.data.address, index_type_and_size, index_count,
 	     reinterpret_cast<uint64_t>(index_addr), vs_input_info.resources_num,
 	     vs_input_info.buffers_num);
@@ -1472,7 +1472,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	FinishDrawCommit();
 	m_context.GetCommandScheduler().PopPendingOperations();
-	m_context.GetCommandScheduler().NoteGpuCommand(m_context.GetGpu().GetFrameNum(), false);
+	m_context.GetCommandScheduler().NoteGpuCommand(m_context.DiagnosticFrameNum(), false);
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1590,7 +1590,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	FinishDrawCommit();
 	m_context.GetCommandScheduler().PopPendingOperations();
-	m_context.GetCommandScheduler().NoteGpuCommand(m_context.GetGpu().GetFrameNum(), false);
+	m_context.GetCommandScheduler().NoteGpuCommand(m_context.DiagnosticFrameNum(), false);
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
