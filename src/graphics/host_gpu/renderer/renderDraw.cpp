@@ -13,7 +13,6 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/abControl.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -202,19 +201,18 @@ bool DrawCommitOnWorker() noexcept {
 	return g_draw_commit_worker;
 }
 
-// Skip dynamic-state setters whose value this command buffer already has. On by default.
+// Skip dynamic-state setters whose value this command buffer already has. On by default;
+// KYTY_DYNAMIC_STATE_CACHE=0 restores issuing all fifteen on every draw.
 //
-// A-B variant 0 reverts to issuing all fifteen on every draw, and takes the uncached route
-// completely -- no comparison and no cache write -- so the baseline is the old behaviour rather
-// than the old behaviour plus bookkeeping, which would flatter the result. KYTY_DYNAMIC_STATE_CACHE=0
-// does the same at launch. Retire this hook and the branch once the result is recorded
-// (DEC-0005, WARN-0011).
+// No longer reads the A-B variant: EXP-0032 settled it at about +2%, and the harness carries ONE
+// variant integer, so a decided feature left wired to it would flip two things at once during the
+// next A-B.
 bool DynamicStateCacheEnabled() noexcept {
-	static const bool launch_default = [] {
+	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_DYNAMIC_STATE_CACHE");
 		return value == nullptr || value[0] != '0';
 	}();
-	return AbVariant(launch_default ? 1 : 0) != 0;
+	return enabled;
 }
 
 void RenderExecutor::FinishDrawCommit() {
