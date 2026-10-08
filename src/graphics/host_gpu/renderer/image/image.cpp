@@ -4,7 +4,6 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
-#include "graphics/host_gpu/renderer/abControl.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -34,19 +33,21 @@ std::atomic<uint64_t> g_image_usage_upgrades {0};
 
 // TASK-0011 Stage 1 opt-out. KYTY_TRANSIT_LAZY_HANDLE=0 restores the pre-EXP-0029 behaviour, in
 // which the render-target transition sites acquired the command buffer handle as a call ARGUMENT,
-// before GetBarriers decided whether anything needed recording. It exists so the deferral can be
-// A-B tested on one binary: EXP-0029 read 9.18-9.45 fps against a ~10.2 baseline, which sits
-// inside the 7.8% single-run variance floor (EXP-0027), so its neutrality is unconfirmed. Note
-// that turning this off also restores the FALSE dirty marks that made barrier coalescing
-// over-conservative, so barrier_global should rise back toward 4286/epoch when it is 0.
+// before GetBarriers decided whether anything needed recording. Note that turning it off also
+// restores the FALSE dirty marks that made barrier coalescing over-conservative, so
+// barrier_global rises back toward 4286/epoch.
+//
+// This no longer reads the A-B variant. EXP-0030 settled the question it was added for -- the
+// deferral is neutral, +0.0% with a CI of -0.6% to +0.5% over 733 s in one fight -- and the
+// harness carries ONE variant integer, so leaving a decided feature hooked to it would flip two
+// things at once during the next A-B. Retire a feature's variant hook as soon as its result is
+// recorded; keep the launch-time opt-out.
 [[nodiscard]] bool TransitLazyHandleEnabled() noexcept {
-	static const bool launch_default = [] {
+	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_TRANSIT_LAZY_HANDLE");
 		return value == nullptr || value[0] != '0';
 	}();
-	// Variant 0 is eager (pre-EXP-0029), anything else is the deferred handle. With no A-B
-	// control file in use this is just the launch default. See abControl.h.
-	return AbVariant(launch_default ? 1 : 0) != 0;
+	return enabled;
 }
 
 [[nodiscard]] bool ImageHasContents(const VulkanImage& image) noexcept {

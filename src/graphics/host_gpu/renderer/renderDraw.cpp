@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/abControl.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -199,6 +200,23 @@ bool DrawCommitEnabled() noexcept {
 
 bool DrawCommitOnWorker() noexcept {
 	return g_draw_commit_worker;
+}
+
+// TASK-0016 first increment. When the commit worker is off -- the default, and the only safe
+// setting given EXP-0020 -- recording happens inline and the 6792-byte CommitWork packet it was
+// built from is pure waste: one heap allocation plus about 13.6 KB of stores on each of 5570
+// draws per epoch, roughly 1.2% of wall (FACT-0032). Skipping it is the default.
+//
+// A-B variant 0 restores the packet on the inline path so the cost can be measured inside one
+// paused fight (DEC-0005, WARN-0011); KYTY_COMMIT_PACKET=1 does the same at launch. Once the
+// result is recorded, retire the variant hook and delete the variant-0 path -- a decided feature
+// must not stay wired to the single variant integer, or the next A-B flips two things at once.
+bool CommitPacketSkipEnabled() noexcept {
+	static const bool launch_default = [] {
+		const char* value = std::getenv("KYTY_COMMIT_PACKET");
+		return value == nullptr || value[0] == '0';
+	}();
+	return AbVariant(launch_default ? 1 : 0) != 0;
 }
 
 void RenderExecutor::FinishDrawCommit() {
@@ -1331,7 +1349,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	struct CommitWork {
 		CommandBuffer*                     buffer = nullptr;
-		vk::CommandBuffer                  vk {};
 		uint64_t                           submit_id = 0;
 		DrawCallInfo                       draw {};
 		bool                               mesh_active = false;
@@ -1355,42 +1372,49 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		uint32_t                           guest_element_size = 0;
 		uint64_t                           index_address      = 0;
 	};
-	auto work                 = std::make_shared<CommitWork>();
-	work->buffer              = &buffer;
-	work->vk                  = buffer.Handle();
-	work->submit_id           = submit_id;
-	work->draw                = draw;
-	work->mesh_active         = mesh_active;
-	work->mesh_groups         = mesh_groups;
-	work->ps_active           = state.ps_active;
-	work->vertex_bindings     = vertex_bindings;
-	work->index_binding       = index_binding;
-	work->pipeline            = &pipeline;
-	work->stage_count         = stage_count;
-	std::copy_n(descriptor_stages.data(), stage_count, work->stages.data());
-	// PreparedBindings::runtime points at DrawRenderState, which dies when this draw
-	// returns. The commit thread outlives that frame, so keep the two cache pointers here.
-	for (uint32_t i = 0; i < stage_count; ++i) {
-		auto* prepared = work->stages[i];
-		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
-		work->runtimes[i]  = *prepared->runtime;
-		prepared->runtime  = &work->runtimes[i];
-	}
-	work->emit                = emit;
-	work->prim                = ucfg.GetPrimType();
-	work->context             = buffer.GetRegisters();
-	work->vertex_input        = vertex_stages.back();
-	work->depth               = state.depth_info;
-	work->rendering           = rendering;
-	work->feedback            = feedback_aspects;
-	work->feedback_enabled    = m_context.GetGraphics().attachment_feedback_loop_enabled;
-	work->shader_writes       = shader_write_stages;
-	work->guest_element_size  = index_source.guest_element_size;
-	work->index_address       = index_source.address;
 
-	auto record = [this, work] {
-		auto& packet    = *work;
-		auto  vk_buffer = packet.vk;
+	// Everything the recording body reads, as references rather than copies. Nothing here is
+	// owned: the inline path builds one over its live locals at no copying cost, while the
+	// deferred path builds one over a packet it owns. sizeof(CommitWork) is 6792 bytes and was
+	// being heap-allocated and fully populated on every one of 5570 draws per epoch even on the
+	// inline path, which never needed it (FACT-0032). Field names match CommitWork so the body
+	// below reads identically through either.
+	struct DrawCommitView {
+		CommandBuffer*                          buffer = nullptr;
+		uint64_t                                submit_id = 0;
+		const DrawCallInfo&                     draw;
+		bool                                    mesh_active = false;
+		uint32_t                                mesh_groups = 0;
+		bool                                    ps_active   = false;
+		const PreparedVertexBuffers&            vertex_bindings;
+		const PreparedIndexBuffer&              index_binding;
+		const PipelineCache::Pipeline*          pipeline = nullptr;
+		const std::array<PreparedBindings*, 4>& stages;
+		uint32_t                                stage_count = 0;
+		const DrawEmitInfo&                     emit;
+		Prospero::PrimitiveType                 prim {};
+		const HW::Context&                      context;
+		const ShaderVertexInputInfo&            vertex_input;
+		const RenderDepthInfo&                  depth;
+		const RenderState&                      rendering;
+		vk::ImageAspectFlags                    feedback {};
+		bool                                    feedback_enabled = false;
+		vk::PipelineStageFlags                  shader_writes {};
+		uint32_t                                guest_element_size = 0;
+		uint64_t                                index_address      = 0;
+		// PreparedBindings::runtime is reset to null after recording, but only when nothing
+		// re-prepared it in the meantime. The packet path compared against its own storage;
+		// this carries whatever each stage pointed at before recording began, so the inline
+		// path reaches the same end state. Leaving a stage pointing into a dead
+		// DrawRenderState would defeat the EXIT_IF(runtime == nullptr) guards in
+		// descriptors.cpp on the next draw.
+		std::array<const ShaderStageRuntime*, 4> expected_runtimes {};
+	};
+
+	const auto record = [this](const DrawCommitView& v) {
+		const auto& packet = v;
+		// TASK-0016 design point 3: the drain acquires the handle, never the producer.
+		auto  vk_buffer = packet.buffer->Handle();
 		SetDrawDebugPhase(*packet.buffer, packet.submit_id, packet.draw,
 		                  packet.draw.IsIndexed() ? 0x100u : 0x200u);
 		if (!packet.mesh_active) {
@@ -1450,18 +1474,130 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			SetDrawDebugPhase(*packet.buffer, packet.submit_id, packet.draw, 0x700u);
 		}
 		for (uint32_t i = 0; i < packet.stage_count; ++i) {
-			if (packet.stages[i] != nullptr && packet.stages[i]->runtime == &packet.runtimes[i]) {
+			if (packet.stages[i] != nullptr &&
+			    packet.stages[i]->runtime == packet.expected_runtimes[i]) {
 				packet.stages[i]->runtime = nullptr;
 			}
 		}
 	};
 
+	// Building a packet and making a view over it is needed by the deferred path, and by A-B
+	// variant 0 which exists only to measure what the packet costs. Shared rather than
+	// duplicated so the two cannot drift apart.
+	const auto build_packet = [&] {
+		auto work                 = std::make_shared<CommitWork>();
+		work->buffer              = &buffer;
+		work->submit_id           = submit_id;
+		work->draw                = draw;
+		work->mesh_active         = mesh_active;
+		work->mesh_groups         = mesh_groups;
+		work->ps_active           = state.ps_active;
+		work->vertex_bindings     = vertex_bindings;
+		work->index_binding       = index_binding;
+		work->pipeline            = &pipeline;
+		work->stage_count         = stage_count;
+		std::copy_n(descriptor_stages.data(), stage_count, work->stages.data());
+		// PreparedBindings::runtime points at DrawRenderState, which dies when this draw
+		// returns. The commit thread outlives that frame, so keep the two cache pointers here.
+		for (uint32_t i = 0; i < stage_count; ++i) {
+			auto* prepared = work->stages[i];
+			EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
+			work->runtimes[i]  = *prepared->runtime;
+			prepared->runtime  = &work->runtimes[i];
+		}
+		work->emit                = emit;
+		work->prim                = ucfg.GetPrimType();
+		work->context             = buffer.GetRegisters();
+		work->vertex_input        = vertex_stages.back();
+		work->depth               = state.depth_info;
+		work->rendering           = rendering;
+		work->feedback            = feedback_aspects;
+		work->feedback_enabled    = m_context.GetGraphics().attachment_feedback_loop_enabled;
+		work->shader_writes       = shader_write_stages;
+		work->guest_element_size  = index_source.guest_element_size;
+		work->index_address       = index_source.address;
+		return work;
+	};
+	// The view holds references into the packet, so the caller must keep it alive.
+	const auto view_over = [](const std::shared_ptr<CommitWork>& work) {
+		DrawCommitView v {.buffer = work->buffer,
+		                  .submit_id = work->submit_id,
+		                  .draw = work->draw,
+		                  .mesh_active = work->mesh_active,
+		                  .mesh_groups = work->mesh_groups,
+		                  .ps_active = work->ps_active,
+		                  .vertex_bindings = work->vertex_bindings,
+		                  .index_binding = work->index_binding,
+		                  .pipeline = work->pipeline,
+		                  .stages = work->stages,
+		                  .stage_count = work->stage_count,
+		                  .emit = work->emit,
+		                  .prim = work->prim,
+		                  .context = work->context,
+		                  .vertex_input = work->vertex_input,
+		                  .depth = work->depth,
+		                  .rendering = work->rendering,
+		                  .feedback = work->feedback,
+		                  .feedback_enabled = work->feedback_enabled,
+		                  .shader_writes = work->shader_writes,
+		                  .guest_element_size = work->guest_element_size,
+		                  .index_address = work->index_address};
+		for (uint32_t i = 0; i < work->stage_count; ++i) {
+			v.expected_runtimes[i] = &work->runtimes[i];
+		}
+		return v;
+	};
+
 	if (DrawCommitEnabled()) {
-		DrawCommitGate::Get().Enqueue(std::move(record));
+		// Off by default: EXP-0020 measured this worker as halving the frame rate, and
+		// TASK-0016 replaces its single job slot with an ordered queue.
+		auto work = build_packet();
+		DrawCommitGate::Get().Enqueue(
+		    [work, record, view_over] { record(view_over(work)); });
 		m_commit_reset_bindings = true;
 		return;
 	}
-	record();
+
+	if (!CommitPacketSkipEnabled()) {
+		// A-B variant 0 only: record inline but still pay for the packet, which is what the
+		// code did before this increment. Delete this branch once the result is recorded.
+		auto work = build_packet();
+		record(view_over(work));
+		return;
+	}
+
+	// Inline: no packet at all. Every field below is a live local, and the recording happens
+	// before any of them goes out of scope.
+	DrawCommitView v {.buffer = &buffer,
+	                  .submit_id = submit_id,
+	                  .draw = draw,
+	                  .mesh_active = mesh_active,
+	                  .mesh_groups = mesh_groups,
+	                  .ps_active = state.ps_active,
+	                  .vertex_bindings = vertex_bindings,
+	                  .index_binding = index_binding,
+	                  .pipeline = &pipeline,
+	                  .stages = descriptor_stages,
+	                  .stage_count = stage_count,
+	                  .emit = emit,
+	                  .prim = ucfg.GetPrimType(),
+	                  .context = buffer.GetRegisters(),
+	                  .vertex_input = vertex_stages.back(),
+	                  .depth = state.depth_info,
+	                  .rendering = rendering,
+	                  .feedback = feedback_aspects,
+	                  .feedback_enabled = m_context.GetGraphics().attachment_feedback_loop_enabled,
+	                  .shader_writes = shader_write_stages,
+	                  .guest_element_size = index_source.guest_element_size,
+	                  .index_address = index_source.address};
+	for (uint32_t i = 0; i < stage_count; ++i) {
+		auto* prepared = descriptor_stages[i];
+		// Same invariant the packet population asserted, kept so the inline path does not lose
+		// a check just because it no longer builds a packet.
+		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
+		v.expected_runtimes[i] = prepared->runtime;
+	}
+	record(v);
 }
 
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
