@@ -6,15 +6,19 @@ UFC 5 is being developed on the `ufc5-v2` Kyty fork, which renders correctly; th
 problem is frame rate (FACT-0005). The current path uses native 4K output and sparse BDA. Bounded
 Function LDS, the CMask impossible-clear skip, compiled SRT and dirty-only BDA are now ALL default
 on in code, with per-feature opt-outs (`KYTY_FUNCTION_LDS_BOUND=0`, `KYTY_CMASK_SKIP_IMPOSSIBLE`,
-`KYTY_COMPILED_SRT=0`, `KYTY_BDA_SYNC=0`). Still record exact flags per run. The repository has
-extensive uncommitted work; do not discard it.
+`KYTY_COMPILED_SRT=0`, `KYTY_BDA_SYNC=0`). Still record exact flags per run. The working tree is
+clean as of 2026-10-08; everything is committed on `ufc5-v2`.
 
 ## Working
 
-- Paused-fight present rate is **~10.2 fps on a plain launch**, up from 6.28 (EXP-0009): compiled
-  SRT + dirty BDA default-on took it to 9.26 (EXP-0012), barrier coalescing added ~10% (EXP-0013),
-  and lazy submission a further +10-19% (EXP-0027). Live gameplay is at least as fast as paused
-  (FACT-0014), so the paused fight is a CONSERVATIVE proxy.
+- Paused-fight present rate is **10.2-11.1 fps depending on the pause**, up from 6.28 (EXP-0009):
+  compiled SRT + dirty BDA default-on took it to 9.26 (EXP-0012), barrier coalescing added ~10%
+  (EXP-0013), and lazy submission a further +10-19% (EXP-0027). Live gameplay is at least as fast
+  as paused (FACT-0014), so the paused fight is a CONSERVATIVE proxy.
+- **There is no single fps baseline, and quoting one is a mistake** (FACT-0033, WARN-0011). The
+  same binary and flags read 10.2 at one pause and 11.13 at another on the same day: scene
+  variation between fights is ~9%, within one fight 0.3-0.6%. Report A-B deltas measured inside
+  ONE scene; when an absolute number is unavoidable, name the pause.
 - **MENUS now run 54-60 fps, up from 40-41** (EXP-0027). Lazy submission helps far more there than
   in the fight, because submission cost is per-submission regardless of the work it carries.
 - Lazy submission is default-on (`KYTY_SUBMIT_DRAW_THRESHOLD=0` opts out, default 64 draws per
@@ -26,14 +30,19 @@ extensive uncommitted work; do not discard it.
   next bottleneck.
 - Compiled SRT and dirty-only BDA are default-on and validated: 27919 + 1093 shadow checks, zero
   mismatches (EXP-0011, FACT-0013). They cut recording 230.8 -> 129.8 ms/epoch.
-- The paused-fight measurement is reproducible to within ~1% across captures, so A-B comparisons
-  are now meaningful. Use `tools/profile-production.ps1`, not the legacy `run_ufc5.ps1` (WARN-0008).
+- **A-B now happens inside one paused fight** (DEC-0005), which is what made the floor tractable.
+  `KYTY_AB_CONTROL_FILE` holds one integer polled every 250 ms; the present-rate sampler reads the
+  same file, tags every window `variant=<n>` and resets its window on a flip, so nothing straddles
+  a boundary. Launch with `-Ab`, flip with `-Action AbSet -AbVariant <n>`, read out with
+  `analyze-ab-fps.py`, and always bracket X-Y-X. Resolution is ~0.5%, about 15x finer than the old
+  relaunch floor. Use `tools/profile-production.ps1`, not the legacy `run_ufc5.ps1` (WARN-0008).
 - `KYTY_DISPATCH_RANGES_CSV=<path>` logs per-dispatch thread groups and every buffer/image range
   read or written (tagged bw/br/iw/ir). Off by default; diagnostic only.
 
 ## Broken or Blocked
 
-- ~10.4 fps is still ~2.9x short of the 30 fps floor (DEC-0003). Not playable yet.
+- Still roughly 2.7-2.9x short of the 30 fps floor (DEC-0003), and the multiplier itself depends
+  on which pause you measure (FACT-0033). Not playable yet.
 - The bottleneck is host CPU command recording, not GPU work and no longer readback waits
   (EXP-0009). Readback waits fell to 9.6% of wall; do not port the old branch's transfer-queue
   work until attribution says otherwise (FACT-0008).
@@ -47,8 +56,10 @@ extensive uncommitted work; do not discard it.
   points (FACT-0019), and hazard-freedom does not imply recording-adjacency (EXP-0017).
 - Remaining per-draw cost sits in `draw_state_cpu` and `draw_bindings_cpu`: ~123 ms/epoch of a
   ~246 ms wall (FACT-0015), still the largest single item -- but **local optimization is close to
-  exhausted**: three attempts returned at most 1.7% (EXP-0019). Scene variation between paused
-  fights exceeds that, so sub-2% changes cannot be measured end to end.
+  exhausted**: three attempts returned at most 1.7% (EXP-0019). Those 1-2% results are now
+  MEASURABLE inside one scene (FACT-0033), which does not make them worth chasing -- 1% at a time
+  does not reach 30 fps from 11 -- but a change can no longer be called unmeasurable without
+  running it through the single-launch harness first.
 - Frame composition has shifted: recording ~48%, GPU batch ~30%, waits ~16% (FACT-0015). Pure CPU
   optimization cannot reach 30 fps alone; zeroing all instrumented CPU work still leaves ~84 ms.
 - Waits rose as CPU work fell, so further CPU wins buy less than the early ones did.
@@ -73,8 +84,11 @@ multi-session, and they likely have to be combined:
 2. **Parallel recording via secondary command buffers (TASK-0011)** -- the one threading approach
    EXP-0020 does not rule out. Real scope is making the texture/buffer/pipeline caches concurrent,
    not just splitting the buffer. Ideal 4-way is ~37% wall, roughly 14-16 fps, so not sufficient
-   alone.
+   alone. Stage 1 is **TASK-0016**, the ordered operation queue; its A-B prerequisite is
+   discharged (EXP-0030 confirmed EXP-0029 neutral at +0.0%, CI -0.6% to +0.5%). First increment
+   is the view refactor identified by FACT-0032, which also carries a `prepared->runtime` nulling
+   trap that must be preserved.
 3. Close the pixel-matched proof gap on bounded LDS (WARN-0007, TASK-0003).
 
-Last updated 2026-10-08 after EXP-0017. Original `ledger.md` content is DEPRECATED historical
-notes; its process IDs and live-mode claims are snapshots, not current state.
+Last updated 2026-10-08 after EXP-0030 and FACT-0033. Original `ledger.md` content is DEPRECATED
+historical notes; its process IDs and live-mode claims are snapshots, not current state.
