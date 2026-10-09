@@ -1479,10 +1479,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 			}
 		}
-		// Written ranges, gathered once. image_writes and buffer_writes are reported separately
-		// so the two EXIT messages stay exactly as they were.
-		// Resolved once: the variant poll is cheap but this sits inside a per-read loop below.
+		// Resolved once: the variant poll is cheap, but it is read again per address below.
 		const bool hoist = HazardHoistEnabled();
+		// Written ranges, gathered once. Image and buffer writes are kept in separate lists so
+		// the two EXIT messages stay exactly as they were.
 		m_hazard_image_writes.clear();
 		m_hazard_buffer_writes.clear();
 		if (hoist) {
