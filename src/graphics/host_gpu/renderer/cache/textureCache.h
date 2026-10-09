@@ -241,6 +241,7 @@ private:
 		// Generation the slot table was last wiped for; a surviving entry is therefore current.
 		uint64_t                 table_generation = 0;
 		uint64_t                 hits = 0, misses = 0, stale = 0, mismatches = 0;
+		uint64_t                 lookups = 0; // report cadence only
 	};
 	mutable FindImageMemo m_find_image_memo;
 	// Bumped whenever anything the FindImage lookup reads changes.

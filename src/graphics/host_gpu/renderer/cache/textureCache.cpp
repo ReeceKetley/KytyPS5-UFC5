@@ -35,6 +35,7 @@
 #include <string>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
+#include "graphics/host_gpu/renderer/abControl.h"
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -849,14 +850,24 @@ static_assert(std::is_trivially_copyable_v<TextureCache::ImageDesc>,
 
 enum class FindImageMemoMode { Off, Shadow, On };
 static FindImageMemoMode FindImageMemoSetting() noexcept {
-	static const FindImageMemoMode mode = [] {
+	static const FindImageMemoMode launch = [] {
 		const char* value = std::getenv("KYTY_IMAGE_FIND_MEMO");
 		if (value == nullptr) return FindImageMemoMode::Off;
 		if (std::strcmp(value, "shadow") == 0) return FindImageMemoMode::Shadow;
 		if (value[0] == '0') return FindImageMemoMode::Off;
 		return FindImageMemoMode::On;
 	}();
-	return mode;
+	// Shadow is a correctness-validation mode and is never overridden, so a validation run
+	// cannot be silently turned into something else by an A-B control file left lying around.
+	if (launch == FindImageMemoMode::Shadow) {
+		return launch;
+	}
+	// Otherwise the A-B variant decides, so the memo can be flipped inside one paused fight
+	// (DEC-0006): variant 0 is the slow lookup, anything else the memo.
+	if (AbControlPath() != nullptr) {
+		return AbVariant(1) != 0 ? FindImageMemoMode::On : FindImageMemoMode::Off;
+	}
+	return launch;
 }
 
 TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
@@ -2008,6 +2019,24 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		    m_slot_images.try_get(memo_slot.result) != nullptr;
 		if (memo_live && !memo_hit && memo_slot.valid) {
 			m_find_image_memo.stale++;
+		}
+		if (memo_live) {
+			// Report occasionally: without the hit rate, a null A-B cannot be told apart from a
+			// memo that never hits, and that is the one thing most likely to go wrong here.
+			auto& memo = m_find_image_memo;
+			if (++memo.lookups >= 500000) {
+				const auto total = memo.hits + memo.misses;
+				printf("TextureCache: FindImage memo hits=%llu misses=%llu stale=%llu "
+				       "mismatches=%llu hit_rate=%.1f%% generation=%llu\n",
+				       static_cast<unsigned long long>(memo.hits),
+				       static_cast<unsigned long long>(memo.misses),
+				       static_cast<unsigned long long>(memo.stale),
+				       static_cast<unsigned long long>(memo.mismatches),
+				       total ? 100.0 * static_cast<double>(memo.hits) /
+				                   static_cast<double>(total) : 0.0,
+				       static_cast<unsigned long long>(memo.generation));
+				memo.lookups = 0;
+			}
 		}
 		if (memo_hit && memo_mode == FindImageMemoMode::On) {
 			m_find_image_memo.hits++;
