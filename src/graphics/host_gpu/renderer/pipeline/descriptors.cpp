@@ -1398,6 +1398,17 @@ void NoteDescriptorPath(bool pushed, uint32_t writes) {
 }
 } // namespace
 
+// EXP-0035: the hoisted form of the scalar-read hazard assertion. KYTY_SCALAR_HAZARD_HOIST=0
+// restores the original nested loops, which re-derived the same write set for every read address.
+// Kept so the change can be A-B tested and so a corruption report can be bisected against it.
+static bool HazardHoistEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SCALAR_HAZARD_HOIST");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -1436,29 +1447,45 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
-	// A pure assertion: every branch inside ends in EXIT, so in normal operation this computes
-	// nothing and returns nothing. It is O(reads x bound_images) with a slot-map lookup per
-	// iteration, plus O(reads x stages x buffer_sources), all on the per-draw path.
+	// A pure assertion: every branch below ends in EXIT, so in normal operation it produces
+	// nothing. EXP-0035 measured it at 14.72 ms/epoch, 62% of the commit phase and the single
+	// largest named cost in the frame, with a median call of 4.85 us -- six to sixteen times
+	// more expensive per call than anything else in commit.
+	//
+	// The waste was re-deriving the SAME write set for every read address: it re-resolved every
+	// m_bound_images entry through a slot-map hash lookup, and re-walked every writer stage's
+	// buffer_sources, once per read. The write set does not depend on the read, so it is now
+	// built ONCE per draw and each read scans that flat list. O(reads x images) hash lookups
+	// become O(images); the comparisons are unchanged.
+	//
+	// The check itself is deliberately NOT weakened or compiled out. It is the only thing
+	// standing between a scalar resource read overlapping a shader write and silent corruption,
+	// and FAIL-0002 is an unexplained corruption, so this is the wrong moment to trade detection
+	// for speed. KYTY_SCALAR_HAZARD_HOIST=0 restores the original nested form.
 	{
 	ProfileDetailScope hazard_profile("cpu_commit_scalar_hazard", 0, m_bound_images.size());
-	for (const auto* reader: prepared_bindings) {
-		const auto& reads = reader->runtime->resources->specialization_reads;
-		if (reads.empty()) continue;
+	const bool any_reads = std::ranges::any_of(prepared_bindings, [](const auto* reader) {
+		return !reader->runtime->resources->specialization_reads.empty();
+	});
+	if (any_reads) {
 		for (const auto* writer: prepared_bindings) {
 			if (writer->runtime->program->has_address_writes) {
 				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 			}
 		}
-		for (const auto [address, size]: reads) {
+		// Written ranges, gathered once. image_writes and buffer_writes are reported separately
+		// so the two EXIT messages stay exactly as they were.
+		m_hazard_image_writes.clear();
+		m_hazard_buffer_writes.clear();
+		if (HazardHoistEnabled()) {
 			for (const auto id: m_bound_images) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
 				if (image == nullptr ||
 				    (!image->binding.shader_write && !image->binding.is_target)) continue;
 				for (const auto written: {image->info.data, image->info.stencil,
 				                          image->info.metadata.range}) {
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
+					if (written.size != 0) {
+						m_hazard_image_writes.emplace_back(written.address, written.size);
 					}
 				}
 			}
@@ -1468,9 +1495,51 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto resource = program.bindings.descriptors.front().resources[i];
 					if (!program.info.buffers[resource].written) continue;
 					const auto& written = writer->buffer_sources[i];
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+					if (written.size != 0) {
+						m_hazard_buffer_writes.emplace_back(written.address, written.size);
+					}
+				}
+			}
+		}
+		for (const auto* reader: prepared_bindings) {
+			const auto& reads = reader->runtime->resources->specialization_reads;
+			if (reads.empty()) continue;
+			for (const auto [address, size]: reads) {
+				if (HazardHoistEnabled()) {
+					for (const auto [written_address, written_size]: m_hazard_image_writes) {
+						if (ImageRangeOverlaps(address, size, written_address, written_size)) {
+							EXIT("scalar resource reads overlap an image or attachment write\n");
+						}
+					}
+					for (const auto [written_address, written_size]: m_hazard_buffer_writes) {
+						if (ImageRangeOverlaps(address, size, written_address, written_size)) {
+							EXIT("scalar resource reads overlap a shader buffer write\n");
+						}
+					}
+					continue;
+				}
+				for (const auto id: m_bound_images) {
+					const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
+					if (image == nullptr ||
+					    (!image->binding.shader_write && !image->binding.is_target)) continue;
+					for (const auto written: {image->info.data, image->info.stencil,
+					                          image->info.metadata.range}) {
+						if (written.size != 0 && ImageRangeOverlaps(address, size,
+						                                          written.address, written.size)) {
+							EXIT("scalar resource reads overlap an image or attachment write\n");
+						}
+					}
+				}
+				for (const auto* writer: prepared_bindings) {
+					const auto& program = *writer->runtime->program;
+					for (uint32_t i = 0; i < writer->buffer_sources.size(); ++i) {
+						const auto resource = program.bindings.descriptors.front().resources[i];
+						if (!program.info.buffers[resource].written) continue;
+						const auto& written = writer->buffer_sources[i];
+						if (written.size != 0 && ImageRangeOverlaps(address, size,
+						                                          written.address, written.size)) {
+							EXIT("scalar resource reads overlap a shader buffer write\n");
+						}
 					}
 				}
 			}

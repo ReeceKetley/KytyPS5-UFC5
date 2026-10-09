@@ -265,6 +265,10 @@ private:
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	// Write set for the scalar-read hazard assertion, gathered once per draw rather than once
+	// per read address (EXP-0035). Members so the capacity survives across draws.
+	std::vector<std::pair<uint64_t, uint64_t>> m_hazard_image_writes;
+	std::vector<std::pair<uint64_t, uint64_t>> m_hazard_buffer_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
 
 	friend class CommandProcessor;
