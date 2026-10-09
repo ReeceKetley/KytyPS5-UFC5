@@ -30,6 +30,7 @@ param(
     [ValidatePattern('^[0-9a-fA-F]{16}$')] [string] $DescriptorShader = 'd3dcf81c43080fd0',
     [string] $DescriptorControlFile = 'D:\PS5\ufc5-descriptor-gather.control',
     [ValidateRange(0,4294967295)] [Nullable[long]] $StartFrame,
+    [ValidateSet('off','shadow','on')] [string] $ImageFindMemo = 'off',
     [switch] $Ab,
     [ValidateRange(0,99)] [int] $AbVariant = 1,
     [string] $AbControlFile = 'D:\PS5\ufc5-ab.control',
@@ -98,6 +99,7 @@ $names += @('KYTY_COMPILED_SRT_CONTROL_FILE','KYTY_COMPILED_SRT_CSV')
 $names += @('KYTY_BDA_SYNC_CONTROL_FILE','KYTY_BDA_SYNC_CSV')
 $names += @('KYTY_CMASK_PRECHECK_CSV','KYTY_CMASK_SKIP_IMPOSSIBLE','KYTY_VRAM_ATTRIBUTION_CSV','KYTY_BDA_SUBALLOC','KYTY_VRAM_EVENTS','KYTY_PIPELINE_BUDGET','KYTY_SHADER_STORAGE_LOG','KYTY_FUNCTION_LDS_BOUND')
 $names += @('KYTY_MATERIALIZER_PROFILE_CONTROL_FILE','KYTY_MATERIALIZER_PROFILE_CSV','KYTY_MATERIALIZER_PROFILE_SECONDS')
+$names += @('KYTY_IMAGE_FIND_MEMO')
 $previous = @{}
 foreach ($name in $names) { $previous[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
 try {
@@ -196,6 +198,14 @@ try {
     }
     $env:KYTY_VIDEO_OUT_1080P = if ($Output1080p) { '1' } else { '0' }
     $env:KYTY_VRAM_TEST_FPS = '1'
+    # Set explicitly rather than relying on the caller's shell, so the mode always appears in
+    # the manifest's kyty_environment. A run where the flag silently failed to reach the process
+    # proves nothing, and that already happened once.
+    if ($ImageFindMemo -eq 'off') {
+        [Environment]::SetEnvironmentVariable('KYTY_IMAGE_FIND_MEMO',$null,'Process')
+    } else {
+        $env:KYTY_IMAGE_FIND_MEMO = if ($ImageFindMemo -eq 'on') { '1' } else { 'shadow' }
+    }
     if ($Ab) {
         Set-Content -LiteralPath $AbControlFile -Value "$AbVariant" -Encoding Ascii
         $env:KYTY_AB_CONTROL_FILE = $AbControlFile
@@ -238,6 +248,7 @@ try {
         vram_attribution_csv=if ($VramAttribution) { $base + '.vram-attribution.csv' } else { $null };
         materializer_diagnostics=[bool]$MaterializerDiagnostics; materializer_seconds=$MaterializerSeconds;
         materializer_control_file=if ($MaterializerDiagnostics) { $MaterializerControlFile } else { $null };
+        image_find_memo=$ImageFindMemo;
         ab=[bool]$Ab; ab_initial_variant=if ($Ab) { $AbVariant } else { $null };
         ab_control_file=if ($Ab) { $AbControlFile } else { $null };
         sparse_bda=$env:KYTY_SPARSE_BDA; prior_environment=$previous;
@@ -252,6 +263,10 @@ try {
         Write-Output 'Leave the detailed production profiler unarmed for the initial off/on timing comparison.'
     } elseif ($null -eq $StartFrame) { Write-Output 'Drive to the paused fight, then run this script with -Action Arm. Capture stops automatically.' }
     if ($BdaSync) { Write-Output "BDA sync starts $BdaSyncInitialMode. Control: $BdaSyncControlFile" }
+    if ($ImageFindMemo -ne 'off') {
+        Write-Output "FindImage memo: $ImageFindMemo (shadow compares both paths and uses the SLOW one)"
+        Write-Output 'Any mismatch prints TextureCache: FindImage memo MISMATCH to the stdout log.'
+    }
     if ($Ab) {
         Write-Output "A-B harness on, variant $AbVariant. Control: $AbControlFile"
         Write-Output 'Flip it without relaunching: .\profile-production.ps1 -Action AbSet -AbVariant <n>'
