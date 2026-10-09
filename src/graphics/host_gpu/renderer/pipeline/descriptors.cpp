@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/productionProfile.h"
+#include "graphics/host_gpu/renderer/abControl.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include "common/alignment.h"
@@ -1398,15 +1399,20 @@ void NoteDescriptorPath(bool pushed, uint32_t writes) {
 }
 } // namespace
 
-// EXP-0035: the hoisted form of the scalar-read hazard assertion. KYTY_SCALAR_HAZARD_HOIST=0
-// restores the original nested loops, which re-derived the same write set for every read address.
-// Kept so the change can be A-B tested and so a corruption report can be bisected against it.
+// EXP-0035: the hoisted form of the scalar-read hazard assertion. Variant 0, or
+// KYTY_SCALAR_HAZARD_HOIST=0 at launch, restores the original nested loops that re-derived the
+// same write set for every read address.
+//
+// Wired to the A-B variant rather than launch-only, because a launch-time flag can only be
+// measured across two launches and WARN-0013 showed that design can report the WRONG SIGN when
+// the machine drifts. The variant integer is free: EXP-0032's hook was retired when its result
+// was recorded. Retire this one the same way once EXP-0036 lands.
 static bool HazardHoistEnabled() noexcept {
-	static const bool enabled = [] {
+	static const bool launch_default = [] {
 		const char* value = std::getenv("KYTY_SCALAR_HAZARD_HOIST");
 		return value == nullptr || value[0] != '0';
 	}();
-	return enabled;
+	return AbVariant(launch_default ? 1 : 0) != 0;
 }
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
@@ -1475,9 +1481,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 		// Written ranges, gathered once. image_writes and buffer_writes are reported separately
 		// so the two EXIT messages stay exactly as they were.
+		// Resolved once: the variant poll is cheap but this sits inside a per-read loop below.
+		const bool hoist = HazardHoistEnabled();
 		m_hazard_image_writes.clear();
 		m_hazard_buffer_writes.clear();
-		if (HazardHoistEnabled()) {
+		if (hoist) {
 			for (const auto id: m_bound_images) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
 				if (image == nullptr ||
@@ -1505,7 +1513,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const auto& reads = reader->runtime->resources->specialization_reads;
 			if (reads.empty()) continue;
 			for (const auto [address, size]: reads) {
-				if (HazardHoistEnabled()) {
+				if (hoist) {
 					for (const auto [written_address, written_size]: m_hazard_image_writes) {
 						if (ImageRangeOverlaps(address, size, written_address, written_size)) {
 							EXIT("scalar resource reads overlap an image or attachment write\n");
