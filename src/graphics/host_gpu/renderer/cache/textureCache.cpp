@@ -1916,12 +1916,22 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	// EXP-0034 put cpu_image_find at about 10 ms/epoch in the state phase alone, with more in
+	// bindings whose scaled numbers the closure check rejects. It is a LEAF scope, so unlike the
+	// bindings aggregates it does not suffer the nesting double-count. These sub-scopes split it
+	// so the next capture names the cost: two candidate guesses have already been wrong at this
+	// level of the frame, so this is measured rather than assumed. ValidateImageDesc is a pure
+	// assertion like the one EXP-0036 fixed, but ~40 integer comparisons should be nanoseconds --
+	// if it shows up large, that is a surprise worth knowing about.
 	ProfileDetailScope profile("cpu_image_find", desc.info.data.address, desc.info.data.size);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
 	}
-	ValidateImageDesc(desc);
+	{
+		ProfileDetailScope validate_profile("cpu_image_find_validate", desc.info.data.address);
+		ValidateImageDesc(desc);
+	}
 	if (desc.info.data.Empty()) {
 		std::scoped_lock lock {m_lock};
 		return GetNullImage(desc);
@@ -1945,19 +1955,28 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		ProfileDetailScope lock_profile("cpu_image_lock_acquire", desc.info.data.address);
 		std::scoped_lock lock {m_lock};
 		lock_profile.Finish();
+		ProfileDetailScope region_profile("cpu_image_find_region", desc.info.data.address,
+		                                  desc.info.data.size);
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		region_profile.Finish();
 
-		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
-			if (SameBacking(image.info, desc.info, exact_format)) {
-				result = id;
+		{
+			ProfileDetailScope same_profile("cpu_image_find_same_backing", desc.info.data.address,
+			                                candidates.size());
+			for (const auto id: candidates) {
+				const auto& image = m_slot_images[id];
+				if (SameBacking(image.info, desc.info, exact_format)) {
+					result = id;
+				}
 			}
 		}
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
 		if (!result) {
+			ProfileDetailScope overlap_profile("cpu_image_find_overlap", desc.info.data.address,
+			                                   candidates.size());
 			for (const auto candidate: candidates) {
 				view_mip                = -1;
 				view_layer              = -1;
