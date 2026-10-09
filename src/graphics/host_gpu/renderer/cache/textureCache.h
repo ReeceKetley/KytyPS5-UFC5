@@ -204,6 +204,47 @@ private:
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
+
+	// FindImage lookup memo. EXP-0037 showed FindImagesInRegion dominates FindImage, because it
+	// walks EVERY page in the requested range to discover what covers it -- on the order of a
+	// thousand page-table lookups for a 4 MB texture, about 10000 times per epoch. Consecutive
+	// draws request the same descriptors, and EXP-0019 measured a 96% hit rate for exactly this
+	// memo pattern on the render-target derivation.
+	//
+	// ONLY THE LOOKUP IS MEMOISED. The result of FindImage is not just the ImageId: it also
+	// normalises desc.view_info.base_level and base_layer, and it has side effects that must run
+	// on every call -- tick_accessed_last, TouchImage and the GC age it maintains,
+	// MaterializeColorClear, and the compressed video-out check. A hit replays the two desc
+	// mutations and still performs all of those; it skips only FindImagesInRegion, the
+	// SameBacking scan and the ResolveOverlap scan.
+	//
+	// INVALIDATION is by generation counter, bumped wherever the lookup's inputs change: the page
+	// table in RegisterImage and UnregisterImage, and the three sites that mutate an already
+	// registered image's info. Missing a source would return a stale ImageId, which is silent
+	// corruption rather than a crash, so the memo ships with a SHADOW mode that computes both
+	// paths and compares -- the same way EXP-0011 validated compiled SRT over 27919 checks before
+	// it was trusted. Do not enable the fast path until shadow reports zero mismatches.
+	struct FindImageMemo {
+		static constexpr size_t Slots = 16; // small on purpose: 16 x sizeof(ImageDesc) stays
+		                                    // cache-resident, and FACT-0034 is a reminder that a
+		                                    // large working set costs more than its bandwidth.
+		struct Entry {
+			ImageDesc key {};
+			bool      valid        = false;
+			bool      exact_format = false;
+			ImageId   result {};
+			int32_t   view_mip   = -1;
+			int32_t   view_layer = -1;
+		};
+		std::array<Entry, Slots> slots {};
+		uint64_t                 generation = 0;
+		// Generation the slot table was last wiped for; a surviving entry is therefore current.
+		uint64_t                 table_generation = 0;
+		uint64_t                 hits = 0, misses = 0, stale = 0, mismatches = 0;
+	};
+	mutable FindImageMemo m_find_image_memo;
+	// Bumped whenever anything the FindImage lookup reads changes.
+	void InvalidateFindImageMemo() noexcept { ++m_find_image_memo.generation; }
 	bool             m_readback_linear_images = false;
 	std::vector<DetileReuseEntry> m_detile_reuse;
 	uint64_t                      m_detile_reuse_bytes = 0;

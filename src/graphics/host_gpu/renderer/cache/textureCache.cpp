@@ -35,6 +35,7 @@
 #include <string>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -628,6 +629,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
+	InvalidateFindImageMemo(); // the page table now reports a different owner set
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -653,6 +655,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	m_total_used_memory -= accounted;
 	image.registered = false;
+	InvalidateFindImageMemo(); // this image is no longer discoverable by region
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -828,6 +831,32 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 		}
 		m_download_images.insert(id);
 	}
+}
+
+// FindImage lookup memo mode. Off by default: a stale ImageId is silent corruption, so the
+// fast path is not trusted until shadow mode has reported zero mismatches over real play, the
+// way EXP-0011 validated compiled SRT across 27919 checks.
+//   KYTY_IMAGE_FIND_MEMO=shadow  compute both paths, compare, USE THE SLOW RESULT
+//   KYTY_IMAGE_FIND_MEMO=1       use the memo
+//   unset or 0                   no memo at all
+// The memo key is compared BYTEWISE, so the descriptor must stay trivially copyable. If anyone
+// adds a pointer or a container to ImageInfo, memcmp would compare addresses rather than
+// contents and a false hit would return the wrong image -- so this breaks the build instead.
+// Padding is harmless in the other direction: memcmp equality implies byte equality implies
+// logical equality, so differing padding costs hit rate, never correctness.
+static_assert(std::is_trivially_copyable_v<TextureCache::ImageDesc>,
+              "FindImage memo compares ImageDesc bytewise; it must stay trivially copyable");
+
+enum class FindImageMemoMode { Off, Shadow, On };
+static FindImageMemoMode FindImageMemoSetting() noexcept {
+	static const FindImageMemoMode mode = [] {
+		const char* value = std::getenv("KYTY_IMAGE_FIND_MEMO");
+		if (value == nullptr) return FindImageMemoMode::Off;
+		if (std::strcmp(value, "shadow") == 0) return FindImageMemoMode::Shadow;
+		if (value[0] == '0') return FindImageMemoMode::Off;
+		return FindImageMemoMode::On;
+	}();
+	return mode;
 }
 
 TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
@@ -1736,6 +1765,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
+		InvalidateFindImageMemo(); // SameBacking reads info, so a memoised result may be stale
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
 		m_surface_metas.erase(range.address);
 		if (range.size == 0 || desc.info.resources.levels != 1) {
@@ -1955,6 +1985,52 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		ProfileDetailScope lock_profile("cpu_image_lock_acquire", desc.info.data.address);
 		std::scoped_lock lock {m_lock};
 		lock_profile.Finish();
+
+		// Memo lookup. The key is the descriptor EXACTLY as passed in, before this function
+		// normalises view_info, because that normalisation is part of the memoised output. The
+		// hash only picks a slot; the key is verified bytewise, so a hash collision cannot
+		// return the wrong image.
+		const auto  memo_mode = FindImageMemoSetting();
+		const auto  memo_key  = desc;
+		const auto  memo_hash = XXH3_64bits(&memo_key, sizeof(memo_key));
+		auto&       memo_slot = m_find_image_memo.slots[memo_hash % FindImageMemo::Slots];
+		const bool  memo_live = memo_mode != FindImageMemoMode::Off;
+		// The generation is checked by wiping the table when it moves, below, so a surviving
+		// entry is already current. The liveness check is defence in depth: if an invalidation
+		// source was missed, this degrades to a miss instead of dereferencing a freed slot.
+		if (memo_live && m_find_image_memo.table_generation != m_find_image_memo.generation) {
+			m_find_image_memo.slots = {};
+			m_find_image_memo.table_generation = m_find_image_memo.generation;
+		}
+		const bool  memo_hit =
+		    memo_live && memo_slot.valid && memo_slot.exact_format == exact_format &&
+		    std::memcmp(&memo_slot.key, &memo_key, sizeof(memo_key)) == 0 &&
+		    m_slot_images.try_get(memo_slot.result) != nullptr;
+		if (memo_live && !memo_hit && memo_slot.valid) {
+			m_find_image_memo.stale++;
+		}
+		if (memo_hit && memo_mode == FindImageMemoMode::On) {
+			m_find_image_memo.hits++;
+			result = memo_slot.result;
+			// Replay the normalisation the slow path would have applied.
+			if (memo_slot.view_mip >= 0) {
+				desc.view_info.base_level = static_cast<uint32_t>(memo_slot.view_mip);
+			}
+			if (memo_slot.view_layer >= 0) {
+				desc.view_info.base_layer = static_cast<uint32_t>(memo_slot.view_layer);
+			}
+			// Side effects still run: the GC would otherwise evict an image still in use.
+			auto& image              = m_slot_images[result];
+			image.tick_accessed_last = m_scheduler.CurrentTick();
+			TouchImage(image);
+			ProfileDetailEvent("cache_image_memo_hit", desc.info.data.address,
+			                   desc.info.data.size);
+			goto memo_done;
+		}
+		if (memo_live) {
+			m_find_image_memo.misses++;
+		}
+
 		ProfileDetailScope region_profile("cpu_image_find_region", desc.info.data.address,
 		                                  desc.info.data.size);
 		const auto       candidates =
@@ -2028,7 +2104,36 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
+
+		if (memo_live) {
+			// Shadow mode compares what the memo WOULD have returned against the slow path's
+			// answer, and always uses the slow one. A mismatch means an invalidation source was
+			// missed, which is the whole risk of this change.
+			if (memo_mode == FindImageMemoMode::Shadow && memo_hit) {
+				const bool same = memo_slot.result == result &&
+				                  memo_slot.view_mip == view_mip &&
+				                  memo_slot.view_layer == view_layer;
+				if (!same) {
+					m_find_image_memo.mismatches++;
+					printf("TextureCache: FindImage memo MISMATCH at 0x%016llx: memo id=%u "
+					       "mip=%d layer=%d, actual id=%u mip=%d layer=%d\n",
+					       static_cast<unsigned long long>(desc.info.data.address),
+					       static_cast<unsigned>(memo_slot.result.index), memo_slot.view_mip,
+					       memo_slot.view_layer, static_cast<unsigned>(result.index), view_mip,
+					       view_layer);
+				} else {
+					m_find_image_memo.hits++;
+				}
+			}
+			memo_slot.key          = memo_key;
+			memo_slot.exact_format = exact_format;
+			memo_slot.result       = result;
+			memo_slot.view_mip     = view_mip;
+			memo_slot.view_layer   = view_layer;
+			memo_slot.valid        = true;
+		}
 	}
+memo_done:
 	MaterializeColorClear(result, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
@@ -2176,6 +2281,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.usage.depth_target = true;
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
+	InvalidateFindImageMemo(); // SameBacking reads info, so a memoised result may be stale
 	if (desc.info.HasMetadata()) {
 		m_surface_metas.emplace(desc.info.metadata.range.address,
 		                        MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
