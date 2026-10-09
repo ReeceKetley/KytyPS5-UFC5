@@ -1,5 +1,4 @@
 #include "graphics/host_gpu/renderer/productionProfile.h"
-#include "graphics/host_gpu/renderer/abControl.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include "common/alignment.h"
@@ -1403,16 +1402,15 @@ void NoteDescriptorPath(bool pushed, uint32_t writes) {
 // KYTY_SCALAR_HAZARD_HOIST=0 at launch, restores the original nested loops that re-derived the
 // same write set for every read address.
 //
-// Wired to the A-B variant rather than launch-only, because a launch-time flag can only be
-// measured across two launches and WARN-0013 showed that design can report the WRONG SIGN when
-// the machine drifts. The variant integer is free: EXP-0032's hook was retired when its result
-// was recorded. Retire this one the same way once EXP-0036 lands.
+// The A-B hook is retired now EXP-0036 has recorded the result at about +5 to +6%, so the single
+// variant integer is free for the next experiment (DEC-0006 step 2). The launch opt-out stays, so
+// a later corruption report can still be bisected against this change without a rebuild.
 static bool HazardHoistEnabled() noexcept {
-	static const bool launch_default = [] {
+	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_SCALAR_HAZARD_HOIST");
 		return value == nullptr || value[0] != '0';
 	}();
-	return AbVariant(launch_default ? 1 : 0) != 0;
+	return enabled;
 }
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,

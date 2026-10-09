@@ -30,6 +30,11 @@ clean as of 2026-10-08; everything is committed on `ufc5-v2`.
   next bottleneck.
 - Compiled SRT and dirty-only BDA are default-on and validated: 27919 + 1093 shadow checks, zero
   mismatches (EXP-0011, FACT-0013). They cut recording 230.8 -> 129.8 ms/epoch.
+- **Follow DEC-0006 for any A-B.** Eight steps, each earned by a wrong answer. In particular:
+  gate the change on `AbVariant` so it can be flipped in-scene, retire the hook once the result
+  is recorded, wait out the ~70 s warm-up ramp, drive arms by window COUNT not a timer, pass BOTH
+  `--since-bytes` and `--until-bytes`, and believe the paired estimate over the pooled one -- the
+  pooled comparison has now called a real win NEUTRAL three times (EXP-0032, EXP-0036).
 - **A-B must use SHORT ALTERNATING ARMS** (WARN-0013): long arms can report the WRONG SIGN,
   because the machine drifts non-monotonically on a 1-2 minute timescale -- one arm climbed
   11.18 -> 11.70 fps with no flip in it. Run 10 arms of 3 windows alternating; `analyze-ab-fps.py`
@@ -47,6 +52,11 @@ clean as of 2026-10-08; everything is committed on `ufc5-v2`.
   through a non-owning `DrawCommitView` instead of a 6792-byte `CommitWork` that was
   `make_shared`'d on every draw even on the inline path that never used it.
   `build_packet`/`view_over` remain for the deferred path only.
+- **The scalar-read hazard assertion is hoisted, about +5 to +6%** (EXP-0036, paired +5.9% CI
+  +2.1% to +6.3%, cross-check +5.3%). It was 14.72 ms/epoch -- 62% of the commit phase and the
+  largest named cost in the frame -- and it is a pure assertion that produces nothing: every
+  branch ends in `EXIT`. It re-derived the same write set for every read address. The check is
+  NOT weakened; `KYTY_SCALAR_HAZARD_HOIST=0` opts out.
 - **Only changed dynamic-state setters are issued, about +2%** (EXP-0032, paired +2.6% CI +1.2%
   to +4.4%, cross-check +1.5%). All fifteen were re-issued on every draw. The cache lives on
   CommandBuffer and is cleared in `Begin()`; colour-write is never cached and `blitHelper.cpp`
@@ -71,13 +81,13 @@ clean as of 2026-10-08; everything is committed on `ufc5-v2`.
   `CommandBuffer::Handle()`. Instrumented adjacency does not prove nothing was recorded between two
   points (FACT-0019), and hazard-freedom does not imply recording-adjacency (EXP-0017).
 - Remaining per-draw cost sits in `draw_state_cpu` and `draw_bindings_cpu`: ~123 ms/epoch of a
-  ~246 ms wall (FACT-0015), still the largest single item. **Local optimization is NOT exhausted
-  after all.** EXP-0019 concluded it was, on three attempts returning at most 1.7%; EXP-0031 then
-  got +4.3% from deleting a single per-draw allocation. Those three attempts were never shown to
-  be small, only unmeasurable against the old 8% relaunch floor (FACT-0033). And analytic
-  memory-cost estimates on this path underestimate by about 4x, because they miss cold-block
-  read-for-ownership, working-set displacement and allocator cost (FACT-0034) -- so rule nothing
-  out here without measuring it.
+  ~246 ms wall (FACT-0015). **Local optimization is NOT exhausted, and the cost is NOT diffuse.**
+  EXP-0019 and EXP-0028 both concluded otherwise; three wins since -- +5.4%, ~+2% and ~+5.5%,
+  compounding to roughly +13.5% -- came from exactly that work. EXP-0034 re-grounded the budget
+  and its per-phase split CLOSES: state 36.5, bindings 35.4, commit 25.7 ms/epoch of a 106 ms
+  recording envelope. Within those, named items dominate. Two caveats that keep biting: analytic
+  memory-cost estimates here underestimate by about 4x (FACT-0034), and I have guessed the
+  mechanism wrong twice -- instrument before optimising.
 - Frame composition has shifted: recording ~48%, GPU batch ~30%, waits ~16% (FACT-0015). Pure CPU
   optimization cannot reach 30 fps alone; zeroing all instrumented CPU work still leaves ~84 ms.
 - Waits rose as CPU work fell, so further CPU wins buy less than the early ones did.
@@ -110,5 +120,5 @@ multi-session, and they likely have to be combined:
    result per-draw and cheap, then the arena and queue, then the worker.
 3. Close the pixel-matched proof gap on bounded LDS (WARN-0007, TASK-0003).
 
-Last updated 2026-10-08 after EXP-0032, FACT-0036 and WARN-0013. Original `ledger.md` content is DEPRECATED
+Last updated 2026-10-09 after EXP-0036 and DEC-0006. Original `ledger.md` content is DEPRECATED
 historical notes; its process IDs and live-mode claims are snapshots, not current state.
